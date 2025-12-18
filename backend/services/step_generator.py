@@ -41,17 +41,6 @@ class StepGenerator:
         try:
             logger.info(f"Generating {difficulty} steps...")
             
-            # Use AI if enabled and available
-            if self.use_ai and self.client:
-                try:
-                    steps = await self._generate_ai_steps(
-                        audio_analysis, difficulty, song_info
-                    )
-                    logger.info(f"✓ AI generated {len(steps)} steps")
-                    return steps
-                except Exception as e:
-                    logger.warning(f"AI generation failed: {e}, falling back to algorithmic")
-            
             # Use enhanced algorithmic generation
             steps = self.algorithmic_generator.generate_steps(audio_analysis, difficulty)
             logger.info(f"✓ Algorithmically generated {len(steps)} steps")

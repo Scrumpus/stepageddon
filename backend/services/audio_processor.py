@@ -66,6 +66,7 @@ class AudioProcessor:
                 "sample_rate": sr
             }
             
+            logger.info(f"Tempo: {tempo}")
             logger.info(f"Analysis complete: Tempo={tempo:.1f} BPM, {len(beat_times)} beats")
             return analysis
             
@@ -78,7 +79,7 @@ class AudioProcessor:
         try:
             # Dynamic tempo estimation
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-            tempo, beats = librosa.beat.beat_track(
+            [tempo], beats = librosa.beat.beat_track(
                 onset_envelope=onset_env,
                 sr=sr,
                 units='frames'
