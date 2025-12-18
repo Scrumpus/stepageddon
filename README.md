@@ -1,11 +1,6 @@
 # 🎮 Beat Sync - AI-Powered Rhythm Game
 
-An AI-powered DDR-style rhythm game that generates custom step charts for any song. Built with React, FastAPI, and Claude AI.
-
-![Beat Sync](https://img.shields.io/badge/Status-MVP-green)
-![React](https://img.shields.io/badge/React-18-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.104-green)
-![Python](https://img.shields.io/badge/Python-3.9+-blue)
+DDR-style rhythm game that generates custom step charts for any song. Built with React and FastAPI
 
 ## ✨ Features
 
