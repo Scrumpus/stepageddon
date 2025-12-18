@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+dist/
+dist-ssr/
+*.local
+
+# Environment
+.env
+.env.local
+.env.production
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Audio storage
+backend/audio_storage/*.mp3
+backend/audio_storage/*.wav
+backend/audio_storage/*.ogg
+backend/audio_storage/*.flac
+!backend/audio_storage/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore
+
+# Build
+build/
+*.egg-info/
+
+# Testing
+.coverage
+coverage/
