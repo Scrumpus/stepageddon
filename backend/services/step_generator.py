@@ -1,37 +1,22 @@
-"""
-Step Generation Service
-AI-powered and algorithmic step chart generation
-"""
-
 import json
 import logging
 from typing import Dict, List
-from anthropic import Anthropic
 
 from core.config import settings
 from services.algorithmic_generator import EnhancedAlgorithmicGenerator
 
 logger = logging.getLogger(__name__)
 
-
 class StepGenerator:
-    """Generate step charts using AI and algorithmic methods"""
-    
     def __init__(self, use_ai: bool = False):
         """
         Initialize step generator
         
         Args:
-            use_ai: If True, use AI (requires API key). If False, use pure algorithmic.
+            use_ai: Will implement later
         """
-        self.use_ai = use_ai and bool(settings.ANTHROPIC_API_KEY)
+        self.use_ai = use_ai
         self.client = None
-        
-        if self.use_ai:
-            self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            logger.info("AI generation enabled")
-        else:
-            logger.info("Using pure algorithmic generation (no AI required)")
         
         # Always initialize algorithmic generator
         self.algorithmic_generator = EnhancedAlgorithmicGenerator()
@@ -76,73 +61,6 @@ class StepGenerator:
             logger.error(f"Step generation failed: {e}", exc_info=True)
             raise
     
-    async def _generate_ai_steps(
-        self,
-        audio_analysis: Dict,
-        difficulty: str,
-        song_info: Dict = None
-    ) -> List[Dict]:
-        """Generate steps using Claude AI"""
-        
-        # Prepare analysis summary for AI
-        analysis_summary = self._prepare_analysis_summary(audio_analysis, song_info)
-        
-        # Difficulty parameters
-        difficulty_params = self._get_difficulty_params(difficulty)
-        
-        # Enhanced prompt
-        prompt = self._create_ai_prompt(analysis_summary, difficulty_params)
-        
-        # Call Claude API
-        message = self.client.messages.create(
-            model=settings.AI_MODEL,
-            max_tokens=4096,
-            temperature=0.7,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-        
-        # Parse response
-        response_text = message.content[0].text
-        steps = self._parse_ai_response(response_text)
-        
-        # Validate and refine
-        steps = self._validate_and_refine_steps(
-            steps,
-            audio_analysis["duration"],
-            difficulty_params
-        )
-        
-        return steps
-    
-    def _prepare_analysis_summary(self, analysis: Dict, song_info: Dict = None) -> str:
-        """Prepare concise analysis summary for AI"""
-        summary_parts = [
-            f"Duration: {analysis['duration']:.1f}s",
-            f"Tempo: {analysis['tempo']:.1f} BPM",
-            f"Beats detected: {len(analysis['beat_times'])}",
-            f"Genre/Style: {analysis['spectral_features']['genre_hint']}",
-            f"Energy level: {'High' if analysis['energy_profile']['mean'] > 0.05 else 'Medium' if analysis['energy_profile']['mean'] > 0.03 else 'Low'}",
-        ]
-        
-        if song_info:
-            if song_info.get("title"):
-                summary_parts.insert(0, f"Song: {song_info['title']}")
-            if song_info.get("artist"):
-                summary_parts.insert(1, f"Artist: {song_info['artist']}")
-        
-        # Add beat times (first 20 for reference)
-        beat_times_str = ", ".join([f"{t:.2f}" for t in analysis['beat_times'][:20]])
-        if len(analysis['beat_times']) > 20:
-            beat_times_str += "..."
-        summary_parts.append(f"Beat times (s): {beat_times_str}")
-        
-        return "\n".join(summary_parts)
-    
     def _get_difficulty_params(self, difficulty: str) -> Dict:
         """Get parameters for difficulty level"""
         params = {
@@ -169,82 +87,6 @@ class StepGenerator:
             }
         }
         return params.get(difficulty, params["intermediate"])
-    
-    def _create_ai_prompt(self, analysis_summary: str, difficulty_params: Dict) -> str:
-        """Create enhanced prompt for Claude"""
-        
-        return f"""You are an expert DDR (Dance Dance Revolution) step chart creator. Generate a step chart for this song.
-
-SONG ANALYSIS:
-{analysis_summary}
-
-DIFFICULTY: {difficulty_params['description']}
-- Target density: {difficulty_params['notes_per_second'][0]}-{difficulty_params['notes_per_second'][1]} notes/second
-- Double arrows: {'Allowed' if difficulty_params['allow_doubles'] else 'Not allowed'}
-- Jump arrows (simultaneous): {'Allowed' if difficulty_params['allow_jumps'] else 'Not allowed'}
-- Minimum gap between notes: {difficulty_params['min_gap']}s
-
-ARROW DIRECTIONS:
-- left (←)
-- down (↓)
-- up (↑)
-- right (→)
-
-GUIDELINES:
-1. Place arrows on or near beat times for musical accuracy
-2. Create patterns that flow naturally (avoid awkward foot movements)
-3. Use directional variety (don't repeat same arrow too much)
-4. Match energy: more arrows in high-energy sections, fewer in calm parts
-5. For doubles, use opposite directions (left+right or up+down)
-6. Build intensity gradually (easier at start, harder towards chorus)
-7. Leave gaps for breathing/recovery in long songs
-
-OUTPUT FORMAT (JSON):
-Return ONLY a JSON array of step objects. Each object must have:
-- "time": float (timestamp in seconds)
-- "direction": string (one of: "left", "down", "up", "right")
-- "type": string ("single" or "double")
-
-Example:
-[
-  {{"time": 1.23, "direction": "left", "type": "single"}},
-  {{"time": 1.75, "direction": "down", "type": "single"}},
-  {{"time": 2.15, "direction": "left", "type": "double"}},
-  {{"time": 2.15, "direction": "right", "type": "double"}},
-  {{"time": 2.89, "direction": "up", "type": "single"}}
-]
-
-Generate the complete step chart now:"""
-    
-    def _parse_ai_response(self, response: str) -> List[Dict]:
-        """Parse AI response into step objects"""
-        try:
-            # Try to extract JSON from response
-            response = response.strip()
-            
-            # Remove markdown code blocks if present
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-            
-            # Parse JSON
-            steps = json.loads(response)
-            
-            # Validate structure
-            if not isinstance(steps, list):
-                raise ValueError("Response is not a list")
-            
-            for step in steps:
-                if not all(k in step for k in ["time", "direction", "type"]):
-                    raise ValueError(f"Invalid step structure: {step}")
-            
-            return steps
-            
-        except Exception as e:
-            logger.error(f"Failed to parse AI response: {e}")
-            logger.debug(f"Response was: {response[:500]}")
-            raise ValueError("Could not parse AI response into valid steps")
     
     def _validate_and_refine_steps(
         self,
