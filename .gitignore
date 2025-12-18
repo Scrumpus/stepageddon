@@ -40,10 +40,7 @@ dist-ssr/
 .DS_Store
 
 # Audio storage
-backend/audio_storage/*.mp3
-backend/audio_storage/*.wav
-backend/audio_storage/*.ogg
-backend/audio_storage/*.flac
+backend/audio_storage/
 !backend/audio_storage/.gitkeep
 
 # Logs

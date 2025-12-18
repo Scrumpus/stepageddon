@@ -39,7 +39,7 @@ export const COMBO_MULTIPLIER = {
 
 // Visual settings
 export const ARROW_SPEED = 400; // pixels per second
-export const HIT_ZONE_Y = 100; // Distance from top of game area
+export const HIT_ZONE_Y = 600; // Distance from top of game area
 export const ARROW_SIZE = 80; // pixels
 
 // Game states
