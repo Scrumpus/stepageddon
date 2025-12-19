@@ -32,4 +32,4 @@ services:
 
 networks:
   default:
-    name: beat-sync-network
+    name: stepageddon-network

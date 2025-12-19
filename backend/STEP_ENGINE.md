@@ -20,6 +20,7 @@ The Step Engine must:
 * Place steps aligned to that grid
 * Select arrows using playability-aware logic
 * Output a deterministic, inspectable chart format
+* Allow holding steps (press a step and hold for a duration)
 
 The engine must **never** place steps arbitrarily or rely on nondeterministic behavior.
 
@@ -82,13 +83,6 @@ The Step Engine consumes the following derived audio features:
 * **Onset Times** — percussive transients
 * **Energy Curve** — RMS or equivalent
 * **Duration** — total track length
-
-### Assumptions (MVP)
-
-* Time signature is assumed to be **4/4**
-* BPM is assumed to be constant
-
----
 
 ## 5. Timing Grid
 
