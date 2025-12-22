@@ -854,4 +854,5 @@ class ChartExporter:
             }
         }
         
-        return json.dumps(chart_data, indent=2)
+        return chart_data
+        ##return json.dumps(chart_data, indent=2)

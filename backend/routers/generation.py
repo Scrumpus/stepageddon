@@ -197,13 +197,13 @@ async def generate_steps_from_url(request: GenerateRequest):
         )
 
         new_steps = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
-        new_steps_json = ChartExporter.to_json(new_steps)
+        new_steps = ChartExporter.to_json(new_steps)
         
         # Prepare response
         response = {
             "song_id": song_id,
             "steps": steps,
-            "new_steps_json": new_steps_json,
+            "new_steps": new_steps,
             "song_info": {
                 "title": metadata["title"],
                 "artist": metadata.get("artist", "Unknown"),
