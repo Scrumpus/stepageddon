@@ -24,21 +24,10 @@ DDR-style rhythm game that generates custom step charts for any song. Built with
 - Energy-aware note placement
 - Works completely offline (except for YouTube/Spotify downloads)
 
-**🤖 AI Mode (Optional - Requires Anthropic API Key)**
-- Enhanced musical understanding via Claude
-- Context-aware pattern creation
-- Genre-specific adaptations
-- Natural flow and transitions
-- Enable by setting `USE_AI_GENERATION=true` in `.env`
-
 ### Technical Features
 - Musical beat detection with librosa
 - Real-time hit detection with 60 FPS gameplay
 - Combo multiplier system
-
-> 📖 **Want to learn more about generation modes?**  
-> - See [ALGORITHMIC_MODE.md](ALGORITHMIC_MODE.md) for details on pure algorithmic generation  
-> - See [docs/COMPARISON.md](docs/COMPARISON.md) for side-by-side comparison with examples
 
 ## 🚀 Quick Start
 
@@ -137,50 +126,9 @@ Frontend will run at http://localhost:3000
 - **OK**: ±150ms timing (25 points)
 - **Miss**: >150ms or no hit (0 points)
 
-## 🏗️ Project Structure
-
-```
-beat-sync/
-├── backend/
-│   ├── main.py              # FastAPI application
-│   ├── core/
-│   │   └── config.py        # Configuration settings
-│   ├── services/
-│   │   ├── audio_processor.py    # Audio analysis with librosa
-│   │   ├── step_generator.py     # AI step generation
-│   │   └── audio_downloader.py   # YouTube/Spotify support
-│   ├── routers/
-│   │   ├── generation.py    # Step generation endpoints
-│   │   └── audio.py         # Audio streaming
-│   └── requirements.txt
-│
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx          # Main application
-│   │   ├── screens/         # Game screens
-│   │   │   ├── MenuScreen.jsx
-│   │   │   ├── LoadingScreen.jsx
-│   │   │   ├── ReadyScreen.jsx
-│   │   │   ├── GameScreen.jsx
-│   │   │   └── ResultsScreen.jsx
-│   │   ├── utils/           # Utilities
-│   │   │   ├── gameConstants.js
-│   │   │   └── scoring.js
-│   │   └── config/
-│   │       └── api.js       # API client
-│   ├── package.json
-│   └── vite.config.js
-│
-└── docker-compose.yml
-```
-
 ## 🔧 Configuration
 
 ### Backend Environment Variables
-
-```env
-# Required
-ANTHROPIC_API_KEY=sk-ant-xxx
 
 # Optional
 SPOTIFY_CLIENT_ID=xxx
