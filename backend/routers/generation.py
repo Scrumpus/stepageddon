@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 from services import AudioProcessor, StepGenerator, AudioDownloader
-from services.step_generator_new import ChartGenerationPipeline, ChartExporter
+from modules.step_generator import ChartGenerationPipeline, ChartExporter
 from core.config import settings
 
 logger = logging.getLogger(__name__)

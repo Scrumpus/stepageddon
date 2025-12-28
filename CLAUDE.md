@@ -82,30 +82,41 @@ The backend has a three-layer step generation architecture:
 
 Output: Comprehensive analysis dict with beat_times, onset_times, energy_profile, spectral_features, structure boundaries
 
-**Layer 2: Step Generation** (THREE generators coexist):
+**Layer 2: Step Generation** - Modular Package Structure
 
-1. **`step_generator_new.py`** - **RECOMMENDED** - New deterministic engine
-   - Implements the STEP_ENGINE.md contract
-   - Grid-locked timing (quarter/eighth/sixteenth notes by difficulty)
-   - Deterministic seeding from audio hash + difficulty
-   - Supports TAP and HOLD note types
-   - Uses dataclasses: `Beat`, `Step`, `Chart`, `Direction`, `StepType`
-   - Difficulty presets with precise configs (see Difficulty System section)
-   - Called via `ChartGenerationPipeline.generate_from_audio()`
+The step generation system follows FastAPI best practices with a modular structure in `backend/modules/step_generator/`
 
-2. **`algorithmic_generator.py`** - Enhanced algorithmic generator
+**Module Structure:**
+```
+backend/modules/step_generator/
+├── __init__.py          # Public API exports
+├── schemas.py           # Pydantic models (Beat, Step, Chart, etc.)
+├── difficulty.py        # Difficulty configurations
+├── audio_analysis.py    # Librosa-based analysis functions
+├── patterns.py          # Pattern templates (streams, jumps, holds)
+├── generator.py         # Core StepGenerator class
+└── pipeline.py          # ChartGenerationPipeline & ChartExporter
+```
+
+**Primary Generator:** `step_generator` module
+- **Entry Point**: `ChartGenerationPipeline.generate_from_audio()`
+- **Implements**: STEP_ENGINE.md contract
+- **Features**: Grid-locked timing, deterministic, TAP and HOLD notes
+- **Schemas**: Pydantic BaseModel for validation and serialization
+- **Import**: `from modules.step_generator import ChartGenerationPipeline, ChartExporter`
+
+**Legacy Generators** (still available for backward compatibility):
+
+1. **`algorithmic_generator.py`** - Enhanced algorithmic generator
    - Pure librosa-based, no AI dependency
    - Energy-aware pattern generation
-   - Supports doubles (two-arrow steps) on higher difficulties
-   - Foot logic to avoid awkward patterns (opposites, adjacents)
    - Used by `step_generator.py` wrapper
 
-3. **`step_generator.py`** - Legacy wrapper (being phased out)
+2. **`step_generator.py`** - Legacy wrapper
    - Simple wrapper around `algorithmic_generator.py`
    - Has `use_ai` parameter (currently unused)
-   - Basic validation and refinement (deduplication, min gap enforcement)
 
-**Current Status**: `routers/generation.py` calls BOTH `step_generator` (legacy) and `step_generator_new` to allow comparison during transition. The response includes both `steps` (legacy) and `new_steps_json` (new format).
+**Current Status**: `routers/generation.py` uses the new modular `step_engine` package as the primary generator. Legacy generators remain available for backward compatibility.
 
 **Layer 3: API Routers** (`backend/routers/`):
 - `generation.py` - POST endpoints for chart generation (file upload or URL)
@@ -350,29 +361,53 @@ VITE_API_URL=http://localhost:8000
 When working with the step generator:
 
 1. **Read STEP_ENGINE.md first** - Contains the complete design contract and requirements
-2. **Primary file**: `backend/services/step_generator_new.py` (800+ lines)
+2. **Primary module**: `backend/modules/step_generator/` (follows FastAPI best practices)
 3. **Test across difficulties** - Each has vastly different grid subdivision and density limits
 4. **Verify determinism** - Use same audio file + difficulty multiple times, compare outputs
 5. **Check playability** - Patterns must be physically feasible (avoid same arrow spam, impossible crossovers)
 
+**Module Organization**:
+- `schemas.py` - Pydantic models (Beat, Step, Chart, Direction, StepType) with validation
+- `difficulty.py` - Configuration and presets
+- `audio_analysis.py` - Librosa-based analysis functions
+- `patterns.py` - Reusable pattern templates
+- `generator.py` - Core StepGenerator class
+- `pipeline.py` - High-level orchestration
+
 **Key Entry Points**:
 ```python
-# Main pipeline
-ChartGenerationPipeline.generate_from_audio(audio_path, difficulty) -> Chart
+# Main pipeline (from pipeline.py)
+from modules.step_generator import ChartGenerationPipeline, ChartExporter
+chart = ChartGenerationPipeline.generate_from_audio(audio_path, difficulty)
+json_data = ChartExporter.to_json(chart)
 
-# Core analysis functions
-analyze_beats(y, sr) -> Tuple[List[Beat], float]
-detect_subdivisions(y, sr, beat_times) -> List[float]
-analyze_energy_sections(y, sr) -> List[EnergySection]
-detect_sustained_notes(y, sr) -> List[SustainedNote]
+# Core analysis functions (from audio_analysis.py)
+from modules.step_generator import analyze_beats, detect_subdivisions, analyze_energy
+beats, tempo = analyze_beats(y, sr)
+subdivisions = detect_subdivisions(y, sr, beat_times)
+energy_sections = analyze_energy(y, sr)
 
-# Export
-ChartExporter.to_json(chart) -> dict
+# Pattern generation (from patterns.py)
+from modules.step_generator import PatternTemplate
+stream = PatternTemplate.single_stream(start_time, count, interval, Direction.LEFT)
+jump = PatternTemplate.jump_pattern(time, 'corners')
+
+# Working with Pydantic models
+from modules.step_generator import Step, StepType, Direction
+step = Step(time=1.5, arrows=[Direction.LEFT], step_type=StepType.TAP)
+# Pydantic handles validation automatically
 ```
 
-**Difficulty Presets**: Located in `DIFFICULTY_PRESETS` dict at top of `step_generator_new.py`
-- Modify density ranges, hold percentages, grid subdivisions
-- Add new difficulty: Create new `DifficultyConfig` instance
+**Difficulty Presets**: Located in `backend/modules/step_generator/difficulty.py`
+- Modify density ranges, hold percentages, grid subdivisions in `DIFFICULTY_PRESETS` dict
+- Add new difficulty: Create new `DifficultyConfig` Pydantic model instance
+- Use `get_difficulty_config(name)` for validated access
+
+**Pydantic Benefits**:
+- Automatic validation of all data structures
+- Easy serialization to/from JSON
+- Type checking and IDE autocompletion
+- FastAPI integration for request/response models
 
 ### Adjusting Timing Windows
 
