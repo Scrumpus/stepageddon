@@ -4,10 +4,10 @@
 
 import { Play, ArrowLeft, Music, Clock, Zap } from 'lucide-react';
 import { GameState } from '@/types/common.types';
-import { useApp } from '@/app/providers';
+import { useApp } from '@/app/providers/AppProvider';
 import { DIFFICULTY_INFO } from '../types/menu.types';
 
-export function ReadyScreen() {
+function ReadyScreen() {
   const { songData, difficulty, setGameState, resetGame } = useApp();
 
   if (!songData) {
@@ -112,3 +112,5 @@ export function ReadyScreen() {
     </div>
   );
 }
+
+export default ReadyScreen;

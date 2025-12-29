@@ -5,7 +5,7 @@
 
 import { useState } from 'react';
 import { GameState } from '@/types/common.types';
-import { useApp } from '@/app/providers';
+import { useApp } from '@/app/providers/AppProvider';
 import { Judgment, HitAccuracy } from '../types/game.types';
 import { calculateAccuracy } from '../utils/scoring';
 import {
@@ -14,12 +14,12 @@ import {
   useKeyboardInput,
   useAudioPlayer,
 } from '../hooks';
-import { GameHUD } from './GameHUD';
-import { ArrowLane } from './ArrowLane';
-import { JudgmentDisplay } from './JudgmentDisplay';
-import { PauseOverlay } from './PauseOverlay';
+import GameHUD from './GameHUD';
+import ArrowLane from './ArrowLane';
+import JudgmentDisplay from './JudgmentDisplay';
+import PauseOverlay from './PauseOverlay';
 
-export function GameScreen() {
+function GameScreen() {
   const { steps, audioRef, songData, setGameResults, resetGame } = useApp();
 
   // Local game state
@@ -140,3 +140,5 @@ export function GameScreen() {
     </div>
   );
 }
+
+export default GameScreen;

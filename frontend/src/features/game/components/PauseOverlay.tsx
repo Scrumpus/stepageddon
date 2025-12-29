@@ -8,7 +8,7 @@ interface PauseOverlayProps {
   onResume: () => void;
 }
 
-export function PauseOverlay({ onResume }: PauseOverlayProps) {
+function PauseOverlay({ onResume }: PauseOverlayProps) {
   return (
     <div className="absolute inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
       <div className="text-center">
@@ -25,3 +25,5 @@ export function PauseOverlay({ onResume }: PauseOverlayProps) {
     </div>
   );
 }
+
+export default PauseOverlay;

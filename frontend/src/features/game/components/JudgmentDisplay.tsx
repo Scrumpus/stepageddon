@@ -2,7 +2,7 @@
  * Judgment display - shows hit feedback (PERFECT, GOOD, OK, MISS)
  */
 
-import { Judgment, JudgmentDisplay as JudgmentDisplayType } from '../../types/game.types';
+import { Judgment, JudgmentDisplay as JudgmentDisplayType } from '../types/game.types';
 
 interface JudgmentDisplayProps {
   judgment: JudgmentDisplayType | null;
@@ -15,7 +15,7 @@ const JUDGMENT_COLORS = {
   [Judgment.MISS]: 'text-red-400',
 };
 
-export function JudgmentDisplay({ judgment }: JudgmentDisplayProps) {
+function JudgmentDisplay({ judgment }: JudgmentDisplayProps) {
   if (!judgment) return null;
 
   return (
@@ -31,3 +31,5 @@ export function JudgmentDisplay({ judgment }: JudgmentDisplayProps) {
     </div>
   );
 }
+
+export default JudgmentDisplay;

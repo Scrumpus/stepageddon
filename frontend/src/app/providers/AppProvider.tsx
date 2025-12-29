@@ -8,7 +8,7 @@ import { GameState, DifficultyLevel, SongInfo } from '@/types/common.types';
 import { Step } from '@/features/game/types/step.types';
 import { GameResults } from '@/features/results/types/results.types';
 import { useToast } from '@/hooks/useToast';
-import { ToastContainer } from '@/components/Toast';
+import ToastContainer from '@/components/Toast/ToastContainer';
 
 interface AppContextValue {
   // Game flow state
@@ -53,7 +53,7 @@ interface AppProviderProps {
   children: ReactNode;
 }
 
-export function AppProvider({ children }: AppProviderProps) {
+function AppProvider({ children }: AppProviderProps) {
   // Game flow state
   const [gameState, setGameState] = useState<GameState>(GameState.MENU);
   const [difficulty, setDifficulty] = useState<DifficultyLevel>('intermediate');
@@ -137,10 +137,13 @@ export function AppProvider({ children }: AppProviderProps) {
  * Hook to access app context
  * Must be used within AppProvider
  */
-export function useApp() {
+function useApp() {
   const context = useContext(AppContext);
   if (!context) {
     throw new Error('useApp must be used within AppProvider');
   }
   return context;
 }
+
+export default AppProvider;
+export { useApp };

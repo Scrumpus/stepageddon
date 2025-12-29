@@ -25,7 +25,7 @@ const toastIcons = {
   info: Info,
 };
 
-export function Toast({ toast, onDismiss }: ToastProps) {
+function Toast({ toast, onDismiss }: ToastProps) {
   const [isExiting, setIsExiting] = useState(false);
   const Icon = toastIcons[toast.type];
 
@@ -67,3 +67,5 @@ export function Toast({ toast, onDismiss }: ToastProps) {
     </div>
   );
 }
+
+export default Toast;

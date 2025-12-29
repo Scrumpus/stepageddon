@@ -8,7 +8,7 @@ interface ProgressBarProps {
   showLabel?: boolean;
 }
 
-export function ProgressBar({ progress, className = '', showLabel = false }: ProgressBarProps) {
+function ProgressBar({ progress, className = '', showLabel = false }: ProgressBarProps) {
   const clampedProgress = Math.min(100, Math.max(0, progress));
 
   return (
@@ -27,3 +27,5 @@ export function ProgressBar({ progress, className = '', showLabel = false }: Pro
     </div>
   );
 }
+
+export default ProgressBar;

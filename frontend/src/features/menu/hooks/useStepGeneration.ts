@@ -5,7 +5,7 @@
 import { useState, useCallback } from 'react';
 import { GameState } from '@/types/common.types';
 import { generateStepsFromFile, generateStepsFromUrl, getAudioUrl } from '../api';
-import { useApp } from '@/app/providers';
+import { useApp } from '@/app/providers/AppProvider';
 
 export function useStepGeneration() {
   const {

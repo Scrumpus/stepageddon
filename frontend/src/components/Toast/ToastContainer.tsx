@@ -2,7 +2,7 @@
  * Container for all toast notifications
  */
 
-import { Toast } from './Toast';
+import Toast from './Toast';
 import type { Toast as ToastType } from '@/hooks/useToast';
 
 interface ToastContainerProps {
@@ -10,7 +10,7 @@ interface ToastContainerProps {
   onDismiss: (id: string) => void;
 }
 
-export function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
+function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
   if (toasts.length === 0) return null;
 
   return (
@@ -21,3 +21,5 @@ export function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
     </div>
   );
 }
+
+export default ToastContainer;

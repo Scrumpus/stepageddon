@@ -52,6 +52,8 @@ class StepGenerator:
 
         available_beats = self._filter_beats(beats)
 
+        breakpoint()
+
         if self.config.use_8th_notes or self.config.use_16th_notes:
             available_beats.extend(subdivisions)
             available_beats.sort()

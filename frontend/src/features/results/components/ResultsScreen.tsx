@@ -4,13 +4,13 @@
  */
 
 import { RotateCcw, Home } from 'lucide-react';
-import { useApp } from '@/app/providers';
+import { useApp } from '@/app/providers/AppProvider';
 import { GameState } from '@/types/common.types';
 import { calculateGrade } from '@/features/results/utils/gradeCalculation';
-import { GradeDisplay } from './GradeDisplay';
-import { StatsBreakdown } from './StatsBreakdown';
+import GradeDisplay from './GradeDisplay';
+import StatsBreakdown from './StatsBreakdown';
 
-export function ResultsScreen() {
+function ResultsScreen() {
   const { gameResults, songData, setGameState, resetGame } = useApp();
 
   if (!gameResults || !songData) return null;
@@ -57,3 +57,5 @@ export function ResultsScreen() {
     </div>
   );
 }
+
+export default ResultsScreen;

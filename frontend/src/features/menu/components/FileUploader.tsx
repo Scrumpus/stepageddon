@@ -8,7 +8,7 @@ interface FileUploaderProps {
   onFileSelect: (file: File) => void;
 }
 
-export function FileUploader({ onFileSelect }: FileUploaderProps) {
+function FileUploader({ onFileSelect }: FileUploaderProps) {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -39,3 +39,5 @@ export function FileUploader({ onFileSelect }: FileUploaderProps) {
     </div>
   );
 }
+
+export default FileUploader;

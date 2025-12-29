@@ -15,7 +15,7 @@ interface GameHUDProps {
   onReturnToMenu: () => void;
 }
 
-export function GameHUD({
+function GameHUD({
   score,
   combo,
   currentTime,
@@ -78,3 +78,5 @@ export function GameHUD({
     </>
   );
 }
+
+export default GameHUD;

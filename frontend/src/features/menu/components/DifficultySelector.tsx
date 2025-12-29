@@ -11,7 +11,7 @@ interface DifficultySelectorProps {
   onDifficultyChange: (difficulty: DifficultyLevel) => void;
 }
 
-export function DifficultySelector({ difficulty, onDifficultyChange }: DifficultySelectorProps) {
+function DifficultySelector({ difficulty, onDifficultyChange }: DifficultySelectorProps) {
   return (
     <div className="mb-8">
       <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
@@ -42,3 +42,5 @@ export function DifficultySelector({ difficulty, onDifficultyChange }: Difficult
     </div>
   );
 }
+
+export default DifficultySelector;

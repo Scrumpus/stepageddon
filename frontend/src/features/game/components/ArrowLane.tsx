@@ -4,8 +4,8 @@
 
 import { ArrowLeft, ArrowDown, ArrowUp, ArrowRight } from 'lucide-react';
 import { Direction } from '@/types/common.types';
-import { ActiveArrow } from '../../types/step.types';
-import { VISUAL_CONFIG, DIRECTIONS } from '../../types/game.types';
+import { ActiveArrow } from '../types/step.types';
+import { VISUAL_CONFIG, DIRECTIONS } from '../types/game.types';
 
 interface ArrowLaneProps {
   activeArrows: ActiveArrow[];
@@ -19,7 +19,7 @@ const ARROW_ICONS = {
   [Direction.RIGHT]: ArrowRight,
 };
 
-export function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
+function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
   return (
     <div className="flex-1 relative overflow-hidden">
       {/* Target Zone */}
@@ -67,3 +67,5 @@ export function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
     </div>
   );
 }
+
+export default ArrowLane;

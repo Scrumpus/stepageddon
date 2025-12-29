@@ -22,7 +22,7 @@ const sizeStyles = {
   lg: 'px-6 py-3 text-lg',
 };
 
-export function Button({
+function Button({
   variant = 'primary',
   size = 'md',
   className = '',
@@ -47,3 +47,5 @@ export function Button({
     </button>
   );
 }
+
+export default Button;

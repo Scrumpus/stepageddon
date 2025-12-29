@@ -2,11 +2,13 @@
  * Main App component - simplified orchestrator using feature modules
  */
 
-import { useApp } from '@/app/providers';
+import { useApp } from '@/app/providers/AppProvider';
 import { GameState } from '@/types/common.types';
-import { MenuScreen, LoadingScreen, ReadyScreen } from '@/features/menu';
-import { GameScreen } from '@/features/game';
-import { ResultsScreen } from '@/features/results';
+import MenuScreen from '@/features/menu/components/MenuScreen';
+import LoadingScreen from '@/features/menu/components/LoadingScreen';
+import ReadyScreen from '@/features/menu/components/ReadyScreen';
+import GameScreen from '@/features/game/components/GameScreen';
+import ResultsScreen from '@/features/results/components/ResultsScreen';
 
 function App() {
   const { gameState } = useApp();

@@ -3,10 +3,10 @@
  */
 
 import { Loader2 } from 'lucide-react';
-import { useApp } from '@/app/providers';
-import { ProgressBar } from '@/components/ui';
+import { useApp } from '@/app/providers/AppProvider';
+import ProgressBar from '@/components/ProgressBar';
 
-export function LoadingScreen() {
+function LoadingScreen() {
   const { loadingMessage, loadingProgress } = useApp();
 
   return (
@@ -28,3 +28,5 @@ export function LoadingScreen() {
     </div>
   );
 }
+
+export default LoadingScreen;

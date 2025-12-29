@@ -9,7 +9,7 @@ interface UrlInputProps {
   onUrlSubmit: (url: string) => void;
 }
 
-export function UrlInput({ onUrlSubmit }: UrlInputProps) {
+function UrlInput({ onUrlSubmit }: UrlInputProps) {
   const [url, setUrl] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -60,3 +60,5 @@ export function UrlInput({ onUrlSubmit }: UrlInputProps) {
     </form>
   );
 }
+
+export default UrlInput;

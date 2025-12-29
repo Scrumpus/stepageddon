@@ -2,14 +2,14 @@
  * Grade display - shows final letter grade
  */
 
-import { Grade, GRADE_COLORS } from '../../types/results.types';
+import { Grade, GRADE_COLORS } from '../types/results.types';
 
 interface GradeDisplayProps {
   grade: Grade;
   songTitle: string;
 }
 
-export function GradeDisplay({ grade, songTitle }: GradeDisplayProps) {
+function GradeDisplay({ grade, songTitle }: GradeDisplayProps) {
   return (
     <div className="text-center mb-8">
       <div className={`text-8xl font-bold mb-4 ${GRADE_COLORS[grade]}`}>
@@ -20,3 +20,5 @@ export function GradeDisplay({ grade, songTitle }: GradeDisplayProps) {
     </div>
   );
 }
+
+export default GradeDisplay;

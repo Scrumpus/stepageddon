@@ -4,14 +4,14 @@
 
 import { useState } from 'react';
 import { Upload, Globe } from 'lucide-react';
-import { useApp } from '@/app/providers';
+import { useApp } from '@/app/providers/AppProvider';
 import { useStepGeneration } from '../hooks';
-import { DifficultySelector } from './DifficultySelector';
-import { FileUploader } from './FileUploader';
-import { UrlInput } from './UrlInput';
+import DifficultySelector from './DifficultySelector';
+import FileUploader from './FileUploader';
+import UrlInput from './UrlInput';
 import type { UploadMethod } from '../types/menu.types';
 
-export function MenuScreen() {
+function MenuScreen() {
   const { difficulty, setDifficulty } = useApp();
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [uploadMethod, setUploadMethod] = useState<UploadMethod>('file');
@@ -24,9 +24,6 @@ export function MenuScreen() {
           <h1 className="text-6xl font-bold mb-4 bg-gradient-to-r from-game-primary via-game-secondary to-game-accent bg-clip-text text-transparent">
             Beat Sync
           </h1>
-          <p className="text-gray-400 text-lg">
-            AI-Powered Rhythm Game
-          </p>
         </div>
 
         {/* Main Card */}
@@ -72,13 +69,9 @@ export function MenuScreen() {
             <UrlInput onUrlSubmit={handleUrlSubmit} />
           )}
         </div>
-
-        {/* Info */}
-        <div className="mt-6 text-center text-sm text-gray-500">
-          <p>🎮 Use arrow keys (←↓↑→) to play</p>
-          <p className="mt-1">Built with AI-powered step generation using Claude</p>
-        </div>
       </div>
     </div>
   );
 }
+
+export default MenuScreen;

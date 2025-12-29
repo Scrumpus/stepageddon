@@ -3,13 +3,13 @@
  */
 
 import { Trophy, Target, Zap } from 'lucide-react';
-import { GameResults } from '../../types/results.types';
+import { GameResults } from '../types/results.types';
 
 interface StatsBreakdownProps {
   results: GameResults;
 }
 
-export function StatsBreakdown({ results }: StatsBreakdownProps) {
+function StatsBreakdown({ results }: StatsBreakdownProps) {
   const { score, maxCombo, hitAccuracy, accuracy, totalNotes } = results;
 
   return (
@@ -102,3 +102,5 @@ export function StatsBreakdown({ results }: StatsBreakdownProps) {
     </div>
   );
 }
+
+export default StatsBreakdown;
