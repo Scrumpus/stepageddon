@@ -66,11 +66,22 @@ export const COMBO_MULTIPLIER = {
  * Visual/rendering configuration
  */
 export const VISUAL_CONFIG = {
-  ARROW_SPEED: 400,        // pixels per second
-  HIT_ZONE_Y: 600,         // Y position of hit zone
-  ARROW_SIZE: 80,          // Arrow size in pixels
-  VISIBLE_WINDOW: 2        // Seconds of lookahead for visible arrows
+  HIT_ZONE_Y: 80,          // Y position of hit zone (near top)
+  ARROW_SIZE: 72,          // Arrow size in pixels
+  VISIBLE_WINDOW: 2,       // Seconds of lookahead for visible arrows
+  SPAWN_Y: 700,            // Y position where arrows spawn (bottom)
+  // Speed is calculated based on tempo: faster tempo = faster arrows
+  BASE_SPEED: 300,         // Base pixels per second at 100 BPM
+  TEMPO_SPEED_FACTOR: 2.5, // Speed multiplier per BPM
 } as const;
+
+/**
+ * Calculate arrow speed based on song tempo
+ */
+export function getArrowSpeed(tempo: number): number {
+  // Scale speed with tempo: 120 BPM = ~400px/s, 180 BPM = ~550px/s
+  return VISUAL_CONFIG.BASE_SPEED + (tempo - 100) * VISUAL_CONFIG.TEMPO_SPEED_FACTOR;
+}
 
 /**
  * Key mapping for arrow controls

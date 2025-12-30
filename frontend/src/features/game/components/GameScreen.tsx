@@ -82,6 +82,7 @@ function GameScreen() {
     steps,
     gameState,
     songDuration: songData.duration,
+    tempo: songData.tempo || 120,
     onFinish: finishGame,
     onMiss: handleMiss,
   });

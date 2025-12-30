@@ -6,13 +6,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { GameState } from '@/types/common.types';
 import { Step, ActiveArrow } from '../types/step.types';
-import { VISUAL_CONFIG } from '../types/game.types';
+import { VISUAL_CONFIG, getArrowSpeed } from '../types/game.types';
 
 interface UseGameLoopParams {
   audioRef: React.RefObject<HTMLAudioElement>;
   steps: Step[];
   gameState: GameState;
   songDuration: number;
+  tempo: number;
   onFinish: () => void;
   onMiss: () => void;
 }
@@ -32,6 +33,7 @@ export function useGameLoop({
   steps,
   gameState,
   songDuration,
+  tempo,
   onFinish,
   onMiss,
 }: UseGameLoopParams): UseGameLoopReturn {
@@ -40,6 +42,9 @@ export function useGameLoop({
 
   const animationRef = useRef<number | null>(null);
   const processedStepsRef = useRef<Set<string>>(new Set());
+
+  // Calculate arrow speed based on tempo
+  const arrowSpeed = getArrowSpeed(tempo);
 
   useEffect(() => {
     // Only run game loop when playing
@@ -78,8 +83,9 @@ export function useGameLoop({
           }
 
           // Show arrows in visible window (-200ms to +2s)
+          // Arrows float UP: spawn at bottom (SPAWN_Y) and move to top (HIT_ZONE_Y)
           if (timeUntilHit >= -0.2 && timeUntilHit <= visibleWindow) {
-            const y = VISUAL_CONFIG.HIT_ZONE_Y - (timeUntilHit * VISUAL_CONFIG.ARROW_SPEED);
+            const y = VISUAL_CONFIG.HIT_ZONE_Y + (timeUntilHit * arrowSpeed);
             newActiveArrows.push({
               time: step.time,
               direction,
@@ -112,7 +118,7 @@ export function useGameLoop({
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [gameState, steps, songDuration, audioRef, onFinish, onMiss]);
+  }, [gameState, steps, songDuration, audioRef, onFinish, onMiss, arrowSpeed]);
 
   return {
     currentTime,
