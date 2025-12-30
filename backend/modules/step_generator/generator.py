@@ -5,11 +5,14 @@ Core chart generation algorithm. Takes analyzed audio data and generates
 a playable step chart according to difficulty constraints.
 """
 
+import logging
 from typing import List
 
 from .schemas import Beat, EnergySection, SustainedNote, SongStructure, Step, Chart, Direction, StepType, DifficultyConfig
 from .patterns import PatternTemplate
 from .audio_analysis import detect_energy_peaks
+
+logger = logging.getLogger(__name__)
 
 
 class StepGenerator:
@@ -30,7 +33,8 @@ class StepGenerator:
                       energy_sections: List[EnergySection],
                       sustained_notes: List[SustainedNote],
                       structure: SongStructure,
-                      tempo: float) -> Chart:
+                      tempo: float,
+                      onset_times: List[float] = None) -> Chart:
         """
         Main chart generation method.
 
@@ -41,6 +45,7 @@ class StepGenerator:
             sustained_notes: List of sustained notes for holds
             structure: Detected song structure
             tempo: Tempo in BPM
+            onset_times: Optional list of onset times (for denser charts)
 
         Returns:
             Complete Chart object
@@ -50,13 +55,20 @@ class StepGenerator:
         duration = structure.total_duration
         target_density = (self.config.min_density + self.config.max_density) / 2
 
-        available_beats = self._filter_beats(beats)
-
-        breakpoint()
+        # Use onset times if enabled, otherwise filter beats
+        if self.config.use_onsets and onset_times:
+            available_beats = list(onset_times)
+            logger.info(f"Using {len(available_beats)} onset times as step candidates")
+        else:
+            available_beats = self._filter_beats(beats)
+            logger.info(f"Using {len(available_beats)} filtered beats as step candidates")
 
         if self.config.use_8th_notes or self.config.use_16th_notes:
+            before_count = len(available_beats)
             available_beats.extend(subdivisions)
-            available_beats.sort()
+            # Remove duplicates and sort
+            available_beats = sorted(set(available_beats))
+            logger.info(f"Added subdivisions: {before_count} -> {len(available_beats)} candidates")
 
         # Phase 1: Place hold notes
         if self.config.allow_holds and sustained_notes:
@@ -77,25 +89,43 @@ class StepGenerator:
                     available_beats.remove(nearest)
 
         # Phase 3: Fill with patterns based on energy
+        total_section_beats = 0
+        total_beats_used = 0
         for section in energy_sections:
             section_beats = [b for b in available_beats
                            if section.start_time <= b <= section.end_time]
+            total_section_beats += len(section_beats)
 
-            density_multiplier = 1.0 + (section.energy_level - 0.5) * self.config.energy_scale_factor
-            section_target = int(len(section_beats) * density_multiplier)
-            section_target = min(section_target, len(section_beats))
+            # When using onsets, use most of them (already filtered by threshold)
+            if self.config.use_onsets:
+                # Use 80-100% of onsets based on energy (higher energy = more steps)
+                base_usage = 0.8
+                energy_bonus = section.energy_level * 0.2
+                section_target = int(len(section_beats) * (base_usage + energy_bonus))
+            else:
+                density_multiplier = 1.0 + (section.energy_level - 0.5) * self.config.energy_scale_factor
+                section_target = int(len(section_beats) * density_multiplier)
+                section_target = min(section_target, len(section_beats))
 
             beats_to_use = self._select_beats_by_energy(section_beats, beats, section_target)
+            total_beats_used += len(beats_to_use)
             section_steps = self._generate_patterns(beats_to_use, section.intensity, structure)
             steps.extend(section_steps)
 
+        logger.info(f"Phase 3: {total_section_beats} section beats -> {total_beats_used} used -> {len(steps)} steps")
+
+        # Sort steps before structure/validation phases
+        steps.sort(key=lambda s: s.time)
+
         # Phase 4: Structure-aware adjustments
+        before_structure = len(steps)
         steps = self._adjust_for_structure(steps, structure)
+        logger.info(f"Phase 4 (structure): {before_structure} -> {len(steps)} steps")
 
         # Phase 5: Validate
+        before_validate = len(steps)
         steps = self._validate_chart(steps, tempo)
-
-        steps.sort(key=lambda s: s.time)
+        logger.info(f"Phase 5 (validate): {before_validate} -> {len(steps)} steps")
 
         return Chart(
             steps=steps,
@@ -157,6 +187,10 @@ class StepGenerator:
                                 all_beats: List[Beat],
                                 target_count: int) -> List[float]:
         """Select strongest beats from a section."""
+        # When using onsets, use all of them (they're already filtered by threshold)
+        if self.config.use_onsets:
+            return sorted(section_beats)[:target_count]
+
         beat_strengths = {b.time: b.strength for b in all_beats}
 
         sorted_beats = sorted(section_beats,

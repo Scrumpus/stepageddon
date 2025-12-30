@@ -122,6 +122,8 @@ class DifficultyConfig(BaseModel):
     use_offbeats: bool
     use_8th_notes: bool
     use_16th_notes: bool
+    use_onsets: bool = False  # Use onset detection for denser step placement
+    onset_threshold: float = Field(default=0.3, ge=0.0, le=1.0)  # Min onset strength
     max_consecutive_jumps: int
     max_stream_length: int
     allow_crossovers: bool

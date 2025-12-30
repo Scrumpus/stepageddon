@@ -14,6 +14,42 @@ from typing import List, Tuple
 from .schemas import Beat, EnergySection, SustainedNote, SongStructure
 
 
+def analyze_onsets(y: np.ndarray, sr: int, strength_threshold: float = 0.3) -> Tuple[List[float], np.ndarray]:
+    """
+    Detect all onsets (note attacks) in the audio.
+
+    This captures every distinct sound event, not just the rhythmic pulse.
+    Use this for denser step charts that follow the actual notes being played.
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+        strength_threshold: Minimum onset strength (0.0-1.0) to include
+
+    Returns:
+        Tuple of (list of onset times in seconds, onset strength envelope)
+    """
+    # Get onset strength envelope
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+
+    # Normalize envelope to 0-1
+    onset_env_norm = onset_env / (onset_env.max() + 1e-8)
+
+    # Detect onset frames with backtracking for precision
+    onset_frames = librosa.onset.onset_detect(
+        y=y, sr=sr, units='frames', backtrack=True
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr)
+
+    # Filter by strength threshold
+    filtered_times = []
+    for frame, time in zip(onset_frames, onset_times):
+        if frame < len(onset_env_norm) and onset_env_norm[frame] >= strength_threshold:
+            filtered_times.append(float(time))
+
+    return filtered_times, onset_env
+
+
 def analyze_beats(y: np.ndarray, sr: int) -> Tuple[List[Beat], float]:
     """
     Detect and classify all beats in the audio.

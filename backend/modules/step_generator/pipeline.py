@@ -12,6 +12,7 @@ from .schemas import Chart, StepType
 from .difficulty import DIFFICULTY_PRESETS
 from .audio_analysis import (
     analyze_beats,
+    analyze_onsets,
     detect_subdivisions,
     analyze_energy,
     detect_sustained_notes,
@@ -44,6 +45,8 @@ class ChartGenerationPipeline:
         logger.info(f"Loading audio from {audio_path}...")
         y, sr = librosa.load(audio_path)
 
+        config = DIFFICULTY_PRESETS[difficulty]
+
         logger.info("Analyzing audio...")
         beats, tempo = analyze_beats(y, sr)
         subdivisions = detect_subdivisions(y, sr, [b.time for b in beats])
@@ -51,11 +54,16 @@ class ChartGenerationPipeline:
         sustained_notes = detect_sustained_notes(y, sr)
         structure = detect_structure(y, sr)
 
+        # Analyze onsets if enabled for this difficulty
+        onset_times = None
+        if config.use_onsets:
+            onset_times, _ = analyze_onsets(y, sr, strength_threshold=config.onset_threshold)
+            logger.info(f"Detected {len(onset_times)} onsets (threshold: {config.onset_threshold})")
+
         logger.info(f"Detected {len(beats)} beats at {tempo:.1f} BPM")
         logger.info(f"Found {len(sustained_notes)} sustained notes for holds")
 
         logger.info(f"Generating {difficulty} chart...")
-        config = DIFFICULTY_PRESETS[difficulty]
         generator = StepGenerator(config)
 
         chart = generator.generate_chart(
@@ -64,7 +72,8 @@ class ChartGenerationPipeline:
             energy_sections=energy_sections,
             sustained_notes=sustained_notes,
             structure=structure,
-            tempo=tempo
+            tempo=tempo,
+            onset_times=onset_times
         )
 
         logger.info(f"Generated {len(chart.steps)} steps")

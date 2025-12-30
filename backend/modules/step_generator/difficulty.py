@@ -47,6 +47,8 @@ DIFFICULTY_PRESETS = {
         use_offbeats=True,
         use_8th_notes=True,
         use_16th_notes=False,
+        use_onsets=True,
+        onset_threshold=0.2,  # Lower threshold = more onsets captured
         max_consecutive_jumps=2,
         max_stream_length=6,
         allow_crossovers=True,
@@ -69,6 +71,8 @@ DIFFICULTY_PRESETS = {
         use_offbeats=True,
         use_8th_notes=True,
         use_16th_notes=True,
+        use_onsets=True,
+        onset_threshold=0.1,  # Low threshold = capture most onsets
         max_consecutive_jumps=4,
         max_stream_length=16,
         allow_crossovers=True,

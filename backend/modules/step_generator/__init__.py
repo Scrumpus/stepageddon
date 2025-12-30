@@ -26,6 +26,7 @@ from .patterns import PatternTemplate
 # Audio analysis functions (for advanced users)
 from .audio_analysis import (
     analyze_beats,
+    analyze_onsets,
     detect_subdivisions,
     analyze_energy,
     detect_energy_peaks,
@@ -64,6 +65,7 @@ __all__ = [
 
     # Audio analysis
     "analyze_beats",
+    "analyze_onsets",
     "detect_subdivisions",
     "analyze_energy",
     "detect_energy_peaks",
