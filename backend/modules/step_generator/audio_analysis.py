@@ -188,7 +188,10 @@ def detect_energy_peaks(sections: List[EnergySection]) -> List[float]:
 
 def detect_sustained_notes(y: np.ndarray, sr: int, min_duration: float = 0.5) -> List[SustainedNote]:
     """
-    Detect sustained notes/vocals for hold note placement.
+    Detect sustained notes using energy analysis (more reliable than pitch tracking).
+
+    Looks for periods of sustained high energy between onsets, which indicate
+    held notes, sustained synths, or vocal holds.
 
     Args:
         y: Audio time series
@@ -198,58 +201,97 @@ def detect_sustained_notes(y: np.ndarray, sr: int, min_duration: float = 0.5) ->
     Returns:
         List of SustainedNote objects representing melodic holds
     """
-    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-    times = librosa.times_like(pitches, sr=sr)
+    # Get RMS energy with small hop for precision
+    hop_length = 512
+    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+    times = librosa.times_like(rms, sr=sr, hop_length=hop_length)
 
-    pitch_sequence = []
-    for t in range(pitches.shape[1]):
-        index = magnitudes[:, t].argmax()
-        pitch = pitches[index, t]
-        confidence = magnitudes[index, t]
-        pitch_sequence.append((float(times[t]), float(pitch), float(confidence)))
+    # Smooth the energy curve
+    rms_smooth = gaussian_filter1d(rms, sigma=3)
+
+    # Normalize
+    rms_norm = rms_smooth / (rms_smooth.max() + 1e-8)
+
+    # Get onsets to find gaps
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, units='frames')
 
     sustained = []
-    current_note = None
 
-    for time, pitch, confidence in pitch_sequence:
-        if confidence < 0.1 or pitch < 50:
-            if current_note:
-                if current_note['end'] - current_note['start'] >= min_duration:
-                    sustained.append(SustainedNote(
-                        start_time=current_note['start'],
-                        end_time=current_note['end'],
-                        pitch=current_note['pitch'],
-                        confidence=current_note['confidence']
-                    ))
-                current_note = None
+    # Look for sustained energy between onsets
+    for i in range(len(onset_frames) - 1):
+        start_frame = onset_frames[i]
+        end_frame = onset_frames[i + 1]
+
+        # Check duration
+        start_time = float(times[start_frame]) if start_frame < len(times) else 0
+        end_time = float(times[min(end_frame, len(times) - 1)])
+        duration = end_time - start_time
+
+        if duration < min_duration:
             continue
 
-        if current_note is None:
-            current_note = {
-                'start': time,
-                'end': time,
-                'pitch': pitch,
-                'confidence': confidence
-            }
-        else:
-            if abs(pitch - current_note['pitch']) < 2:
-                current_note['end'] = time
-            else:
-                if current_note['end'] - current_note['start'] >= min_duration:
-                    sustained.append(SustainedNote(
-                        start_time=current_note['start'],
-                        end_time=current_note['end'],
-                        pitch=current_note['pitch'],
-                        confidence=current_note['confidence']
-                    ))
-                current_note = {
-                    'start': time,
-                    'end': time,
-                    'pitch': pitch,
-                    'confidence': confidence
-                }
+        # Check if energy stays high throughout
+        segment_energy = rms_norm[start_frame:end_frame]
+        if len(segment_energy) == 0:
+            continue
+
+        avg_energy = float(np.mean(segment_energy))
+        min_energy = float(np.min(segment_energy))
+
+        # Sustained note: high average energy that doesn't drop much
+        if avg_energy > 0.3 and min_energy > avg_energy * 0.5:
+            # Use spectral centroid as proxy for "pitch" (higher = brighter)
+            segment_audio = y[start_frame * hop_length:end_frame * hop_length]
+            if len(segment_audio) > 0:
+                centroid = librosa.feature.spectral_centroid(y=segment_audio, sr=sr)
+                pitch_proxy = float(np.mean(centroid)) / 100  # Scale to reasonable range
+
+                sustained.append(SustainedNote(
+                    start_time=start_time,
+                    end_time=end_time,
+                    pitch=pitch_proxy,
+                    confidence=avg_energy
+                ))
 
     return sustained
+
+
+def quantize_to_grid(times: List[float], tempo: float, grid_division: int = 8) -> List[float]:
+    """
+    Quantize times to musical grid based on tempo.
+
+    Args:
+        times: List of times in seconds
+        tempo: Tempo in BPM
+        grid_division: Grid resolution (4=quarter, 8=eighth, 16=sixteenth)
+
+    Returns:
+        List of quantized times snapped to nearest grid position
+    """
+    if not times or tempo <= 0:
+        return times
+
+    # Calculate grid spacing
+    beat_duration = 60.0 / tempo  # Duration of one beat
+    grid_spacing = beat_duration / (grid_division / 4)  # Grid unit duration
+
+    quantized = []
+    for t in times:
+        # Find nearest grid position
+        grid_position = round(t / grid_spacing)
+        quantized_time = grid_position * grid_spacing
+        quantized.append(quantized_time)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique = []
+    for t in quantized:
+        t_rounded = round(t, 4)  # Avoid floating point issues
+        if t_rounded not in seen:
+            seen.add(t_rounded)
+            unique.append(t_rounded)
+
+    return sorted(unique)
 
 
 def detect_structure(y: np.ndarray, sr: int) -> SongStructure:

@@ -34,3 +34,16 @@ export interface ActiveArrow {
   y: number;                 // Y position for rendering
   timeUntilHit: number;      // Time until hit zone in seconds
 }
+
+/**
+ * Active hold being tracked during gameplay
+ */
+export interface ActiveHold {
+  arrowKey: string;          // Unique key: stepIndex-arrowIndex
+  direction: Direction;      // Direction being held
+  startTime: number;         // When hold started (audio time)
+  endTime: number;           // When hold should end (audio time)
+  lastTickTime: number;      // Last time we awarded hold points
+  totalDuration: number;     // Original hold duration
+  holdProgress: number;      // Progress 0-1 for animation
+}

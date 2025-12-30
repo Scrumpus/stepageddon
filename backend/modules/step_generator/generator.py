@@ -202,8 +202,9 @@ class StepGenerator:
     def _generate_patterns(self, beat_times: List[float],
                           intensity: str,
                           structure: SongStructure) -> List[Step]:
-        """Generate step patterns for given beats."""
+        """Generate step patterns for given beats with musical flow."""
         steps = []
+        beat_times = sorted(beat_times)  # Ensure sorted
         i = 0
 
         while i < len(beat_times):
@@ -212,31 +213,49 @@ class StepGenerator:
             pattern_choice = self._choose_pattern(time, intensity, structure, steps)
 
             if pattern_choice == 'stream' and i + 4 < len(beat_times):
-                stream_length = min(self.config.max_stream_length, len(beat_times) - i)
-                interval = beat_times[i + 1] - beat_times[i] if i + 1 < len(beat_times) else 0.25
+                # Check if beats are evenly spaced (actual stream)
+                intervals = [beat_times[i+j+1] - beat_times[i+j] for j in range(min(4, len(beat_times)-i-1))]
+                if intervals and max(intervals) - min(intervals) < 0.05:
+                    stream_length = min(self.config.max_stream_length, len(beat_times) - i)
+                    interval = intervals[0]
 
-                stream_steps = PatternTemplate.single_stream(
-                    time, stream_length, interval, Direction.LEFT
-                )
-                steps.extend(stream_steps)
-                i += stream_length
+                    # Generate stream with proper foot alternation
+                    for j in range(stream_length):
+                        arrow = self._choose_single_arrow(steps, time + j * interval)
+                        steps.append(Step(time=beat_times[i + j], arrows=[arrow], step_type=StepType.TAP))
+                    i += stream_length
+                else:
+                    # Not a real stream, just do single
+                    arrow = self._choose_single_arrow(steps, time)
+                    steps.append(Step(time=time, arrows=[arrow], step_type=StepType.TAP))
+                    i += 1
 
             elif pattern_choice == 'jump' and self.config.allow_doubles:
-                jump = PatternTemplate.jump_pattern(time, 'corners')
-                steps.append(jump)
+                # Use foot-appropriate jumps
+                seed = int(time * 100) % 3
+                if seed == 0:
+                    arrows = [Direction.LEFT, Direction.RIGHT]  # Wide jump
+                elif seed == 1:
+                    arrows = [Direction.DOWN, Direction.UP]  # Vertical jump
+                else:
+                    arrows = [Direction.LEFT, Direction.UP]  # Diagonal
+                steps.append(Step(time=time, arrows=arrows, step_type=StepType.TAP))
                 i += 1
 
             elif pattern_choice == 'crossover' and self.config.allow_crossovers:
                 if i + 3 < len(beat_times):
-                    interval = beat_times[i + 1] - beat_times[i]
-                    crossover = PatternTemplate.crossover_pattern(time, interval)
-                    steps.extend(crossover)
+                    # L-R-L-R or R-L-R-L pattern
+                    crossover_arrows = [Direction.LEFT, Direction.RIGHT, Direction.LEFT, Direction.RIGHT]
+                    for j, arrow in enumerate(crossover_arrows):
+                        if i + j < len(beat_times):
+                            steps.append(Step(time=beat_times[i + j], arrows=[arrow], step_type=StepType.TAP))
                     i += 4
                 else:
-                    steps.append(Step(time=time, arrows=[Direction.LEFT], step_type=StepType.TAP))
+                    arrow = self._choose_single_arrow(steps, time)
+                    steps.append(Step(time=time, arrows=[arrow], step_type=StepType.TAP))
                     i += 1
             else:
-                arrow = self._choose_single_arrow(steps)
+                arrow = self._choose_single_arrow(steps, time)
                 steps.append(Step(time=time, arrows=[arrow], step_type=StepType.TAP))
                 i += 1
 
@@ -269,22 +288,51 @@ class StepGenerator:
 
         return 'single'
 
-    def _choose_single_arrow(self, existing_steps: List[Step]) -> Direction:
-        """Choose next arrow for natural alternation."""
+    def _choose_single_arrow(self, existing_steps: List[Step], current_time: float = 0) -> Direction:
+        """
+        Choose next arrow for natural dance flow.
+
+        Uses foot alternation patterns that feel natural:
+        - Left foot: LEFT, DOWN
+        - Right foot: UP, RIGHT
+
+        This creates natural stepping patterns instead of random rotation.
+        """
+        left_foot = [Direction.LEFT, Direction.DOWN]
+        right_foot = [Direction.UP, Direction.RIGHT]
+
         if not existing_steps:
+            # Start with left foot
             return Direction.LEFT
 
         last_step = existing_steps[-1]
         last_arrow = last_step.arrows[-1] if last_step.arrows else Direction.LEFT
 
-        rotation = {
-            Direction.LEFT: Direction.DOWN,
-            Direction.DOWN: Direction.UP,
-            Direction.UP: Direction.RIGHT,
-            Direction.RIGHT: Direction.LEFT
-        }
+        # Determine which foot was last used
+        last_was_left = last_arrow in left_foot
 
-        return rotation[last_arrow]
+        # Use time to add variety within each foot
+        time_seed = int(current_time * 100) % 100
+
+        if last_was_left:
+            # Switch to right foot
+            return right_foot[0] if time_seed < 60 else right_foot[1]
+        else:
+            # Switch to left foot
+            return left_foot[0] if time_seed < 60 else left_foot[1]
+
+    def _get_onset_strength(self, time: float, onset_times: List[float], onset_env: any = None) -> float:
+        """Get relative strength of an onset (0-1)."""
+        if not onset_times:
+            return 0.5
+
+        # Find nearest onset
+        if time in onset_times:
+            idx = onset_times.index(time)
+            # Earlier in list = stronger (they're sorted by detection)
+            return 1.0 - (idx / len(onset_times)) * 0.5
+
+        return 0.5
 
     def _adjust_for_structure(self, steps: List[Step],
                              structure: SongStructure) -> List[Step]:

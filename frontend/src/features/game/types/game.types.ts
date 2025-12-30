@@ -63,6 +63,16 @@ export const COMBO_MULTIPLIER = {
 } as const;
 
 /**
+ * Hold note scoring configuration
+ */
+export const HOLD_SCORING = {
+  TICK_INTERVAL: 0.1,        // Award points every 100ms while holding
+  POINTS_PER_TICK: 10,       // Base points per tick
+  COMPLETION_BONUS: 50,      // Bonus for completing the hold
+  EARLY_RELEASE_PENALTY: 0,  // No penalty, just stop scoring
+} as const;
+
+/**
  * Visual/rendering configuration
  */
 export const VISUAL_CONFIG = {

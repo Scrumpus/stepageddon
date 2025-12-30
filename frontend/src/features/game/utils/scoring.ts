@@ -2,7 +2,7 @@
  * Scoring utilities for game play
  */
 
-import { TIMING, POINTS, COMBO_MULTIPLIER, Judgment, HitAccuracy } from '../types';
+import { TIMING, POINTS, COMBO_MULTIPLIER, HOLD_SCORING, Judgment, HitAccuracy } from '../types';
 
 /**
  * Evaluate hit timing and return judgment
@@ -64,4 +64,24 @@ export const calculateAccuracy = (hitAccuracy: HitAccuracy): number => {
     (hitAccuracy.miss * 0);
 
   return (weighted / (total * 100)) * 100;
+};
+
+/**
+ * Calculate hold tick points with combo multiplier
+ * @param combo - Current combo count
+ * @returns Points for this hold tick
+ */
+export const calculateHoldTickPoints = (combo: number): number => {
+  const multiplier = getComboMultiplier(combo);
+  return Math.floor(HOLD_SCORING.POINTS_PER_TICK * multiplier);
+};
+
+/**
+ * Calculate hold completion bonus with combo multiplier
+ * @param combo - Current combo count
+ * @returns Bonus points for completing the hold
+ */
+export const calculateHoldCompletionBonus = (combo: number): number => {
+  const multiplier = getComboMultiplier(combo);
+  return Math.floor(HOLD_SCORING.COMPLETION_BONUS * multiplier);
 };

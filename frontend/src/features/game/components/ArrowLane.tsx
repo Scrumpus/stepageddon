@@ -1,14 +1,17 @@
 /**
  * Arrow lane - renders target zone and active arrows (DDR style)
+ * Supports hold notes with trails
  */
 
 import { Direction } from '@/types/common.types';
-import { ActiveArrow } from '../types/step.types';
+import { ActiveArrow, ActiveHold } from '../types/step.types';
 import { VISUAL_CONFIG, DIRECTIONS } from '../types/game.types';
 
 interface ArrowLaneProps {
   activeArrows: ActiveArrow[];
   activeKeys: Record<Direction, boolean>;
+  activeHolds: ActiveHold[];
+  arrowSpeed: number;  // Pixels per second for calculating hold trail length
 }
 
 // DDR-style color scheme
@@ -64,7 +67,69 @@ function ReceptorSVG({ color, active, size = 64 }: { color: string; active: bool
   );
 }
 
-function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
+// Hold trail component
+function HoldTrail({
+  color,
+  length,
+  width,
+  glowColor,
+  progress = 0,
+  isActive = false,
+}: {
+  color: string;
+  length: number;
+  width: number;
+  glowColor: string;
+  progress?: number;  // 0-1 indicating how much of the hold has been completed
+  isActive?: boolean; // Whether the hold is currently being held
+}) {
+  const trailWidth = width * 0.35;  // Trail is narrower than arrow
+  // Shrink trail from bottom as hold progresses
+  const remainingLength = length * (1 - progress);
+  // Active holds glow brighter
+  const activeGlow = isActive ? 1.5 : 1;
+
+  return (
+    <div
+      className="absolute transition-all duration-75"
+      style={{
+        width: trailWidth,
+        height: Math.max(remainingLength, 0),
+        left: (width - trailWidth) / 2,
+        top: width * 0.6,  // Start from bottom of arrow head
+        background: `linear-gradient(to bottom, ${color}, ${color}88 20%, ${color}66 80%, ${color}33)`,
+        borderRadius: trailWidth / 2,
+        boxShadow: `0 0 ${10 * activeGlow}px ${glowColor}66, inset 0 0 8px rgba(255,255,255,0.3)`,
+        opacity: isActive ? 1 : 0.7,
+      }}
+    >
+      {/* Inner glow line */}
+      <div
+        className="absolute left-1/2 -translate-x-1/2 h-full"
+        style={{
+          width: trailWidth * 0.4,
+          background: `linear-gradient(to bottom, rgba(255,255,255,0.6), rgba(255,255,255,0.2) 50%, transparent)`,
+          borderRadius: trailWidth / 2,
+        }}
+      />
+      {/* End cap - only show if trail has length */}
+      {remainingLength > trailWidth && (
+        <div
+          className="absolute bottom-0 left-1/2 -translate-x-1/2"
+          style={{
+            width: trailWidth * 1.5,
+            height: trailWidth * 1.5,
+            background: color,
+            borderRadius: '50%',
+            boxShadow: `0 0 ${15 * activeGlow}px ${glowColor}`,
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed }: ArrowLaneProps) {
   const arrowSize = VISUAL_CONFIG.ARROW_SIZE;
   const gap = 16;
   const totalWidth = (arrowSize * 4) + (gap * 3);
@@ -136,6 +201,15 @@ function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
         const distanceToHit = Math.abs(arrow.timeUntilHit);
         const glowIntensity = distanceToHit < 0.3 ? (0.3 - distanceToHit) / 0.3 : 0;
 
+        // Calculate hold trail length if this is a hold note
+        const isHold = arrow.type === 'hold' && arrow.hold_duration;
+        const trailLength = isHold ? arrow.hold_duration! * arrowSpeed : 0;
+
+        // Find if this hold is being actively held
+        const activeHold = activeHolds.find((h) => h.arrowKey === arrowKey);
+        const holdProgress = activeHold?.holdProgress ?? 0;
+        const isActivelyHeld = !!activeHold;
+
         return (
           <div
             key={arrowKey}
@@ -144,14 +218,32 @@ function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
               top: `${arrow.y}px`,
               left: `calc(50% + ${x}px)`,
               width: arrowSize,
-              height: arrowSize,
-              transform: `rotate(${rotation}deg)`,
-              filter: glowIntensity > 0
-                ? `drop-shadow(0 0 ${10 + glowIntensity * 20}px ${colors.glow})`
-                : 'none',
             }}
           >
-            <ArrowSVG color={colors.main} size={arrowSize} />
+            {/* Hold trail (not rotated - stays vertical) */}
+            {isHold && (
+              <HoldTrail
+                color={colors.main}
+                length={trailLength}
+                width={arrowSize}
+                glowColor={colors.glow}
+                progress={holdProgress}
+                isActive={isActivelyHeld}
+              />
+            )}
+            {/* Arrow head (rotated) */}
+            <div
+              style={{
+                width: arrowSize,
+                height: arrowSize,
+                transform: `rotate(${rotation}deg)`,
+                filter: glowIntensity > 0
+                  ? `drop-shadow(0 0 ${10 + glowIntensity * 20}px ${colors.glow})`
+                  : 'none',
+              }}
+            >
+              <ArrowSVG color={colors.main} size={arrowSize} />
+            </div>
           </div>
         );
       })}

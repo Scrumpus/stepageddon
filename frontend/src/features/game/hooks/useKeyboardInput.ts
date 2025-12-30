@@ -9,6 +9,7 @@ import { KEY_MAP } from '../types/game.types';
 interface UseKeyboardInputParams {
   gameState: GameState;
   onArrowPress: (direction: Direction) => void;
+  onArrowRelease: (direction: Direction) => void;
   onPause: () => void;
 }
 
@@ -18,11 +19,12 @@ interface UseKeyboardInputReturn {
 
 /**
  * Handle keyboard events for game controls
- * Tracks active keys for visual feedback
+ * Tracks active keys for visual feedback and hold note detection
  */
 export function useKeyboardInput({
   gameState,
   onArrowPress,
+  onArrowRelease,
   onPause,
 }: UseKeyboardInputParams): UseKeyboardInputReturn {
   const [activeKeys, setActiveKeys] = useState<Record<Direction, boolean>>({
@@ -47,12 +49,18 @@ export function useKeyboardInput({
     [gameState, onArrowPress, onPause]
   );
 
-  const handleKeyUp = useCallback((e: KeyboardEvent) => {
-    const direction = KEY_MAP[e.key];
-    if (direction) {
-      setActiveKeys((prev) => ({ ...prev, [direction]: false }));
-    }
-  }, []);
+  const handleKeyUp = useCallback(
+    (e: KeyboardEvent) => {
+      const direction = KEY_MAP[e.key];
+      if (direction) {
+        setActiveKeys((prev) => ({ ...prev, [direction]: false }));
+        if (gameState === GameState.PLAYING) {
+          onArrowRelease(direction);
+        }
+      }
+    },
+    [gameState, onArrowRelease]
+  );
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);

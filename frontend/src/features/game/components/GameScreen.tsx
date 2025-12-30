@@ -3,16 +3,17 @@
  * Composes hooks and subcomponents for clean separation of concerns
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { GameState } from '@/types/common.types';
 import { useApp } from '@/app/providers/AppProvider';
-import { Judgment, HitAccuracy } from '../types/game.types';
+import { Judgment, HitAccuracy, getArrowSpeed } from '../types/game.types';
 import { calculateAccuracy } from '../utils/scoring';
 import {
   useGameLoop,
   useHitDetection,
   useKeyboardInput,
   useAudioPlayer,
+  useHoldTracking,
 } from '../hooks';
 import GameHUD from './GameHUD';
 import ArrowLane from './ArrowLane';
@@ -87,11 +88,25 @@ function GameScreen() {
     onMiss: handleMiss,
   });
 
+  // Hold tracking hook
+  const { activeHolds, startHold, releaseHold, updateHolds } = useHoldTracking({
+    combo,
+    onScoreUpdate: (points) => setScore((prev) => prev + points),
+  });
+
+  // Update holds each frame when playing
+  useEffect(() => {
+    if (gameState === GameState.PLAYING) {
+      updateHolds(currentTime);
+    }
+  }, [currentTime, gameState, updateHolds]);
+
   // Hit detection hook
   const { checkHit } = useHitDetection({
     activeArrows,
     processedStepsRef,
     combo,
+    currentTime,
     onScoreUpdate: (points) => setScore((prev) => prev + points),
     onComboUpdate: (newCombo) => {
       setCombo(newCombo);
@@ -105,12 +120,14 @@ function GameScreen() {
     },
     onJudgmentDisplay: ({ judgment, points }) => showJudgment(judgment, points),
     onMiss: handleMiss,
+    onHoldStart: startHold,
   });
 
   // Keyboard input hook
   const { activeKeys } = useKeyboardInput({
     gameState,
     onArrowPress: checkHit,
+    onArrowRelease: releaseHold,
     onPause: togglePause,
   });
 
@@ -133,7 +150,12 @@ function GameScreen() {
         onReturnToMenu={resetGame}
       />
 
-      <ArrowLane activeArrows={activeArrows} activeKeys={activeKeys} />
+      <ArrowLane
+        activeArrows={activeArrows}
+        activeKeys={activeKeys}
+        activeHolds={activeHolds}
+        arrowSpeed={getArrowSpeed(songData.tempo || 120)}
+      />
 
       <JudgmentDisplay judgment={judgmentDisplay} />
 

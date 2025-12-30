@@ -32,6 +32,7 @@ from .audio_analysis import (
     detect_energy_peaks,
     detect_sustained_notes,
     detect_structure,
+    quantize_to_grid,
 )
 
 # Additional data schemas
@@ -71,4 +72,5 @@ __all__ = [
     "detect_energy_peaks",
     "detect_sustained_notes",
     "detect_structure",
+    "quantize_to_grid",
 ]

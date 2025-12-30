@@ -1,11 +1,11 @@
 /**
  * Hit detection hook - handles arrow hit detection and scoring
- * CRITICAL: Fixes state mutation bug from original (closest.hit = true)
+ * Supports both tap and hold notes
  */
 
 import { useCallback } from 'react';
 import { Direction } from '@/types/common.types';
-import { ActiveArrow } from '../types/step.types';
+import { ActiveArrow, ActiveHold } from '../types/step.types';
 import { Judgment, JudgmentDisplay, TIMING } from '../types/game.types';
 import { evaluateHit, calculatePoints } from '../utils/scoring';
 
@@ -13,11 +13,13 @@ interface UseHitDetectionParams {
   activeArrows: ActiveArrow[];
   processedStepsRef: React.MutableRefObject<Set<string>>;
   combo: number;
+  currentTime: number;
   onScoreUpdate: (points: number) => void;
   onComboUpdate: (newCombo: number) => void;
   onHitAccuracyUpdate: (judgment: Judgment) => void;
   onJudgmentDisplay: (display: JudgmentDisplay) => void;
   onMiss: () => void;
+  onHoldStart: (hold: ActiveHold) => void;
 }
 
 interface UseHitDetectionReturn {
@@ -26,17 +28,19 @@ interface UseHitDetectionReturn {
 
 /**
  * Check for hits and update score/combo
- * Uses immutable updates (fixes mutation bug from original)
+ * Handles both tap and hold notes
  */
 export function useHitDetection({
   activeArrows,
   processedStepsRef,
   combo,
+  currentTime,
   onScoreUpdate,
   onComboUpdate,
   onHitAccuracyUpdate,
   onJudgmentDisplay,
   onMiss,
+  onHoldStart,
 }: UseHitDetectionParams): UseHitDetectionReturn {
   const checkHit = useCallback(
     (direction: Direction) => {
@@ -75,6 +79,20 @@ export function useHitDetection({
 
         // Show judgment feedback
         onJudgmentDisplay({ judgment, points });
+
+        // If this is a hold note, start tracking the hold
+        if (closest.type === 'hold' && closest.hold_duration) {
+          const holdEndTime = closest.time + closest.hold_duration;
+          onHoldStart({
+            arrowKey,
+            direction: closest.direction,
+            startTime: currentTime,
+            endTime: holdEndTime,
+            lastTickTime: currentTime,
+            totalDuration: closest.hold_duration,
+            holdProgress: 0,
+          });
+        }
       } else {
         onMiss();
       }
@@ -83,11 +101,13 @@ export function useHitDetection({
       activeArrows,
       processedStepsRef,
       combo,
+      currentTime,
       onScoreUpdate,
       onComboUpdate,
       onHitAccuracyUpdate,
       onJudgmentDisplay,
       onMiss,
+      onHoldStart,
     ]
   );
 

@@ -16,7 +16,8 @@ from .audio_analysis import (
     detect_subdivisions,
     analyze_energy,
     detect_sustained_notes,
-    detect_structure
+    detect_structure,
+    quantize_to_grid
 )
 from .generator import StepGenerator
 
@@ -57,8 +58,14 @@ class ChartGenerationPipeline:
         # Analyze onsets if enabled for this difficulty
         onset_times = None
         if config.use_onsets:
-            onset_times, _ = analyze_onsets(y, sr, strength_threshold=config.onset_threshold)
-            logger.info(f"Detected {len(onset_times)} onsets (threshold: {config.onset_threshold})")
+            raw_onsets, _ = analyze_onsets(y, sr, strength_threshold=config.onset_threshold)
+            logger.info(f"Detected {len(raw_onsets)} raw onsets (threshold: {config.onset_threshold})")
+
+            # Quantize to musical grid for better flow
+            # Use 16th notes for expert, 8th notes for others
+            grid_division = 16 if difficulty == 'expert' else 8
+            onset_times = quantize_to_grid(raw_onsets, tempo, grid_division)
+            logger.info(f"Quantized to {len(onset_times)} grid-aligned onsets ({grid_division}th notes)")
 
         logger.info(f"Detected {len(beats)} beats at {tempo:.1f} BPM")
         logger.info(f"Found {len(sustained_notes)} sustained notes for holds")
