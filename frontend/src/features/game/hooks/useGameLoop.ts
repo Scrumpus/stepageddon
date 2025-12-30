@@ -20,7 +20,7 @@ interface UseGameLoopParams {
 interface UseGameLoopReturn {
   currentTime: number;
   activeArrows: ActiveArrow[];
-  processedStepsRef: React.MutableRefObject<Set<number>>;
+  processedStepsRef: React.MutableRefObject<Set<string>>;
 }
 
 /**
@@ -39,7 +39,7 @@ export function useGameLoop({
   const [activeArrows, setActiveArrows] = useState<ActiveArrow[]>([]);
 
   const animationRef = useRef<number | null>(null);
-  const processedStepsRef = useRef<Set<number>>(new Set());
+  const processedStepsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     // Only run game loop when playing
@@ -60,29 +60,38 @@ export function useGameLoop({
       const visibleWindow = VISUAL_CONFIG.VISIBLE_WINDOW;
       const newActiveArrows: ActiveArrow[] = [];
 
-      steps.forEach((step, index) => {
+      steps.forEach((step, stepIndex) => {
         const timeUntilHit = step.time - currentTime;
 
-        // Skip if already processed
-        if (processedStepsRef.current.has(index)) return;
-
         // Check for missed arrows (-200ms grace period)
-        if (timeUntilHit < -0.2) {
-          processedStepsRef.current.add(index);
-          onMiss();
-          return;
-        }
+        // Each arrow in the step is tracked separately
+        step.arrows.forEach((direction, arrowIndex) => {
+          const arrowKey = `${stepIndex}-${arrowIndex}`;
 
-        // Show arrows in visible window (-200ms to +2s)
-        if (timeUntilHit >= -0.2 && timeUntilHit <= visibleWindow) {
-          const y = VISUAL_CONFIG.HIT_ZONE_Y - (timeUntilHit * VISUAL_CONFIG.ARROW_SPEED);
-          newActiveArrows.push({
-            ...step,
-            index,
-            y,
-            timeUntilHit,
-          });
-        }
+          // Skip if already processed
+          if (processedStepsRef.current.has(arrowKey)) return;
+
+          if (timeUntilHit < -0.2) {
+            processedStepsRef.current.add(arrowKey);
+            onMiss();
+            return;
+          }
+
+          // Show arrows in visible window (-200ms to +2s)
+          if (timeUntilHit >= -0.2 && timeUntilHit <= visibleWindow) {
+            const y = VISUAL_CONFIG.HIT_ZONE_Y - (timeUntilHit * VISUAL_CONFIG.ARROW_SPEED);
+            newActiveArrows.push({
+              time: step.time,
+              direction,
+              type: step.type,
+              hold_duration: step.hold_duration,
+              stepIndex,
+              arrowIndex,
+              y,
+              timeUntilHit,
+            });
+          }
+        });
       });
 
       setActiveArrows(newActiveArrows);

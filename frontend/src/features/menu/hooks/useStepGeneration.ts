@@ -6,6 +6,22 @@ import { useState, useCallback } from 'react';
 import { GameState } from '@/types/common.types';
 import { generateStepsFromFile, generateStepsFromUrl, getAudioUrl } from '../api';
 import { useApp } from '@/app/providers/AppProvider';
+import { Step } from '@/features/game/types/step.types';
+import { StepGenerationResponse } from '../types/menu.types';
+
+/**
+ * Extract steps from API response (prefers new_steps format)
+ */
+function extractSteps(response: StepGenerationResponse): Step[] {
+  // Use new_steps if available
+  if (response.new_steps?.steps && Array.isArray(response.new_steps.steps)) {
+    return response.new_steps.steps as Step[];
+  }
+
+  // Fallback: shouldn't happen with new backend
+  console.warn('No new_steps found in response, steps may be empty');
+  return [];
+}
 
 export function useStepGeneration() {
   const {
@@ -39,7 +55,7 @@ export function useStepGeneration() {
 
         // Set data
         setSongData(result.song_info);
-        setSteps(result.steps);
+        setSteps(extractSteps(result));
         setAudioUrl(getAudioUrl(result.audio_url));
 
         // Move to ready screen
@@ -91,7 +107,7 @@ export function useStepGeneration() {
 
         // Set data
         setSongData(result.song_info);
-        setSteps(result.steps);
+        setSteps(extractSteps(result));
         setAudioUrl(getAudioUrl(result.audio_url));
 
         // Move to ready screen

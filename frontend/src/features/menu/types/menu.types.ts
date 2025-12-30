@@ -41,13 +41,30 @@ export const DIFFICULTY_INFO: Record<DifficultyLevel, DifficultyInfo> = {
 } as const;
 
 /**
+ * New step generator output format
+ */
+export interface NewStepsResponse {
+  steps: Step[];
+  difficulty: string;
+  tempo: number;
+  duration: number;
+  stats: {
+    total_steps: number;
+    total_arrows: number;
+    tap_notes: number;
+    hold_notes: number;
+    singles: number;
+    doubles: number;
+  };
+}
+
+/**
  * API response for step generation
  */
 export interface StepGenerationResponse {
   song_info: SongInfo;
-  steps: Step[];
-  new_steps?: any;      // New generator output (optional)
-  new_steps_json?: any; // New generator JSON output (optional)
+  steps: any[];                      // Legacy format (deprecated)
+  new_steps?: NewStepsResponse;      // New generator output
   audio_url: string;
 }
 

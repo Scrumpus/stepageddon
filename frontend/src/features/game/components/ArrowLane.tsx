@@ -43,19 +43,19 @@ function ArrowLane({ activeArrows, activeKeys }: ArrowLaneProps) {
       </div>
 
       {/* Falling Arrows */}
-      {activeArrows.map((arrow, idx) => {
+      {activeArrows.map((arrow) => {
         const Icon = ARROW_ICONS[arrow.direction];
         const directionIndex = DIRECTIONS.indexOf(arrow.direction);
         const x = -160 + directionIndex * 96;
+        const arrowKey = `${arrow.stepIndex}-${arrow.arrowIndex}`;
 
         return (
           <div
-            key={`${arrow.index}-${idx}`}
-            className="absolute left-1/2 transform -translate-x-1/2 transition-opacity"
+            key={arrowKey}
+            className="absolute left-1/2 transform -translate-x-1/2"
             style={{
               top: `${arrow.y}px`,
               left: `calc(50% + ${x}px)`,
-              opacity: arrow.index !== undefined && arrow.hit ? 0 : 1,
             }}
           >
             <div className="w-20 h-20 bg-game-primary/80 rounded-lg flex items-center justify-center border-2 border-game-primary">

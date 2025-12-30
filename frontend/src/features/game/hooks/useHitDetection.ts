@@ -11,7 +11,7 @@ import { evaluateHit, calculatePoints } from '../utils/scoring';
 
 interface UseHitDetectionParams {
   activeArrows: ActiveArrow[];
-  processedStepsRef: React.MutableRefObject<Set<number>>;
+  processedStepsRef: React.MutableRefObject<Set<string>>;
   combo: number;
   onScoreUpdate: (points: number) => void;
   onComboUpdate: (newCombo: number) => void;
@@ -41,13 +41,14 @@ export function useHitDetection({
   const checkHit = useCallback(
     (direction: Direction) => {
       // Find hittable arrows for this direction
-      const hittableArrows = activeArrows.filter(
-        (arrow) =>
+      const hittableArrows = activeArrows.filter((arrow) => {
+        const arrowKey = `${arrow.stepIndex}-${arrow.arrowIndex}`;
+        return (
           arrow.direction === direction &&
-          arrow.index !== undefined &&
-          !processedStepsRef.current.has(arrow.index) &&
+          !processedStepsRef.current.has(arrowKey) &&
           Math.abs(arrow.timeUntilHit) <= TIMING.MISS / 1000 // 200ms window
-      );
+        );
+      });
 
       if (hittableArrows.length === 0) return;
 
@@ -59,10 +60,9 @@ export function useHitDetection({
       const timingMs = closest.timeUntilHit * 1000;
       const judgment = evaluateHit(timingMs);
 
-      // Mark as processed (immutably - fixes mutation bug)
-      if (closest.index !== undefined) {
-        processedStepsRef.current.add(closest.index);
-      }
+      // Mark as processed
+      const arrowKey = `${closest.stepIndex}-${closest.arrowIndex}`;
+      processedStepsRef.current.add(arrowKey);
 
       // Update score and combo
       if (judgment !== Judgment.MISS) {
