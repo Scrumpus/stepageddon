@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 from services import AudioProcessor, StepGenerator, AudioDownloader
+from modules.step_generator import ChartGenerationPipeline, ChartExporter
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -114,11 +115,17 @@ async def generate_steps_from_file(
             difficulty,
             song_info={"title": file.filename}
         )
+
+        new_steps = ChartGenerationPipeline.generate_from_audio(file_path, difficulty)
+        new_steps_json = ChartExporter.to_json(new_steps)
+
+        # New generator
         
         # Prepare response
         response = {
             "song_id": song_id,
             "steps": steps,
+            "new_steps_json": new_steps_json,
             "song_info": {
                 "title": file.filename,
                 "duration": analysis["duration"],
@@ -188,11 +195,15 @@ async def generate_steps_from_url(request: GenerateRequest):
             request.difficulty,
             song_info=metadata
         )
+
+        new_steps = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
+        new_steps = ChartExporter.to_json(new_steps)
         
         # Prepare response
         response = {
             "song_id": song_id,
             "steps": steps,
+            "new_steps": new_steps,
             "song_info": {
                 "title": metadata["title"],
                 "artist": metadata.get("artist", "Unknown"),
