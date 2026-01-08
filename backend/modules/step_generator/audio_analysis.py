@@ -11,7 +11,7 @@ from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 from typing import List, Tuple
 
-from .schemas import Beat, EnergySection, SustainedNote, SongStructure
+from .schemas import Beat, EnergySection, SustainedNote, SongStructure, MusicalSources, MelodyNote, StepCandidate, Direction
 
 
 def analyze_onsets(y: np.ndarray, sr: int, strength_threshold: float = 0.3) -> Tuple[List[float], np.ndarray]:
@@ -360,3 +360,380 @@ def detect_structure(y: np.ndarray, sr: int) -> SongStructure:
         outro=outro,
         total_duration=duration
     )
+
+
+# =============================================================================
+# Advanced Musical Source Analysis
+# =============================================================================
+
+def analyze_hpss(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Separate audio into harmonic (melodic) and percussive (drum) components.
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+
+    Returns:
+        Tuple of (harmonic audio, percussive audio)
+    """
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+    return y_harmonic, y_percussive
+
+
+def analyze_separated_sources(y: np.ndarray, sr: int, strength_threshold: float = 0.2) -> dict:
+    """
+    Separate and analyze harmonic (melody) and percussive (drums) components.
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+        strength_threshold: Minimum onset strength to include
+
+    Returns:
+        Dictionary with drum_times, harmonic_times, and separated audio
+    """
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+
+    # Detect drum hits from percussive component
+    onset_env_perc = librosa.onset.onset_strength(y=y_percussive, sr=sr)
+    onset_env_perc_norm = onset_env_perc / (onset_env_perc.max() + 1e-8)
+
+    drum_frames = librosa.onset.onset_detect(
+        y=y_percussive, sr=sr, units='frames', backtrack=True
+    )
+
+    # Filter by strength
+    drum_times = []
+    for frame in drum_frames:
+        if frame < len(onset_env_perc_norm) and onset_env_perc_norm[frame] >= strength_threshold:
+            drum_times.append(float(librosa.frames_to_time(frame, sr=sr)))
+
+    # Detect melodic notes from harmonic component
+    onset_env_harm = librosa.onset.onset_strength(y=y_harmonic, sr=sr)
+    onset_env_harm_norm = onset_env_harm / (onset_env_harm.max() + 1e-8)
+
+    harmonic_frames = librosa.onset.onset_detect(
+        y=y_harmonic, sr=sr, units='frames', backtrack=True
+    )
+
+    harmonic_times = []
+    for frame in harmonic_frames:
+        if frame < len(onset_env_harm_norm) and onset_env_harm_norm[frame] >= strength_threshold:
+            harmonic_times.append(float(librosa.frames_to_time(frame, sr=sr)))
+
+    return {
+        'drum_times': drum_times,
+        'harmonic_times': harmonic_times,
+        'y_harmonic': y_harmonic,
+        'y_percussive': y_percussive,
+    }
+
+
+def analyze_multiband_onsets(y: np.ndarray, sr: int, strength_threshold: float = 0.3) -> dict:
+    """
+    Detect onsets in separate frequency bands (bass/mid/high).
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+        strength_threshold: Minimum onset strength to include
+
+    Returns:
+        Dictionary with bass_times, mid_times, high_times
+    """
+    # Compute mel spectrogram with more frequency resolution
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+
+    n_mels = S.shape[0]
+    # Split into frequency bands
+    # Low (bass): ~0-300Hz - kick drums, bass
+    # Mid: ~300-2000Hz - snare, vocals, guitars
+    # High: ~2000Hz+ - hi-hats, cymbals, brightness
+    low_band = S[:n_mels // 4, :]
+    mid_band = S[n_mels // 4:n_mels // 2, :]
+    high_band = S[n_mels // 2:, :]
+
+    results = {}
+    for name, band in [('bass', low_band), ('mid', mid_band), ('high', high_band)]:
+        # Onset strength from this band
+        onset_env = librosa.onset.onset_strength(S=librosa.power_to_db(band), sr=sr)
+        onset_env_norm = onset_env / (onset_env.max() + 1e-8)
+
+        # Detect onsets
+        onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr)
+
+        # Filter by strength
+        times = []
+        for frame in onset_frames:
+            if frame < len(onset_env_norm) and onset_env_norm[frame] >= strength_threshold:
+                times.append(float(librosa.frames_to_time(frame, sr=sr)))
+
+        results[f'{name}_times'] = times
+
+    return results
+
+
+def detect_kick_snare(y: np.ndarray, sr: int) -> dict:
+    """
+    Detect kick and snare drum hits using frequency analysis.
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+
+    Returns:
+        Dictionary with kick_times, snare_times, hihat_times
+    """
+    # Separate percussive component
+    _, y_perc = librosa.effects.hpss(y)
+
+    # Compute STFT
+    S = np.abs(librosa.stft(y_perc))
+    freq_bins = librosa.fft_frequencies(sr=sr)
+
+    # Kick detection: low frequency energy (60-150Hz)
+    kick_bins = (freq_bins >= 60) & (freq_bins <= 150)
+    kick_energy = S[kick_bins, :].sum(axis=0)
+    kick_energy_norm = kick_energy / (kick_energy.max() + 1e-8)
+
+    # Find kick peaks
+    kick_peaks, _ = find_peaks(
+        kick_energy_norm,
+        height=0.3,
+        distance=int(sr / 512 * 0.15)  # ~150ms minimum between kicks
+    )
+    kick_times = librosa.frames_to_time(kick_peaks, sr=sr).tolist()
+
+    # Snare detection: mid frequency with high energy (150-400Hz)
+    snare_bins = (freq_bins >= 150) & (freq_bins <= 400)
+    snare_energy = S[snare_bins, :].sum(axis=0)
+    snare_energy_norm = snare_energy / (snare_energy.max() + 1e-8)
+
+    # Find snare peaks
+    snare_peaks, _ = find_peaks(
+        snare_energy_norm,
+        height=0.3,
+        distance=int(sr / 512 * 0.15)
+    )
+    snare_times = librosa.frames_to_time(snare_peaks, sr=sr).tolist()
+
+    # Hi-hat detection: high frequency (5000Hz+)
+    hihat_bins = freq_bins >= 5000
+    hihat_energy = S[hihat_bins, :].sum(axis=0)
+    hihat_energy_norm = hihat_energy / (hihat_energy.max() + 1e-8)
+
+    # Find hi-hat peaks (can be faster)
+    hihat_peaks, _ = find_peaks(
+        hihat_energy_norm,
+        height=0.25,
+        distance=int(sr / 512 * 0.08)  # ~80ms minimum
+    )
+    hihat_times = librosa.frames_to_time(hihat_peaks, sr=sr).tolist()
+
+    return {
+        'kick_times': kick_times,
+        'snare_times': snare_times,
+        'hihat_times': hihat_times,
+    }
+
+
+def track_melody(y: np.ndarray, sr: int, min_confidence: float = 0.5) -> List[MelodyNote]:
+    """
+    Track melodic pitch for vocal/lead instrument following.
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+        min_confidence: Minimum voicing confidence to include
+
+    Returns:
+        List of MelodyNote objects representing detected melody notes
+    """
+    # Separate harmonic content
+    y_harmonic, _ = librosa.effects.hpss(y)
+
+    # Use pyin for robust pitch tracking
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y_harmonic,
+        fmin=librosa.note_to_hz('C2'),
+        fmax=librosa.note_to_hz('C7'),
+        sr=sr
+    )
+
+    times = librosa.times_like(f0, sr=sr)
+
+    # Find note onsets (where pitch changes or note starts)
+    melody_notes = []
+    in_note = False
+    prev_midi = 0
+
+    for i, (t, pitch, voiced, prob) in enumerate(zip(times, f0, voiced_flag, voiced_probs)):
+        if voiced and not np.isnan(pitch) and prob >= min_confidence:
+            midi_note = librosa.hz_to_midi(pitch)
+
+            if not in_note:
+                # Note start
+                in_note = True
+                prev_midi = midi_note
+                melody_notes.append(MelodyNote(
+                    time=float(t),
+                    pitch=float(pitch),
+                    midi_note=float(midi_note),
+                    confidence=float(prob)
+                ))
+            elif abs(midi_note - prev_midi) > 1.5:
+                # Significant pitch change - new note
+                prev_midi = midi_note
+                melody_notes.append(MelodyNote(
+                    time=float(t),
+                    pitch=float(pitch),
+                    midi_note=float(midi_note),
+                    confidence=float(prob)
+                ))
+        else:
+            in_note = False
+
+    return melody_notes
+
+
+def analyze_musical_sources(y: np.ndarray, sr: int) -> MusicalSources:
+    """
+    Complete musical source analysis - drums, bass, melody.
+
+    This is the main entry point for advanced audio analysis.
+
+    Args:
+        y: Audio time series
+        sr: Sample rate
+
+    Returns:
+        MusicalSources object with all detected musical elements
+    """
+    # HPSS separation
+    separated = analyze_separated_sources(y, sr)
+
+    # Multi-band analysis
+    multiband = analyze_multiband_onsets(y, sr)
+
+    # Drum detection
+    drums = detect_kick_snare(y, sr)
+
+    # Melody tracking
+    melody = track_melody(y, sr)
+
+    return MusicalSources(
+        kick_times=drums['kick_times'],
+        snare_times=drums['snare_times'],
+        hihat_times=drums['hihat_times'],
+        bass_times=multiband['bass_times'],
+        mid_times=multiband['mid_times'],
+        high_times=multiband['high_times'],
+        melody_notes=melody,
+        drum_times=separated['drum_times'],
+        harmonic_times=separated['harmonic_times'],
+    )
+
+
+def build_step_candidates(
+    sources: MusicalSources,
+    tempo: float,
+    grid_division: int = 8
+) -> List[StepCandidate]:
+    """
+    Build prioritized step candidates from musical sources.
+
+    Does NOT assign specific arrows - lets the generator handle arrow
+    selection for natural foot alternation and spread.
+
+    Args:
+        sources: MusicalSources from analyze_musical_sources
+        tempo: Song tempo in BPM
+        grid_division: Grid to quantize to (4, 8, or 16)
+
+    Returns:
+        List of StepCandidate sorted by time
+    """
+    candidates = []
+
+    # Kick drums - highest priority (main beat)
+    for t in sources.kick_times:
+        candidates.append(StepCandidate(
+            time=t,
+            source='kick',
+            priority=10,
+            suggested_arrows=[]  # Let generator decide
+        ))
+
+    # Snare drums - high priority (backbeat)
+    for t in sources.snare_times:
+        candidates.append(StepCandidate(
+            time=t,
+            source='snare',
+            priority=9,
+            suggested_arrows=[]
+        ))
+
+    # Bass hits - medium-high priority
+    for t in sources.bass_times:
+        # Skip if too close to a kick (likely same hit)
+        if any(abs(t - kt) < 0.05 for kt in sources.kick_times):
+            continue
+        candidates.append(StepCandidate(
+            time=t,
+            source='bass',
+            priority=6,
+            suggested_arrows=[]
+        ))
+
+    # Hi-hats - lower priority (fills)
+    for t in sources.hihat_times:
+        # Skip if too close to snare or kick
+        if any(abs(t - st) < 0.05 for st in sources.snare_times):
+            continue
+        if any(abs(t - kt) < 0.05 for kt in sources.kick_times):
+            continue
+        candidates.append(StepCandidate(
+            time=t,
+            source='hihat',
+            priority=3,
+            suggested_arrows=[]
+        ))
+
+    # Melody notes - medium priority
+    for note in sources.melody_notes:
+        candidates.append(StepCandidate(
+            time=note.time,
+            source='melody',
+            priority=5,
+            suggested_arrows=[]
+        ))
+
+    # Quantize all candidates to grid
+    quantized_candidates = []
+    beat_duration = 60.0 / tempo
+    grid_spacing = beat_duration / (grid_division / 4)
+
+    for c in candidates:
+        grid_pos = round(c.time / grid_spacing)
+        quantized_time = round(grid_pos * grid_spacing, 4)
+        quantized_candidates.append(StepCandidate(
+            time=quantized_time,
+            source=c.source,
+            priority=c.priority,
+            suggested_arrows=c.suggested_arrows
+        ))
+
+    # Sort by time, then by priority (descending)
+    quantized_candidates.sort(key=lambda c: (c.time, -c.priority))
+
+    # Remove duplicates at same time (keep highest priority)
+    final_candidates = []
+    seen_times = set()
+    for c in quantized_candidates:
+        t_key = round(c.time, 3)
+        if t_key not in seen_times:
+            seen_times.add(t_key)
+            final_candidates.append(c)
+
+    return final_candidates

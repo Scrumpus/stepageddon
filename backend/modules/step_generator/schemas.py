@@ -55,6 +55,48 @@ class SustainedNote(BaseModel):
     model_config = {"frozen": False}
 
 
+class MelodyNote(BaseModel):
+    """Represents a detected melody/vocal note."""
+    time: float
+    pitch: float  # Hz
+    midi_note: float  # MIDI note number
+    confidence: float
+
+    model_config = {"frozen": False}
+
+
+class MusicalSources(BaseModel):
+    """All detected musical sources from audio analysis."""
+    # Drum hits
+    kick_times: List[float] = []
+    snare_times: List[float] = []
+    hihat_times: List[float] = []
+
+    # Frequency band onsets
+    bass_times: List[float] = []
+    mid_times: List[float] = []
+    high_times: List[float] = []
+
+    # Melodic content
+    melody_notes: List[MelodyNote] = []
+
+    # Separated source onsets
+    drum_times: List[float] = []
+    harmonic_times: List[float] = []
+
+    model_config = {"frozen": False}
+
+
+class StepCandidate(BaseModel):
+    """A candidate for step placement with source information."""
+    time: float
+    source: str  # 'kick', 'snare', 'hihat', 'bass', 'melody', etc.
+    priority: int  # Higher = more important
+    suggested_arrows: List[Direction] = []
+
+    model_config = {"frozen": False}
+
+
 class SongStructure(BaseModel):
     """Complete song structure."""
     intro: Tuple[float, float]
