@@ -3,12 +3,15 @@ Step Generator
 
 Core chart generation algorithm. Takes analyzed audio data and generates
 a playable step chart according to difficulty constraints.
+
+Uses musical source analysis (drums, bass, melody) to create charts that
+follow the rhythm of the song more naturally.
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
-from .schemas import Beat, EnergySection, SustainedNote, SongStructure, Step, Chart, Direction, StepType, DifficultyConfig
+from .schemas import Beat, EnergySection, SustainedNote, SongStructure, Step, Chart, Direction, StepType, DifficultyConfig, StepCandidate
 from .patterns import PatternTemplate
 from .audio_analysis import detect_energy_peaks
 
@@ -34,7 +37,8 @@ class StepGenerator:
                       sustained_notes: List[SustainedNote],
                       structure: SongStructure,
                       tempo: float,
-                      onset_times: List[float] = None) -> Chart:
+                      onset_times: List[float] = None,
+                      step_candidates: Optional[List[StepCandidate]] = None) -> Chart:
         """
         Main chart generation method.
 
@@ -46,14 +50,273 @@ class StepGenerator:
             structure: Detected song structure
             tempo: Tempo in BPM
             onset_times: Optional list of onset times (for denser charts)
+            step_candidates: Optional list of StepCandidate from musical source analysis
 
         Returns:
             Complete Chart object
         """
         steps = []
-
         duration = structure.total_duration
-        target_density = (self.config.min_density + self.config.max_density) / 2
+
+        # Use musical source-based generation if step_candidates provided
+        if step_candidates:
+            logger.info(f"Using {len(step_candidates)} step candidates from musical sources")
+            steps = self._generate_from_sources(
+                step_candidates, energy_sections, sustained_notes, structure, tempo
+            )
+        else:
+            # Fallback to original beat-based generation
+            steps = self._generate_from_beats(
+                beats, subdivisions, energy_sections, sustained_notes,
+                structure, tempo, onset_times
+            )
+
+        # Sort steps before structure/validation phases
+        steps.sort(key=lambda s: s.time)
+
+        # Structure-aware adjustments
+        before_structure = len(steps)
+        steps = self._adjust_for_structure(steps, structure)
+        logger.info(f"Structure adjustment: {before_structure} -> {len(steps)} steps")
+
+        # Validate
+        before_validate = len(steps)
+        steps = self._validate_chart(steps, tempo)
+        logger.info(f"Validation: {before_validate} -> {len(steps)} steps")
+
+        return Chart(
+            steps=steps,
+            difficulty=self.config.name,
+            tempo=tempo,
+            duration=duration
+        )
+
+    def _generate_from_sources(self,
+                               step_candidates: List[StepCandidate],
+                               energy_sections: List[EnergySection],
+                               sustained_notes: List[SustainedNote],
+                               structure: SongStructure,
+                               tempo: float) -> List[Step]:
+        """
+        Generate steps from musical source candidates.
+
+        Uses the source-based arrow suggestions for more musical charts.
+        """
+        steps = []
+        used_times = set()
+        hold_steps = []
+
+        # Phase 1: Place hold notes first
+        if self.config.allow_holds and sustained_notes:
+            candidate_times = [c.time for c in step_candidates]
+            hold_steps = self._place_holds_with_sources(sustained_notes, step_candidates)
+            steps.extend(hold_steps)
+            used_times.update(s.time for s in hold_steps)
+            logger.info(f"Phase 1 (holds): {len(hold_steps)} hold steps")
+
+        # Phase 2: Filter candidates by energy section and density
+        for section in energy_sections:
+            section_candidates = [c for c in step_candidates
+                                  if section.start_time <= c.time <= section.end_time
+                                  and round(c.time, 3) not in used_times]
+
+            if not section_candidates:
+                continue
+
+            # Calculate target step count based on energy and difficulty
+            base_usage = 0.5 + section.energy_level * 0.4  # 50-90% based on energy
+            if self.config.name == 'beginner':
+                base_usage *= 0.4  # Much fewer steps for beginner
+            elif self.config.name == 'expert':
+                base_usage *= 1.2  # More steps for expert
+
+            target_count = int(len(section_candidates) * base_usage)
+            target_count = max(1, target_count)
+
+            # Sort by priority and take top candidates
+            sorted_candidates = sorted(section_candidates, key=lambda c: -c.priority)
+            selected = sorted_candidates[:target_count]
+
+            # Generate steps from selected candidates (avoiding held arrows)
+            section_steps = self._candidates_to_steps(selected, section.intensity, hold_steps)
+            steps.extend(section_steps)
+            used_times.update(round(s.time, 3) for s in section_steps)
+
+        logger.info(f"Phase 2 (sources): {len(steps)} total steps")
+
+        # Phase 3: Add jumps on energy peaks if doubles allowed
+        if self.config.allow_doubles:
+            energy_peaks = detect_energy_peaks(energy_sections)
+            for peak_time in energy_peaks:
+                # Find if there's already a step near this peak
+                existing = [s for s in steps if abs(s.time - peak_time) < 0.1]
+                if existing and len(existing[0].arrows) == 1:
+                    # Convert to jump (but not on held arrows)
+                    existing_arrow = existing[0].arrows[0]
+                    held = self._get_held_arrows_at_time(hold_steps, peak_time)
+                    second_arrow = self._get_jump_partner(existing_arrow)
+                    if second_arrow not in held:
+                        existing[0].arrows.append(second_arrow)
+
+        return steps
+
+    def _place_holds_with_sources(self,
+                                  sustained_notes: List[SustainedNote],
+                                  step_candidates: List[StepCandidate]) -> List[Step]:
+        """Place hold notes using source-aware arrow selection."""
+        holds = []
+        candidate_map = {round(c.time, 3): c for c in step_candidates}
+
+        for note in sustained_notes:
+            duration = note.end_time - note.start_time
+
+            if not (self.config.min_hold_duration <= duration <= self.config.max_hold_duration):
+                continue
+
+            # Find nearest candidate
+            nearest_time = min(candidate_map.keys(),
+                               key=lambda t: abs(t - note.start_time),
+                               default=None)
+
+            if nearest_time and abs(nearest_time - note.start_time) < 0.2:
+                candidate = candidate_map[nearest_time]
+                # Use source-suggested arrow, or fallback to pitch-based
+                if candidate.suggested_arrows:
+                    arrow = candidate.suggested_arrows[0]
+                else:
+                    arrow = self._pitch_to_arrow(note.pitch)
+
+                holds.append(Step(
+                    time=nearest_time,
+                    arrows=[arrow],
+                    step_type=StepType.HOLD,
+                    hold_duration=min(duration, self.config.max_hold_duration)
+                ))
+
+        max_holds = int(len(step_candidates) * self.config.hold_percentage)
+        return holds[:max_holds]
+
+    def _candidates_to_steps(self,
+                            candidates: List[StepCandidate],
+                            intensity: str,
+                            hold_steps: List[Step] = None) -> List[Step]:
+        """Convert step candidates to actual steps with spread-out arrow selection."""
+        steps = []
+        prev_arrow = None
+        arrow_counts = {d: 0 for d in Direction}
+        hold_steps = hold_steps or []
+
+        for candidate in sorted(candidates, key=lambda c: c.time):
+            # Get arrows that are currently being held at this time
+            held_arrows = self._get_held_arrows_at_time(hold_steps, candidate.time)
+
+            # Choose arrow with good spread and flow, avoiding held arrows
+            arrow = self._choose_spread_arrow(prev_arrow, arrow_counts, candidate.time, held_arrows)
+
+            steps.append(Step(
+                time=candidate.time,
+                arrows=[arrow],
+                step_type=StepType.TAP
+            ))
+
+            prev_arrow = arrow
+            arrow_counts[arrow] += 1
+
+        return steps
+
+    def _get_held_arrows_at_time(self, hold_steps: List[Step], time: float) -> set:
+        """Get set of arrows that are being held at a given time."""
+        held = set()
+        for step in hold_steps:
+            if step.step_type == StepType.HOLD and step.hold_duration:
+                hold_end = step.time + step.hold_duration
+                # Check if time falls within the hold (with small buffer)
+                if step.time <= time <= hold_end + 0.05:
+                    held.update(step.arrows)
+        return held
+
+    def _choose_spread_arrow(self,
+                             prev: Direction,
+                             counts: dict,
+                             current_time: float,
+                             held_arrows: set = None) -> Direction:
+        """
+        Choose arrow that spreads usage across all directions.
+
+        Uses foot alternation (left foot: LEFT/DOWN, right foot: UP/RIGHT)
+        while balancing arrow counts for variety.
+        Avoids arrows that are currently being held.
+        """
+        left_foot = [Direction.LEFT, Direction.DOWN]
+        right_foot = [Direction.UP, Direction.RIGHT]
+        all_arrows = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
+        held_arrows = held_arrows or set()
+
+        # Filter out held arrows
+        available = [d for d in all_arrows if d not in held_arrows]
+        if not available:
+            # All arrows held (shouldn't happen), fall back to any
+            available = all_arrows
+
+        if prev is None:
+            # Start with least used available arrow
+            return min(available, key=lambda d: counts[d])
+
+        # Determine which foot to use (alternate)
+        last_was_left = prev in left_foot
+        foot_options = right_foot if last_was_left else left_foot
+
+        # Filter foot options to exclude held arrows
+        foot_options = [d for d in foot_options if d not in held_arrows]
+
+        # If no options on preferred foot, use other foot
+        if not foot_options:
+            foot_options = [d for d in (left_foot if last_was_left else right_foot) if d not in held_arrows]
+
+        # If still no options, use any available
+        if not foot_options:
+            foot_options = available
+
+        if len(foot_options) == 1:
+            return foot_options[0]
+
+        # Pick the less-used arrow from this foot's options
+        # Add some time-based variation
+        time_seed = int(current_time * 100) % 100
+
+        if counts[foot_options[0]] < counts[foot_options[1]]:
+            # First option is less used
+            return foot_options[0] if time_seed < 70 else foot_options[1]
+        elif counts[foot_options[1]] < counts[foot_options[0]]:
+            # Second option is less used
+            return foot_options[1] if time_seed < 70 else foot_options[0]
+        else:
+            # Equal counts - use time for variety
+            return foot_options[0] if time_seed < 50 else foot_options[1]
+
+    def _get_jump_partner(self, arrow: Direction) -> Direction:
+        """Get a good partner arrow for a jump."""
+        # Prefer comfortable jumps
+        partners = {
+            Direction.LEFT: Direction.RIGHT,  # Wide jump
+            Direction.RIGHT: Direction.LEFT,
+            Direction.DOWN: Direction.UP,     # Vertical jump
+            Direction.UP: Direction.DOWN,
+        }
+        return partners.get(arrow, Direction.DOWN)
+
+    def _generate_from_beats(self,
+                            beats: List[Beat],
+                            subdivisions: List[float],
+                            energy_sections: List[EnergySection],
+                            sustained_notes: List[SustainedNote],
+                            structure: SongStructure,
+                            tempo: float,
+                            onset_times: List[float] = None) -> List[Step]:
+        """
+        Original beat-based generation (fallback when no step_candidates).
+        """
+        steps = []
 
         # Use onset times if enabled, otherwise filter beats
         if self.config.use_onsets and onset_times:
@@ -66,7 +329,6 @@ class StepGenerator:
         if self.config.use_8th_notes or self.config.use_16th_notes:
             before_count = len(available_beats)
             available_beats.extend(subdivisions)
-            # Remove duplicates and sort
             available_beats = sorted(set(available_beats))
             logger.info(f"Added subdivisions: {before_count} -> {len(available_beats)} candidates")
 
@@ -96,9 +358,7 @@ class StepGenerator:
                            if section.start_time <= b <= section.end_time]
             total_section_beats += len(section_beats)
 
-            # When using onsets, use most of them (already filtered by threshold)
             if self.config.use_onsets:
-                # Use 80-100% of onsets based on energy (higher energy = more steps)
                 base_usage = 0.8
                 energy_bonus = section.energy_level * 0.2
                 section_target = int(len(section_beats) * (base_usage + energy_bonus))
@@ -112,27 +372,9 @@ class StepGenerator:
             section_steps = self._generate_patterns(beats_to_use, section.intensity, structure)
             steps.extend(section_steps)
 
-        logger.info(f"Phase 3: {total_section_beats} section beats -> {total_beats_used} used -> {len(steps)} steps")
+        logger.info(f"Beat-based generation: {total_section_beats} beats -> {total_beats_used} used -> {len(steps)} steps")
 
-        # Sort steps before structure/validation phases
-        steps.sort(key=lambda s: s.time)
-
-        # Phase 4: Structure-aware adjustments
-        before_structure = len(steps)
-        steps = self._adjust_for_structure(steps, structure)
-        logger.info(f"Phase 4 (structure): {before_structure} -> {len(steps)} steps")
-
-        # Phase 5: Validate
-        before_validate = len(steps)
-        steps = self._validate_chart(steps, tempo)
-        logger.info(f"Phase 5 (validate): {before_validate} -> {len(steps)} steps")
-
-        return Chart(
-            steps=steps,
-            difficulty=self.config.name,
-            tempo=tempo,
-            duration=duration
-        )
+        return steps
 
     def _filter_beats(self, beats: List[Beat]) -> List[float]:
         """Filter beats based on difficulty configuration."""

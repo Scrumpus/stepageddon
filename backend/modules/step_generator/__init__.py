@@ -33,10 +33,26 @@ from .audio_analysis import (
     detect_sustained_notes,
     detect_structure,
     quantize_to_grid,
+    # Advanced musical source analysis
+    analyze_hpss,
+    analyze_separated_sources,
+    analyze_multiband_onsets,
+    detect_kick_snare,
+    track_melody,
+    analyze_musical_sources,
+    build_step_candidates,
 )
 
 # Additional data schemas
-from .schemas import Beat, EnergySection, SustainedNote, SongStructure
+from .schemas import (
+    Beat,
+    EnergySection,
+    SustainedNote,
+    SongStructure,
+    MusicalSources,
+    MelodyNote,
+    StepCandidate,
+)
 
 __version__ = '2.0.0'
 
@@ -55,6 +71,9 @@ __all__ = [
     "EnergySection",
     "SustainedNote",
     "SongStructure",
+    "MusicalSources",
+    "MelodyNote",
+    "StepCandidate",
 
     # Configuration
     "DIFFICULTY_PRESETS",
@@ -73,4 +92,13 @@ __all__ = [
     "detect_sustained_notes",
     "detect_structure",
     "quantize_to_grid",
+
+    # Advanced musical source analysis
+    "analyze_hpss",
+    "analyze_separated_sources",
+    "analyze_multiband_onsets",
+    "detect_kick_snare",
+    "track_melody",
+    "analyze_musical_sources",
+    "build_step_candidates",
 ]

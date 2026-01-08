@@ -17,7 +17,9 @@ from .audio_analysis import (
     analyze_energy,
     detect_sustained_notes,
     detect_structure,
-    quantize_to_grid
+    quantize_to_grid,
+    analyze_musical_sources,
+    build_step_candidates,
 )
 from .generator import StepGenerator
 
@@ -55,15 +57,25 @@ class ChartGenerationPipeline:
         sustained_notes = detect_sustained_notes(y, sr)
         structure = detect_structure(y, sr)
 
-        # Analyze onsets if enabled for this difficulty
+        # Advanced musical source analysis (drums, bass, melody)
+        logger.info("Analyzing musical sources (drums, bass, melody)...")
+        musical_sources = analyze_musical_sources(y, sr)
+        logger.info(f"  Kicks: {len(musical_sources.kick_times)}, Snares: {len(musical_sources.snare_times)}")
+        logger.info(f"  Hi-hats: {len(musical_sources.hihat_times)}, Bass: {len(musical_sources.bass_times)}")
+        logger.info(f"  Melody notes: {len(musical_sources.melody_notes)}")
+
+        # Build step candidates from musical sources
+        grid_division = 16 if difficulty == 'expert' else 8
+        step_candidates = build_step_candidates(musical_sources, tempo, grid_division)
+        logger.info(f"Built {len(step_candidates)} step candidates from musical sources")
+
+        # Analyze onsets if enabled for this difficulty (fallback/supplement)
         onset_times = None
         if config.use_onsets:
             raw_onsets, _ = analyze_onsets(y, sr, strength_threshold=config.onset_threshold)
             logger.info(f"Detected {len(raw_onsets)} raw onsets (threshold: {config.onset_threshold})")
 
             # Quantize to musical grid for better flow
-            # Use 16th notes for expert, 8th notes for others
-            grid_division = 16 if difficulty == 'expert' else 8
             onset_times = quantize_to_grid(raw_onsets, tempo, grid_division)
             logger.info(f"Quantized to {len(onset_times)} grid-aligned onsets ({grid_division}th notes)")
 
@@ -80,7 +92,8 @@ class ChartGenerationPipeline:
             sustained_notes=sustained_notes,
             structure=structure,
             tempo=tempo,
-            onset_times=onset_times
+            onset_times=onset_times,
+            step_candidates=step_candidates,
         )
 
         logger.info(f"Generated {len(chart.steps)} steps")
