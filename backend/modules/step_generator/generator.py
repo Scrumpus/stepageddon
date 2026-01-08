@@ -8,9 +8,11 @@ a playable step chart according to difficulty constraints.
 import logging
 from typing import List
 
-from .schemas import Beat, EnergySection, SustainedNote, SongStructure, Step, Chart, Direction, StepType, DifficultyConfig
+from .schemas import Beat, EnergySection, SustainedNote, SongStructure, Step, Chart, Direction, StepType, DifficultyConfig, DrumTrack, WeightedOnset
 from .patterns import PatternTemplate
 from .audio_analysis import detect_energy_peaks
+
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,9 @@ class StepGenerator:
                       sustained_notes: List[SustainedNote],
                       structure: SongStructure,
                       tempo: float,
-                      onset_times: List[float] = None) -> Chart:
+                      onset_times: List[float] = None,
+                      drum_track: Optional[DrumTrack] = None,
+                      weighted_onsets: Optional[List[WeightedOnset]] = None) -> Chart:
         """
         Main chart generation method.
 
@@ -46,6 +50,8 @@ class StepGenerator:
             structure: Detected song structure
             tempo: Tempo in BPM
             onset_times: Optional list of onset times (for denser charts)
+            drum_track: Optional DrumTrack with kick/snare/hihat events
+            weighted_onsets: Optional list of WeightedOnset for strength-based selection
 
         Returns:
             Complete Chart object
@@ -78,19 +84,68 @@ class StepGenerator:
             hold_times = {s.time for s in hold_steps}
             available_beats = [b for b in available_beats if b not in hold_times]
 
-        # Phase 2: Place accents on energy peaks
+        # Phase 2: Place accents on energy peaks AND snare-driven jumps
         energy_peaks = detect_energy_peaks(energy_sections)
+        used_times = set()
+
+        # 2a: Energy peak jumps
         for peak_time in energy_peaks:
             nearest = min(available_beats, key=lambda b: abs(b - peak_time), default=None)
             if nearest and abs(nearest - peak_time) < 0.1:
                 if self.config.allow_doubles:
                     step = PatternTemplate.jump_pattern(nearest, 'corners')
                     steps.append(step)
+                    used_times.add(nearest)
                     available_beats.remove(nearest)
 
+        # 2b: Snare-driven jump placement
+        # Snares typically mark emphasized backbeats - perfect for jumps
+        snare_jumps_placed = 0
+        if drum_track and self.config.allow_doubles:
+            for snare in drum_track.snares:
+                # Only place jumps on strong snare hits
+                if snare.strength < 0.5:
+                    continue
+
+                # Find nearest available beat to snare hit
+                nearest = min(available_beats, key=lambda b: abs(b - snare.time), default=None)
+                if nearest and abs(nearest - snare.time) < 0.05:  # Tighter tolerance for snares
+                    # Don't double up on existing jumps
+                    if nearest not in used_times:
+                        # Alternate jump types for variety
+                        seed = int(snare.time * 100) % 3
+                        if seed == 0:
+                            arrows = [Direction.LEFT, Direction.RIGHT]
+                        elif seed == 1:
+                            arrows = [Direction.DOWN, Direction.UP]
+                        else:
+                            arrows = [Direction.LEFT, Direction.UP]
+
+                        steps.append(Step(time=nearest, arrows=arrows, step_type=StepType.TAP))
+                        used_times.add(nearest)
+                        available_beats.remove(nearest)
+                        snare_jumps_placed += 1
+
+                        # Limit snare jumps to avoid overwhelming the chart
+                        if snare_jumps_placed >= 10:
+                            break
+
+        logger.info(f"Phase 2: {len(energy_peaks)} energy peaks, {snare_jumps_placed} snare jumps placed")
+
         # Phase 3: Fill with patterns based on energy
+        # Use weighted onsets if available for better strength-based selection
         total_section_beats = 0
         total_beats_used = 0
+
+        # Build weighted onset lookup for strength-based selection
+        onset_strengths = {}
+        if weighted_onsets:
+            for wo in weighted_onsets:
+                onset_strengths[round(wo.time, 3)] = wo.strength
+                # Boost drum-correlated onsets
+                if wo.is_drum:
+                    onset_strengths[round(wo.time, 3)] += 0.2
+
         for section in energy_sections:
             section_beats = [b for b in available_beats
                            if section.start_time <= b <= section.end_time]
@@ -107,9 +162,14 @@ class StepGenerator:
                 section_target = int(len(section_beats) * density_multiplier)
                 section_target = min(section_target, len(section_beats))
 
-            beats_to_use = self._select_beats_by_energy(section_beats, beats, section_target)
+            # Use weighted onset selection if available, otherwise fall back to beat energy
+            if weighted_onsets and onset_strengths:
+                beats_to_use = self._select_beats_by_onset_strength(section_beats, onset_strengths, section_target)
+            else:
+                beats_to_use = self._select_beats_by_energy(section_beats, beats, section_target)
+
             total_beats_used += len(beats_to_use)
-            section_steps = self._generate_patterns(beats_to_use, section.intensity, structure)
+            section_steps = self._generate_patterns(beats_to_use, section.intensity, structure, drum_track)
             steps.extend(section_steps)
 
         logger.info(f"Phase 3: {total_section_beats} section beats -> {total_beats_used} used -> {len(steps)} steps")
@@ -199,9 +259,51 @@ class StepGenerator:
 
         return sorted_beats[:target_count]
 
+    def _select_beats_by_onset_strength(self, section_beats: List[float],
+                                        onset_strengths: dict,
+                                        target_count: int) -> List[float]:
+        """
+        Select beats by onset strength (weighted onset selection).
+
+        Prioritizes beats that align with strong onsets, especially
+        those correlated with drum hits.
+
+        Args:
+            section_beats: Candidate beat times in this section
+            onset_strengths: Dict mapping time -> strength (with drum boost)
+            target_count: Number of beats to select
+
+        Returns:
+            List of selected beat times, sorted by time
+        """
+        def get_strength(beat_time: float) -> float:
+            # Check exact match first
+            rounded = round(beat_time, 3)
+            if rounded in onset_strengths:
+                return onset_strengths[rounded]
+
+            # Check nearby onsets (within 30ms)
+            for t, s in onset_strengths.items():
+                if abs(t - beat_time) < 0.03:
+                    return s
+
+            return 0.0  # No matching onset
+
+        # Sort by strength (descending), then by time for stability
+        sorted_beats = sorted(
+            section_beats,
+            key=lambda t: (get_strength(t), -t),
+            reverse=True
+        )
+
+        # Take top N by strength, then sort by time for playback order
+        selected = sorted_beats[:target_count]
+        return sorted(selected)
+
     def _generate_patterns(self, beat_times: List[float],
                           intensity: str,
-                          structure: SongStructure) -> List[Step]:
+                          structure: SongStructure,
+                          drum_track: Optional[DrumTrack] = None) -> List[Step]:
         """Generate step patterns for given beats with musical flow."""
         steps = []
         beat_times = sorted(beat_times)  # Ensure sorted

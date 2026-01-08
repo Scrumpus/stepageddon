@@ -33,10 +33,17 @@ from .audio_analysis import (
     detect_sustained_notes,
     detect_structure,
     quantize_to_grid,
+    # Enhanced audio analysis (HPSS, drums, melody)
+    separate_harmonic_percussive,
+    detect_drum_events,
+    analyze_weighted_onsets,
+    filter_onsets_by_strength,
+    detect_melody_notes_pyin,
+    score_beat_prominence,
 )
 
 # Additional data schemas
-from .schemas import Beat, EnergySection, SustainedNote, SongStructure
+from .schemas import Beat, EnergySection, SustainedNote, SongStructure, DrumEvent, DrumTrack, WeightedOnset
 
 __version__ = '2.0.0'
 
@@ -55,6 +62,9 @@ __all__ = [
     "EnergySection",
     "SustainedNote",
     "SongStructure",
+    "DrumEvent",
+    "DrumTrack",
+    "WeightedOnset",
 
     # Configuration
     "DIFFICULTY_PRESETS",
@@ -64,7 +74,7 @@ __all__ = [
     # Patterns
     "PatternTemplate",
 
-    # Audio analysis
+    # Audio analysis (basic)
     "analyze_beats",
     "analyze_onsets",
     "detect_subdivisions",
@@ -73,4 +83,12 @@ __all__ = [
     "detect_sustained_notes",
     "detect_structure",
     "quantize_to_grid",
+
+    # Audio analysis (enhanced - HPSS, drums, melody)
+    "separate_harmonic_percussive",
+    "detect_drum_events",
+    "analyze_weighted_onsets",
+    "filter_onsets_by_strength",
+    "detect_melody_notes_pyin",
+    "score_beat_prominence",
 ]

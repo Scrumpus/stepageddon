@@ -49,8 +49,41 @@ class SustainedNote(BaseModel):
     """Represents a sustained melodic note (candidate for hold)."""
     start_time: float
     end_time: float
-    pitch: float  # MIDI note number
+    pitch: float  # MIDI note number or Hz frequency
     confidence: float
+
+    model_config = {"frozen": False}
+
+
+class DrumEvent(BaseModel):
+    """Represents a detected drum hit."""
+    time: float
+    drum_type: str  # 'kick', 'snare', 'hihat'
+    strength: float = Field(ge=0.0, le=1.0)
+
+    model_config = {"frozen": False}
+
+
+class DrumTrack(BaseModel):
+    """Collection of drum events by type."""
+    kicks: List['DrumEvent'] = []
+    snares: List['DrumEvent'] = []
+    hihats: List['DrumEvent'] = []
+
+    def all_events(self) -> List['DrumEvent']:
+        """Get all drum events sorted by time."""
+        all_drums = self.kicks + self.snares + self.hihats
+        return sorted(all_drums, key=lambda d: d.time)
+
+    model_config = {"frozen": False}
+
+
+class WeightedOnset(BaseModel):
+    """An onset with its strength/prominence score."""
+    time: float
+    strength: float = Field(ge=0.0, le=1.0)
+    is_drum: bool = False
+    drum_type: Optional[str] = None  # 'kick', 'snare', 'hihat' if is_drum
 
     model_config = {"frozen": False}
 
