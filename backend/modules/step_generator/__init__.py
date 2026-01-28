@@ -22,6 +22,8 @@ from .schemas import Chart, Step, StepType, Direction
 # Advanced exports (for customization)
 from .difficulty import DIFFICULTY_PRESETS, DifficultyConfig, get_difficulty_config
 from .patterns import PatternTemplate
+from .contour import ContourArrowMapper
+from .simplification import RhythmSimplifier
 
 # Audio analysis functions (for advanced users)
 from .audio_analysis import (
@@ -33,10 +35,21 @@ from .audio_analysis import (
     detect_sustained_notes,
     detect_structure,
     quantize_to_grid,
+    # New musical analysis functions
+    detect_pitch_contour,
+    classify_onsets_by_band,
+    detect_tempo_changes,
+    detect_phrase_boundaries,
+    detect_musical_rests,
+    quantize_to_grid_with_tolerance,
 )
 
 # Additional data schemas
-from .schemas import Beat, EnergySection, SustainedNote, SongStructure
+from .schemas import (
+    Beat, EnergySection, SustainedNote, SongStructure,
+    # New schemas for enhanced analysis
+    PitchFrame, TempoSection, PhraseBoundary, OnsetClassification, ContourDirection
+)
 
 __version__ = '2.0.0'
 
@@ -55,6 +68,12 @@ __all__ = [
     "EnergySection",
     "SustainedNote",
     "SongStructure",
+    # New data types
+    "PitchFrame",
+    "TempoSection",
+    "PhraseBoundary",
+    "OnsetClassification",
+    "ContourDirection",
 
     # Configuration
     "DIFFICULTY_PRESETS",
@@ -63,6 +82,12 @@ __all__ = [
 
     # Patterns
     "PatternTemplate",
+
+    # Contour
+    "ContourArrowMapper",
+
+    # Simplification
+    "RhythmSimplifier",
 
     # Audio analysis
     "analyze_beats",
@@ -73,4 +98,11 @@ __all__ = [
     "detect_sustained_notes",
     "detect_structure",
     "quantize_to_grid",
+    # New audio analysis functions
+    "detect_pitch_contour",
+    "classify_onsets_by_band",
+    "detect_tempo_changes",
+    "detect_phrase_boundaries",
+    "detect_musical_rests",
+    "quantize_to_grid_with_tolerance",
 ]

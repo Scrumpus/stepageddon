@@ -29,7 +29,14 @@ DIFFICULTY_PRESETS = {
         max_stream_length=0,
         allow_crossovers=False,
         allow_brackets=False,
-        energy_scale_factor=0.3
+        energy_scale_factor=0.3,
+        # New: strict grid, maximum simplification, no advanced patterns
+        off_grid_tolerance_ms=0.0,
+        rhythmic_simplification=1.0,
+        allow_gallops=False,
+        allow_drills=False,
+        max_drill_length=0,
+        use_contour=True
     ),
 
     "intermediate": DifficultyConfig(
@@ -53,7 +60,14 @@ DIFFICULTY_PRESETS = {
         max_stream_length=6,
         allow_crossovers=True,
         allow_brackets=False,
-        energy_scale_factor=0.6
+        energy_scale_factor=0.6,
+        # New: slight timing flexibility, moderate simplification, gallops allowed
+        off_grid_tolerance_ms=10.0,
+        rhythmic_simplification=0.5,
+        allow_gallops=True,
+        allow_drills=False,
+        max_drill_length=0,
+        use_contour=True
     ),
 
     "expert": DifficultyConfig(
@@ -77,7 +91,54 @@ DIFFICULTY_PRESETS = {
         max_stream_length=16,
         allow_crossovers=True,
         allow_brackets=True,
-        energy_scale_factor=1.0
+        energy_scale_factor=1.0,
+        # New: full timing expression, literal rhythm, all patterns allowed
+        off_grid_tolerance_ms=20.0,
+        rhythmic_simplification=0.0,
+        allow_gallops=True,
+        allow_drills=True,
+        max_drill_length=8,
+        use_contour=True
+    ),
+
+    "insane": DifficultyConfig(
+        name="insane",
+        # Extreme density - nearly every onset becomes a step
+        min_density=3.5,
+        max_density=6.0,
+        # All step types enabled
+        allow_singles=True,
+        allow_doubles=True,
+        allow_holds=True,
+        # More holds, can be very short or very long
+        hold_percentage=0.30,
+        min_hold_duration=0.3,
+        max_hold_duration=6.0,
+        # Use every possible beat position
+        use_downbeats=True,
+        use_upbeats=True,
+        use_offbeats=True,
+        use_8th_notes=True,
+        use_16th_notes=True,
+        # Capture nearly all onsets
+        use_onsets=True,
+        onset_threshold=0.05,  # Very low threshold = capture almost everything
+        # Allow long sequences of jumps and streams
+        max_consecutive_jumps=8,
+        max_stream_length=32,
+        # All pattern types enabled
+        allow_crossovers=True,
+        allow_brackets=True,
+        # Maximum energy responsiveness
+        energy_scale_factor=1.5,
+        # Full expressive timing
+        off_grid_tolerance_ms=20.0,
+        rhythmic_simplification=0.0,
+        # All advanced patterns with extended lengths
+        allow_gallops=True,
+        allow_drills=True,
+        max_drill_length=16,
+        use_contour=True
     )
 }
 
