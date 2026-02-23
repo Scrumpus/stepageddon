@@ -24,6 +24,13 @@ class Direction(str, Enum):
     RIGHT = "right"
 
 
+class ContourDirection(str, Enum):
+    """Melodic contour direction for arrow selection."""
+    ASCENDING = "ascending"
+    DESCENDING = "descending"
+    STABLE = "stable"
+
+
 class Beat(BaseModel):
     """Represents a single beat."""
     time: float
@@ -63,6 +70,45 @@ class SongStructure(BaseModel):
     bridge: Tuple[float, float]
     outro: Tuple[float, float]
     total_duration: float
+
+    model_config = {"frozen": False}
+
+
+class PitchFrame(BaseModel):
+    """A single frame of pitch tracking data."""
+    time: float
+    frequency: float  # Hz
+    midi_note: float  # MIDI note number (60 = C4)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    model_config = {"frozen": False}
+
+
+class TempoSection(BaseModel):
+    """A section of the song with consistent tempo."""
+    start_time: float
+    end_time: float
+    bpm: float = Field(gt=0.0)
+
+    model_config = {"frozen": False}
+
+
+class PhraseBoundary(BaseModel):
+    """A musical phrase boundary (typically every 4 or 8 bars)."""
+    time: float
+    bar_number: int
+    phrase_length: int  # 4, 8, or 16 bars
+    is_major: bool  # True for strong boundaries (8-bar, high novelty, or energy drop)
+    novelty_score: float = Field(ge=0.0, le=1.0)
+
+    model_config = {"frozen": False}
+
+
+class OnsetClassification(BaseModel):
+    """An onset classified by frequency band."""
+    time: float
+    band: str  # 'kick', 'snare', 'hihat', 'melodic'
+    strength: float = Field(ge=0.0, le=1.0)
 
     model_config = {"frozen": False}
 
@@ -129,5 +175,19 @@ class DifficultyConfig(BaseModel):
     allow_crossovers: bool
     allow_brackets: bool
     energy_scale_factor: float
+
+    # Timing tolerance: 0 = strict grid, 20 = ±20ms off-grid allowed
+    off_grid_tolerance_ms: float = Field(default=0.0, ge=0.0, le=50.0)
+
+    # Rhythmic simplification: 0 = literal (expert), 1.0 = maximum (beginner)
+    rhythmic_simplification: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # Pattern vocabulary
+    allow_gallops: bool = False  # Quick same-foot doubles
+    allow_drills: bool = False   # Rapid same-arrow repeats
+    max_drill_length: int = 0    # Max consecutive same-arrow taps
+
+    # Contour following: whether to use melodic contour for arrow selection
+    use_contour: bool = True
 
     model_config = {"frozen": False}
