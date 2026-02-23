@@ -74,7 +74,7 @@ class AudioDownloader:
             'outtmpl': output_path.replace('.mp3', ''),
             'quiet': True,
             'no_warnings': True,
-            'extractor_args': {'youtube': {'player_client': ['ios,web']}},
+            'extractor_args': {'youtube': {'player_client': ['android_vr']}},
         }
 
         if os.path.exists(cookies_path):
