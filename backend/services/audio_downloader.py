@@ -62,6 +62,8 @@ class AudioDownloader:
         """Download audio from YouTube"""
         logger.info(f"Downloading from YouTube: {url}")
         
+        cookies_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt')
+
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -72,7 +74,11 @@ class AudioDownloader:
             'outtmpl': output_path.replace('.mp3', ''),
             'quiet': True,
             'no_warnings': True,
+            'extractor_args': {'youtube': {'player_client': ['ios,web']}},
         }
+
+        if os.path.exists(cookies_path):
+            ydl_opts['cookiefile'] = cookies_path
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
