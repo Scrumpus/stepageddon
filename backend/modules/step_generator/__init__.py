@@ -26,19 +26,23 @@ from .contour import ContourArrowMapper
 from .simplification import RhythmSimplifier
 
 # Audio analysis functions (for advanced users)
-from .audio_analysis import (
+# Beat/onset/tempo detection via madmom RNNs
+from .madmom_analysis import (
+    MadmomAnalysisCache,
     analyze_beats,
     analyze_onsets,
     detect_subdivisions,
+    detect_tempo_changes,
+)
+# Spectral/timbral analysis via librosa
+from .audio_analysis import (
     analyze_energy,
     detect_energy_peaks,
     detect_sustained_notes,
     detect_structure,
     quantize_to_grid,
-    # New musical analysis functions
     detect_pitch_contour,
     classify_onsets_by_band,
-    detect_tempo_changes,
     detect_phrase_boundaries,
     detect_musical_rests,
     quantize_to_grid_with_tolerance,
@@ -88,6 +92,9 @@ __all__ = [
 
     # Simplification
     "RhythmSimplifier",
+
+    # Madmom analysis cache
+    "MadmomAnalysisCache",
 
     # Audio analysis
     "analyze_beats",

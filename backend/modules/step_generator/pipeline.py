@@ -19,19 +19,22 @@ import librosa
 from .schemas import Chart, StepType
 from .difficulty import DIFFICULTY_PRESETS
 from .audio_analysis import (
-    analyze_beats,
-    analyze_onsets,
-    detect_subdivisions,
     analyze_energy,
     detect_sustained_notes,
     detect_structure,
     quantize_to_grid,
     # New analysis functions
     detect_pitch_contour,
-    detect_tempo_changes,
     detect_phrase_boundaries,
     detect_musical_rests,
     quantize_to_grid_with_tolerance
+)
+from .madmom_analysis import (
+    MadmomAnalysisCache,
+    analyze_beats,
+    analyze_onsets,
+    detect_subdivisions,
+    detect_tempo_changes,
 )
 from .generator import StepGenerator
 from .simplification import RhythmSimplifier
@@ -63,10 +66,15 @@ class ChartGenerationPipeline:
 
         config = DIFFICULTY_PRESETS[difficulty]
 
+        # === Initialize madmom cache (avoids re-running RNNs) ===
+        madmom_cache = MadmomAnalysisCache(audio_path)
+
         # === Core Audio Analysis ===
         logger.info("Analyzing audio (core features)...")
-        beats, tempo = analyze_beats(y, sr)
-        subdivisions = detect_subdivisions(y, sr, [b.time for b in beats])
+        # Beat/onset detection via madmom RNNs (more accurate than librosa)
+        beats, tempo = analyze_beats(audio_path, madmom_cache)
+        subdivisions = detect_subdivisions(audio_path, [b.time for b in beats], madmom_cache)
+        # Spectral/timbral analysis stays with librosa
         energy_sections = analyze_energy(y, sr)
         sustained_notes = detect_sustained_notes(y, sr)
         structure = detect_structure(y, sr)
@@ -74,7 +82,7 @@ class ChartGenerationPipeline:
         # === Enhanced Analysis (new features) ===
         logger.info("Analyzing audio (enhanced features)...")
 
-        # Pitch tracking for contour-aware arrow selection
+        # Pitch tracking for contour-aware arrow selection (librosa)
         pitch_frames = []
         if config.use_contour:
             try:
@@ -83,16 +91,16 @@ class ChartGenerationPipeline:
             except Exception as e:
                 logger.warning(f"Pitch tracking failed, continuing without contour: {e}")
 
-        # Phrase boundary detection for pattern switching
+        # Phrase boundary detection for pattern switching (librosa, uses madmom beats)
         phrase_boundaries = detect_phrase_boundaries(y, sr, beats, tempo)
         logger.info(f"Detected {len(phrase_boundaries)} phrase boundaries")
 
-        # Musical rest detection
+        # Musical rest detection (librosa)
         rest_periods = detect_musical_rests(y, sr)
         logger.info(f"Detected {len(rest_periods)} musical rest periods")
 
-        # Tempo change detection
-        tempo_sections = detect_tempo_changes(y, sr)
+        # Tempo change detection via madmom
+        tempo_sections = detect_tempo_changes(audio_path, cache=madmom_cache)
         if len(tempo_sections) > 1:
             logger.info(f"Detected {len(tempo_sections)} tempo sections (variable tempo song)")
             # Use average tempo for now; full multi-tempo support is a future enhancement
@@ -105,7 +113,7 @@ class ChartGenerationPipeline:
         # === Onset Analysis with Simplification ===
         onset_times = None
         if config.use_onsets:
-            raw_onsets, _ = analyze_onsets(y, sr, strength_threshold=config.onset_threshold)
+            raw_onsets, _ = analyze_onsets(audio_path, strength_threshold=config.onset_threshold, cache=madmom_cache)
             logger.info(f"Detected {len(raw_onsets)} raw onsets (threshold: {config.onset_threshold})")
 
             # Apply rhythmic simplification based on difficulty
