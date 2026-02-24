@@ -8,7 +8,6 @@ Beat Sync is a DDR-style rhythm game that generates custom step charts from audi
 - **Frontend**: React 18 + Vite + TailwindCSS
 - **Backend**: FastAPI (Python) with librosa for audio analysis
 - **Audio Processing**: librosa 22050 Hz sample rate, comprehensive feature extraction
-- **Two Generation Modes**: Pure algorithmic (default) or AI-enhanced (optional, requires Anthropic API key)
 
 ## Development Commands
 
@@ -20,7 +19,7 @@ cd backend
 # Setup (first time)
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync
 cp .env.example .env
 
 # Run development server (with auto-reload)
@@ -106,17 +105,6 @@ backend/modules/step_generator/
 - **Import**: `from modules.step_generator import ChartGenerationPipeline, ChartExporter`
 
 **Legacy Generators** (still available for backward compatibility):
-
-1. **`algorithmic_generator.py`** - Enhanced algorithmic generator
-   - Pure librosa-based, no AI dependency
-   - Energy-aware pattern generation
-   - Used by `step_generator.py` wrapper
-
-2. **`step_generator.py`** - Legacy wrapper
-   - Simple wrapper around `algorithmic_generator.py`
-   - Has `use_ai` parameter (currently unused)
-
-**Current Status**: `routers/generation.py` uses the new modular `step_engine` package as the primary generator. Legacy generators remain available for backward compatibility.
 
 **Layer 3: API Routers** (`backend/routers/`):
 - `generation.py` - POST endpoints for chart generation (file upload or URL)

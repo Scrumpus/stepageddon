@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from services import AudioProcessor, StepGenerator, AudioDownloader
+from services import AudioProcessor, AudioDownloader
 from modules.step_generator import ChartGenerationPipeline, ChartExporter
 from core.config import settings
 
@@ -22,14 +22,7 @@ router = APIRouter()
 # Initialize services
 audio_processor = AudioProcessor()
 
-# Step generator - set use_ai=False for pure algorithmic, True for AI
-# You can also make this configurable via environment variable
-USE_AI_GENERATION = os.getenv("USE_AI_GENERATION", "false").lower() == "true"
-step_generator = StepGenerator(use_ai=USE_AI_GENERATION)
-
 audio_downloader = AudioDownloader()
-
-logger.info(f"Step generation mode: {'AI + Algorithmic' if USE_AI_GENERATION else 'Pure Algorithmic'}")
 
 
 class GenerateRequest(BaseModel):
@@ -104,37 +97,24 @@ async def generate_steps_from_file(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
         
-        # Analyze audio
-        logger.info("Analyzing audio...")
-        analysis = audio_processor.analyze_audio(file_path)
-        
         # Generate steps
         logger.info(f"Generating {difficulty} steps...")
-        steps = await step_generator.generate_steps(
-            analysis,
-            difficulty,
-            song_info={"title": file.filename}
-        )
+        chart = ChartGenerationPipeline.generate_from_audio(file_path, difficulty)
+        steps = ChartExporter.to_json(chart)
 
-        new_steps = ChartGenerationPipeline.generate_from_audio(file_path, difficulty)
-        new_steps_json = ChartExporter.to_json(new_steps)
-
-        # New generator
-        
         # Prepare response
         response = {
             "song_id": song_id,
             "steps": steps,
-            "new_steps_json": new_steps_json,
             "song_info": {
                 "title": file.filename,
-                "duration": analysis["duration"],
-                "tempo": analysis["tempo"],
+                "duration": chart.duration,
+                "tempo": chart.tempo,
                 "source": "upload"
             },
             "audio_url": f"/api/audio/{song_id}{file_ext}"
         }
-        
+
         logger.info(f"✓ Generated {len(steps)} steps for {song_id}")
         return JSONResponse(content=response)
         
@@ -184,38 +164,27 @@ async def generate_steps_from_url(request: GenerateRequest):
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
         
-        # Analyze audio
-        logger.info("Analyzing audio...")
-        analysis = audio_processor.analyze_audio(file_path)
-        
         # Generate steps
         logger.info(f"Generating {request.difficulty} steps...")
-        steps = await step_generator.generate_steps(
-            analysis,
-            request.difficulty,
-            song_info=metadata
-        )
+        chart = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
+        steps = ChartExporter.to_json(chart)
 
-        new_steps = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
-        new_steps = ChartExporter.to_json(new_steps)
-        
         # Prepare response
         response = {
             "song_id": song_id,
-            "steps": steps,
-            "new_steps": new_steps,
+            "steps": steps["steps"],
             "song_info": {
                 "title": metadata["title"],
                 "artist": metadata.get("artist", "Unknown"),
-                "duration": analysis["duration"],
-                "tempo": analysis["tempo"],
+                "duration": chart.duration,
+                "tempo": chart.tempo,
                 "thumbnail": metadata.get("thumbnail", ""),
                 "source": metadata["source"],
                 "is_preview": download_result.get("is_preview", False)
             },
             "audio_url": f"/api/audio/{song_id}.mp3"
         }
-        
+
         logger.info(f"✓ Generated {len(steps)} steps for {song_id}")
         return JSONResponse(content=response)
         

@@ -13,9 +13,10 @@ import { StepGenerationResponse } from '../types/menu.types';
  * Extract steps from API response (prefers new_steps format)
  */
 function extractSteps(response: StepGenerationResponse): Step[] {
+  console.log({ response });
   // Use new_steps if available
-  if (response.new_steps?.steps && Array.isArray(response.new_steps.steps)) {
-    return response.new_steps.steps as Step[];
+  if (response.steps && Array.isArray(response.steps)) {
+    return response.steps as Step[];
   }
 
   // Fallback: shouldn't happen with new backend
