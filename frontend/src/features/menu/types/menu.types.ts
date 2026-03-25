@@ -15,7 +15,6 @@ export type AudioSource = 'file' | 'youtube' | 'spotify';
  */
 export interface DifficultyInfo {
   name: string;
-  description: string;
   color: string;
 }
 
@@ -25,18 +24,19 @@ export interface DifficultyInfo {
 export const DIFFICULTY_INFO: Record<DifficultyLevel, DifficultyInfo> = {
   beginner: {
     name: 'Beginner',
-    description: 'Slow pace, single arrows only',
     color: 'text-green-400'
   },
   intermediate: {
     name: 'Intermediate',
-    description: 'Moderate speed, some doubles',
     color: 'text-yellow-400'
   },
   expert: {
     name: 'Expert',
-    description: 'Fast, complex patterns',
     color: 'text-red-400'
+  },
+  insane: {
+    name: 'Insane',
+    color: 'text-red-800'
   }
 } as const;
 

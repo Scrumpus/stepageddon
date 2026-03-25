@@ -17,7 +17,7 @@ export interface SongInfo {
 /**
  * Difficulty levels for gameplay
  */
-export type DifficultyLevel = 'beginner' | 'intermediate' | 'expert';
+export type DifficultyLevel = 'beginner' | 'intermediate' | 'expert' | 'insane';
 
 /**
  * Game state machine states
