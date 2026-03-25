@@ -6,9 +6,9 @@ import { DifficultyLevel, SongInfo } from '@/types/common.types';
 import { Step } from '@/features/game/types/step.types';
 
 /**
- * Upload method selection
+ * Audio source type
  */
-export type UploadMethod = 'file' | 'url';
+export type AudioSource = 'file' | 'youtube' | 'spotify';
 
 /**
  * Difficulty information for display

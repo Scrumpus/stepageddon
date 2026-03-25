@@ -2,19 +2,15 @@
  * Main menu screen
  */
 
-import { useState } from 'react';
-import { Upload, Globe } from 'lucide-react';
 import { useApp } from '@/app/providers/AppProvider';
 import { useStepGeneration } from '../hooks';
 import DifficultySelector from './DifficultySelector';
 import FileUploader from './FileUploader';
 import UrlInput from './UrlInput';
-import type { UploadMethod } from '../types/menu.types';
 
 function MenuScreen() {
   const { difficulty, setDifficulty } = useApp();
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
-  const [uploadMethod, setUploadMethod] = useState<UploadMethod>('file');
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -22,7 +18,7 @@ function MenuScreen() {
         {/* Title */}
         <div className="text-center mb-12">
           <h1 className="text-6xl font-bold mb-4 bg-gradient-to-r from-game-primary via-game-secondary to-game-accent bg-clip-text text-transparent">
-            Stepageddon 
+            Stepageddon
           </h1>
         </div>
 
@@ -34,40 +30,24 @@ function MenuScreen() {
             onDifficultyChange={setDifficulty}
           />
 
-          {/* Upload Method Toggle */}
-          <div className="mb-6">
-            <div className="flex gap-2 bg-white/5 p-1 rounded-lg">
-              <button
-                onClick={() => setUploadMethod('file')}
-                className={`flex-1 py-2 px-4 rounded-md transition-all ${
-                  uploadMethod === 'file'
-                    ? 'bg-game-primary text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-              >
-                <Upload className="w-4 h-4 inline mr-2" />
-                Upload File
-              </button>
-              <button
-                onClick={() => setUploadMethod('url')}
-                className={`flex-1 py-2 px-4 rounded-md transition-all ${
-                  uploadMethod === 'url'
-                    ? 'bg-game-primary text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-              >
-                <Globe className="w-4 h-4 inline mr-2" />
-                URL
-              </button>
+          {/* Song Sources */}
+          <div className="space-y-6">
+            {/* URL Sources */}
+            <div className="space-y-4">
+              <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />
+              <UrlInput source="spotify" onUrlSubmit={handleUrlSubmit} />
             </div>
-          </div>
 
-          {/* File Upload or URL Input */}
-          {uploadMethod === 'file' ? (
+            {/* Divider */}
+            <div className="flex items-center gap-4">
+              <div className="flex-1 border-t border-white/10" />
+              <span className="text-xs text-gray-500 uppercase tracking-wider">or paste a link</span>
+              <div className="flex-1 border-t border-white/10" />
+            </div>
+
+            {/* File Upload */}
             <FileUploader onFileSelect={handleFileUpload} />
-          ) : (
-            <UrlInput onUrlSubmit={handleUrlSubmit} />
-          )}
+          </div>
         </div>
       </div>
     </div>
