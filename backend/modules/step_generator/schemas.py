@@ -45,12 +45,20 @@ class EnergySection(BaseModel):
     model_config = {"frozen": False}
 
 
+class BeatSubdivision(str, Enum):
+    """Beat subdivision for note coloring (DDR-style)."""
+    QUARTER = "4th"
+    EIGHTH = "8th"
+    SIXTEENTH = "16th"
+
+
 class Step(BaseModel):
     """A single step (tap or hold start)."""
     time: float
     arrows: List[Direction]
     step_type: StepType = StepType.TAP
     hold_duration: Optional[float] = None
+    beat_subdivision: BeatSubdivision = BeatSubdivision.QUARTER
 
     @field_validator('hold_duration')
     @classmethod

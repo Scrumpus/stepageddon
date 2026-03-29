@@ -84,7 +84,8 @@ class ChartExporter:
             step_dict = {
                 'time': round(step.time, 3),
                 'arrows': [a.value for a in step.arrows],
-                'type': step.step_type.value
+                'type': step.step_type.value,
+                'beat_subdivision': step.beat_subdivision.value,
             }
 
             if step.step_type == StepType.HOLD:

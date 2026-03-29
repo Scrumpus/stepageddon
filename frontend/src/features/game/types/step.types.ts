@@ -8,6 +8,7 @@ import { Direction } from '@/types/common.types';
  * Step type from backend
  */
 export type StepType = 'tap' | 'hold';
+export type BeatSubdivision = '4th' | '8th' | '16th';
 
 /**
  * Single step/note in the chart (new format from backend)
@@ -18,6 +19,7 @@ export interface Step {
   arrows: Direction[];       // Arrow directions (can be multiple for jumps)
   type: StepType;            // 'tap' or 'hold'
   hold_duration?: number;    // Duration for hold notes
+  beat_subdivision?: BeatSubdivision;  // '4th', '8th', '16th' for arrow coloring
 }
 
 /**
@@ -29,6 +31,7 @@ export interface ActiveArrow {
   direction: Direction;      // Single arrow direction
   type: StepType;            // 'tap' or 'hold'
   hold_duration?: number;    // Duration for hold notes
+  beat_subdivision?: BeatSubdivision;  // '4th', '8th', '16th' for arrow coloring
   stepIndex: number;         // Index of parent step
   arrowIndex: number;        // Index within step's arrows array
   y: number;                 // Y position for rendering

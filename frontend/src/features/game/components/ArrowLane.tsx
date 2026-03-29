@@ -4,7 +4,7 @@
  */
 
 import { Direction } from '@/types/common.types';
-import { ActiveArrow, ActiveHold } from '../types/step.types';
+import { ActiveArrow, ActiveHold, BeatSubdivision } from '../types/step.types';
 import { VISUAL_CONFIG, DIRECTIONS } from '../types/game.types';
 
 interface ArrowLaneProps {
@@ -31,55 +31,83 @@ const ARROW_ROTATION: Record<Direction, number> = {
   [Direction.RIGHT]: 0,
 };
 
-// Static PNG paths per direction
-// Drop PNGs into public/arrows/ with these filenames:
-//   arrow-left.png, arrow-down.png, arrow-up.png, arrow-right.png
+// Spritesheet config
+// Each file is a horizontal strip of 4 frames (e.g., 512x128 for 128px frames)
+// Frames cycle through inner section lighting: dim → 1 lit → 2 lit → all lit
+//
+// Drop into public/arrows/:
+//   arrow-left-4th.png, arrow-left-8th.png, arrow-left-16th.png  (different colors)
+//   arrow-down-4th.png, arrow-down-8th.png, arrow-down-16th.png
+//   arrow-up-4th.png, arrow-up-8th.png, arrow-up-16th.png
+//   arrow-right-4th.png, arrow-right-8th.png, arrow-right-16th.png
 //   receptor-left.png, receptor-down.png, receptor-up.png, receptor-right.png
-const ARROW_IMAGES: Record<Direction, string> = {
-  [Direction.LEFT]: '/arrows/arrow-left.png',
-  [Direction.DOWN]: '/arrows/arrow-down.png',
-  [Direction.UP]: '/arrows/arrow-up.png',
-  [Direction.RIGHT]: '/arrows/arrow-right.png',
+const SPRITE_FRAMES = 4;
+
+const ARROW_SHEETS: Record<BeatSubdivision, Record<Direction, string>> = {
+  '4th': {
+    [Direction.LEFT]: '/arrows/arrow-left-4th.png',
+    [Direction.DOWN]: '/arrows/arrow-down-4th.png',
+    [Direction.UP]: '/arrows/arrow-up-4th.png',
+    [Direction.RIGHT]: '/arrows/arrow-right-4th.png',
+  },
+  '8th': {
+    [Direction.LEFT]: '/arrows/arrow-left-8th.png',
+    [Direction.DOWN]: '/arrows/arrow-down-8th.png',
+    [Direction.UP]: '/arrows/arrow-up-8th.png',
+    [Direction.RIGHT]: '/arrows/arrow-right-8th.png',
+  },
+  '16th': {
+    [Direction.LEFT]: '/arrows/arrow-left-16th.png',
+    [Direction.DOWN]: '/arrows/arrow-down-16th.png',
+    [Direction.UP]: '/arrows/arrow-up-16th.png',
+    [Direction.RIGHT]: '/arrows/arrow-right-16th.png',
+  },
 };
 
-const RECEPTOR_IMAGES: Record<Direction, string> = {
+const RECEPTOR_SHEETS: Record<Direction, string> = {
   [Direction.LEFT]: '/arrows/receptor-left.png',
   [Direction.DOWN]: '/arrows/receptor-down.png',
   [Direction.UP]: '/arrows/receptor-up.png',
   [Direction.RIGHT]: '/arrows/receptor-right.png',
 };
 
-function ArrowImage({ direction, size = 64, tempo = 120 }: { direction: Direction; size?: number; tempo?: number }) {
+function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: {
+  direction: Direction;
+  subdivision?: BeatSubdivision;
+  size?: number;
+  tempo?: number;
+}) {
   const beatDuration = 60 / tempo;
+  const sheet = ARROW_SHEETS[subdivision][direction];
+  const sheetWidth = size * SPRITE_FRAMES;
 
   return (
-    <img
-      src={ARROW_IMAGES[direction]}
-      width={size}
-      height={size}
-      alt=""
-      draggable={false}
-      className="receptor-pulse"
-      style={{ animationDuration: `${beatDuration}s` }}
+    <div
+      style={{
+        width: size,
+        height: size,
+        backgroundImage: `url(${sheet})`,
+        backgroundSize: `${sheetWidth}px ${size}px`,
+        '--sheet-width': `${-sheetWidth}px`,
+        animation: `sprite-step ${beatDuration}s steps(${SPRITE_FRAMES}) infinite`,
+      } as React.CSSProperties}
     />
   );
 }
 
-function ReceptorImage({ direction, active, size = 64, tempo = 120 }: { direction: Direction; active: boolean; size?: number; tempo?: number }) {
-  const beatDuration = 60 / tempo;
-
+function ReceptorImage({ direction, active, size = 64 }: {
+  direction: Direction;
+  active: boolean;
+  size?: number;
+}) {
   return (
     <img
-      src={RECEPTOR_IMAGES[direction]}
+      src={RECEPTOR_SHEETS[direction]}
       width={size}
       height={size}
       alt=""
       draggable={false}
-      className="receptor-pulse"
-      style={{
-        opacity: active ? 1 : 0.5,
-        animationDuration: `${beatDuration}s`,
-      }}
+      style={{ opacity: active ? 1 : 0.5 }}
     />
   );
 }
@@ -179,7 +207,7 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                 filter: isActive ? `drop-shadow(0 0 20px ${colors.glow})` : 'none',
               }}
             >
-              <ReceptorImage direction={direction} active={isActive} size={arrowSize} tempo={tempo} />
+              <ReceptorImage direction={direction} active={isActive} size={arrowSize} />
             </div>
           );
         })}
@@ -238,7 +266,7 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                   : 'none',
               }}
             >
-              <ArrowImage direction={arrow.direction} size={arrowSize} tempo={tempo} />
+              <ArrowImage direction={arrow.direction} subdivision={arrow.beat_subdivision} size={arrowSize} tempo={tempo} />
             </div>
           </div>
         );

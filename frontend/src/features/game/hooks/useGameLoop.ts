@@ -91,6 +91,7 @@ export function useGameLoop({
               direction,
               type: step.type,
               hold_duration: step.hold_duration,
+              beat_subdivision: step.beat_subdivision,
               stepIndex,
               arrowIndex,
               y,
