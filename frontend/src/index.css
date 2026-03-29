@@ -16,10 +16,14 @@
   }
 }
 
-/* Spritesheet animation - steps through frames horizontally */
-@keyframes sprite-step {
-  from { background-position: 0 0; }
-  to { background-position: -100% 0; }
+/* Beat-synced receptor pulse */
+@keyframes receptor-pulse {
+  0%, 100% { transform: scale(1); filter: brightness(1); }
+  50% { transform: scale(1.08); filter: brightness(1.5); }
+}
+
+.receptor-pulse {
+  animation: receptor-pulse 0.5s ease-in-out infinite;
 }
 
 @layer utilities {
