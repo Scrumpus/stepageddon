@@ -244,11 +244,6 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
         );
       })}
 
-      {/* Hit zone line */}
-      <div
-        className="absolute left-0 right-0 h-0.5 bg-white/20 z-10"
-        style={{ top: `${VISUAL_CONFIG.HIT_ZONE_Y + arrowSize / 2}px` }}
-      />
     </div>
   );
 }
