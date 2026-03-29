@@ -155,6 +155,7 @@ function GameScreen() {
         activeKeys={activeKeys}
         activeHolds={activeHolds}
         arrowSpeed={getArrowSpeed(songData.tempo || 120)}
+        tempo={songData.tempo || 120}
       />
 
       <JudgmentDisplay judgment={judgmentDisplay} />

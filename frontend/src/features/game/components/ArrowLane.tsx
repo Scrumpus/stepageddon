@@ -12,6 +12,7 @@ interface ArrowLaneProps {
   activeKeys: Record<Direction, boolean>;
   activeHolds: ActiveHold[];
   arrowSpeed: number;  // Pixels per second for calculating hold trail length
+  tempo: number;       // BPM for beat-synced spritesheet animation
 }
 
 // DDR-style color scheme
@@ -22,48 +23,79 @@ const ARROW_COLORS: Record<Direction, { main: string; glow: string; bg: string }
   [Direction.RIGHT]: { main: '#ff4757', glow: '#ff4757', bg: 'rgba(255, 71, 87, 0.15)' },
 };
 
-// Arrow rotation for each direction
+// Arrow rotation for each direction (set to 0 when using pre-rotated PNGs)
 const ARROW_ROTATION: Record<Direction, number> = {
-  [Direction.LEFT]: -90,
-  [Direction.DOWN]: 180,
+  [Direction.LEFT]: 0,
+  [Direction.DOWN]: 0,
   [Direction.UP]: 0,
-  [Direction.RIGHT]: 90,
+  [Direction.RIGHT]: 0,
 };
 
-// DDR-style arrow SVG
-function ArrowSVG({ color, size = 64 }: { color: string; size?: number }) {
+// Spritesheet config
+// Each spritesheet is a horizontal strip: [frame1][frame2][frame3][frame4]...
+// Drop spritesheets into public/arrows/ with these filenames:
+//   arrow-left.png, arrow-down.png, arrow-up.png, arrow-right.png
+//   receptor-left.png, receptor-down.png, receptor-up.png, receptor-right.png
+// Each frame should be square (e.g., 128x128). A 4-frame sheet = 512x128.
+const SPRITE_FRAMES = 4;  // Number of frames in each spritesheet
+
+const ARROW_SHEETS: Record<Direction, string> = {
+  [Direction.LEFT]: '/arrows/arrow-left.png',
+  [Direction.DOWN]: '/arrows/arrow-down.png',
+  [Direction.UP]: '/arrows/arrow-up.png',
+  [Direction.RIGHT]: '/arrows/arrow-right.png',
+};
+
+const RECEPTOR_SHEETS: Record<Direction, string> = {
+  [Direction.LEFT]: '/arrows/receptor-left.png',
+  [Direction.DOWN]: '/arrows/receptor-down.png',
+  [Direction.UP]: '/arrows/receptor-up.png',
+  [Direction.RIGHT]: '/arrows/receptor-right.png',
+};
+
+// Shared spritesheet component
+function Sprite({
+  sheet,
+  frames,
+  size,
+  tempo,
+  style,
+}: {
+  sheet: string;
+  frames: number;
+  size: number;
+  tempo: number;
+  style?: React.CSSProperties;
+}) {
+  const beatDuration = 60 / tempo;  // seconds per beat
+
   return (
-    <svg width={size} height={size} viewBox="0 0 64 64" fill="none">
-      {/* Arrow shape */}
-      <path
-        d="M32 8L52 28H40V56H24V28H12L32 8Z"
-        fill={color}
-        stroke={color}
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-      {/* Inner highlight */}
-      <path
-        d="M32 14L46 28H40V50H24V28H18L32 14Z"
-        fill="rgba(255,255,255,0.3)"
-      />
-    </svg>
+    <div
+      style={{
+        width: size,
+        height: size,
+        backgroundImage: `url(${sheet})`,
+        backgroundSize: `${size * frames}px ${size}px`,
+        animation: `sprite-step ${beatDuration}s steps(${frames}) infinite`,
+        ...style,
+      }}
+    />
   );
 }
 
-// Target receptor (outline only)
-function ReceptorSVG({ color, active, size = 64 }: { color: string; active: boolean; size?: number }) {
+function ArrowImage({ direction, size = 64, tempo = 120 }: { direction: Direction; size?: number; tempo?: number }) {
+  return <Sprite sheet={ARROW_SHEETS[direction]} frames={SPRITE_FRAMES} size={size} tempo={tempo} />;
+}
+
+function ReceptorImage({ direction, active, size = 64, tempo = 120 }: { direction: Direction; active: boolean; size?: number; tempo?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 64 64" fill="none">
-      <path
-        d="M32 8L52 28H40V56H24V28H12L32 8Z"
-        fill={active ? `${color}33` : 'transparent'}
-        stroke={color}
-        strokeWidth="3"
-        strokeLinejoin="round"
-        opacity={active ? 1 : 0.5}
-      />
-    </svg>
+    <Sprite
+      sheet={RECEPTOR_SHEETS[direction]}
+      frames={SPRITE_FRAMES}
+      size={size}
+      tempo={tempo}
+      style={{ opacity: active ? 1 : 0.5 }}
+    />
   );
 }
 
@@ -129,7 +161,7 @@ function HoldTrail({
   );
 }
 
-function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed }: ArrowLaneProps) {
+function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }: ArrowLaneProps) {
   const arrowSize = VISUAL_CONFIG.ARROW_SIZE;
   const gap = 16;
   const totalWidth = (arrowSize * 4) + (gap * 3);
@@ -183,7 +215,7 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed }: ArrowL
                 filter: isActive ? `drop-shadow(0 0 20px ${colors.glow})` : 'none',
               }}
             >
-              <ReceptorSVG color={colors.main} active={isActive} size={arrowSize} />
+              <ReceptorImage direction={direction} active={isActive} size={arrowSize} tempo={tempo} />
             </div>
           );
         })}
@@ -242,7 +274,7 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed }: ArrowL
                   : 'none',
               }}
             >
-              <ArrowSVG color={colors.main} size={arrowSize} />
+              <ArrowImage direction={arrow.direction} size={arrowSize} tempo={tempo} />
             </div>
           </div>
         );
