@@ -154,27 +154,6 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
 
   return (
     <div className="flex-1 relative overflow-hidden bg-gradient-to-b from-black/50 to-transparent">
-      {/* Lane guides */}
-      <div
-        className="absolute left-1/2 h-full pointer-events-none"
-        style={{ transform: 'translateX(-50%)' }}
-      >
-        {DIRECTIONS.map((direction, index) => {
-          const x = startX + index * (arrowSize + gap);
-          const colors = ARROW_COLORS[direction];
-          return (
-            <div
-              key={`lane-${direction}`}
-              className="absolute h-full"
-              style={{
-                left: `calc(50% + ${x}px)`,
-                width: arrowSize,
-                background: `linear-gradient(to top, ${colors.bg}, transparent 30%)`,
-              }}
-            />
-          );
-        })}
-      </div>
 
       {/* Target Zone (Receptors) */}
       <div
