@@ -221,10 +221,6 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
         const colors = ARROW_COLORS[arrow.direction];
         const rotation = ARROW_ROTATION[arrow.direction];
 
-        // Glow intensity based on proximity to hit zone
-        const distanceToHit = Math.abs(arrow.timeUntilHit);
-        const glowIntensity = distanceToHit < 0.3 ? (0.3 - distanceToHit) / 0.3 : 0;
-
         // Calculate hold trail length if this is a hold note
         const isHold = arrow.type === 'hold' && arrow.hold_duration;
         const trailLength = isHold ? arrow.hold_duration! * arrowSpeed : 0;
@@ -261,9 +257,6 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                 width: arrowSize,
                 height: arrowSize,
                 transform: `rotate(${rotation}deg)`,
-                filter: glowIntensity > 0
-                  ? `drop-shadow(0 0 ${10 + glowIntensity * 20}px ${colors.glow})`
-                  : 'none',
               }}
             >
               <ArrowImage direction={arrow.direction} subdivision={arrow.beat_subdivision} size={arrowSize} tempo={tempo} />
