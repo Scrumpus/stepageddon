@@ -95,11 +95,14 @@ function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: 
   );
 }
 
-function ReceptorImage({ direction, active, size = 64 }: {
+function ReceptorImage({ direction, active, size = 64, tempo = 120 }: {
   direction: Direction;
   active: boolean;
   size?: number;
+  tempo?: number;
 }) {
+  const beatDuration = 60 / tempo;
+
   return (
     <img
       src={RECEPTOR_SHEETS[direction]}
@@ -107,7 +110,10 @@ function ReceptorImage({ direction, active, size = 64 }: {
       height={size}
       alt=""
       draggable={false}
-      style={{ opacity: active ? 1 : 0.5 }}
+      style={{
+        opacity: active ? 1 : 0.5,
+        animation: `receptor-pulse ${beatDuration}s steps(1) infinite`,
+      }}
     />
   );
 }
@@ -207,7 +213,7 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                 filter: isActive ? `drop-shadow(0 0 20px ${colors.glow})` : 'none',
               }}
             >
-              <ReceptorImage direction={direction} active={isActive} size={arrowSize} />
+              <ReceptorImage direction={direction} active={isActive} size={arrowSize} tempo={tempo} />
             </div>
           );
         })}
