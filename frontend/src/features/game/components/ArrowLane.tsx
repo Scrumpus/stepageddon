@@ -95,9 +95,8 @@ function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: 
   );
 }
 
-function ReceptorImage({ direction, active, size = 64, tempo = 120 }: {
+function ReceptorImage({ direction, size = 64, tempo = 120 }: {
   direction: Direction;
-  active: boolean;
   size?: number;
   tempo?: number;
 }) {
@@ -111,7 +110,7 @@ function ReceptorImage({ direction, active, size = 64, tempo = 120 }: {
       alt=""
       draggable={false}
       style={{
-        opacity: active ? 1 : 0.5,
+        opacity: 0.5,
         animation: `receptor-pulse ${beatDuration}s steps(1) infinite`,
       }}
     />
@@ -198,7 +197,6 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
         }}
       >
         {DIRECTIONS.map((direction) => {
-          const colors = ARROW_COLORS[direction];
           const rotation = ARROW_ROTATION[direction];
           const isActive = activeKeys[direction];
 
@@ -210,10 +208,9 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                 width: arrowSize,
                 height: arrowSize,
                 transform: `rotate(${rotation}deg) ${isActive ? 'scale(1.1)' : 'scale(1)'}`,
-                filter: isActive ? `drop-shadow(0 0 20px ${colors.glow})` : 'none',
               }}
             >
-              <ReceptorImage direction={direction} active={isActive} size={arrowSize} tempo={tempo} />
+              <ReceptorImage direction={direction} size={arrowSize} tempo={tempo} />
             </div>
           );
         })}
