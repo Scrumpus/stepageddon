@@ -15,7 +15,7 @@ from typing import List, Optional
 
 from .schemas import (
     Beat, EnergySection, Step, Chart,
-    Direction, StepType, DifficultyConfig
+    Direction, StepType, DifficultyConfig, BeatSubdivision
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,10 @@ class StepGenerator:
         # Phase 3: Validate
         steps = self._validate_chart(steps, duration)
         logger.info(f"Phase 3: {len(steps)} steps after validation")
+
+        # Classify beat subdivisions
+        for step in steps:
+            step.beat_subdivision = self._classify_subdivision(step.time, tempo)
 
         return Chart(
             steps=steps,
@@ -402,6 +406,23 @@ class StepGenerator:
             if s.start_time <= time <= s.end_time:
                 return s
         return None
+
+    # ── Beat subdivision classification ─────────────────────────────────
+
+    @staticmethod
+    def _classify_subdivision(time: float, tempo: float) -> BeatSubdivision:
+        """Classify a step time as quarter, eighth, or sixteenth note."""
+        beat_duration = 60.0 / tempo
+        # Position within the beat (0.0 to 1.0)
+        beat_position = (time % beat_duration) / beat_duration
+        # Quarter note: lands on the beat (position ~0.0)
+        if beat_position < 0.05 or beat_position > 0.95:
+            return BeatSubdivision.QUARTER
+        # Eighth note: lands on the half-beat (position ~0.5)
+        if abs(beat_position - 0.5) < 0.05:
+            return BeatSubdivision.EIGHTH
+        # Everything else is a sixteenth
+        return BeatSubdivision.SIXTEENTH
 
     # ── Phase 3: Validate ──────────────────────────────────────────────
 

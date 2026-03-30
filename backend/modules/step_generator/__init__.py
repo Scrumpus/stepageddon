@@ -16,7 +16,7 @@ Example:
 
 from .pipeline import ChartGenerationPipeline, ChartExporter
 from .generator import StepGenerator
-from .schemas import Chart, Step, StepType, Direction, DifficultyConfig, Beat, EnergySection
+from .schemas import Chart, Step, StepType, Direction, DifficultyConfig, Beat, EnergySection, BeatSubdivision
 from .difficulty import DIFFICULTY_PRESETS, get_difficulty_config
 from .patterns import PatternTemplate
 
@@ -33,6 +33,7 @@ __all__ = [
     "DifficultyConfig",
     "Beat",
     "EnergySection",
+    "BeatSubdivision",
     "DIFFICULTY_PRESETS",
     "get_difficulty_config",
     "PatternTemplate",

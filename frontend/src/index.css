@@ -16,14 +16,16 @@
   }
 }
 
-/* Beat-synced receptor pulse */
-@keyframes receptor-pulse {
-  0%, 100% { transform: scale(1); filter: brightness(1); }
-  50% { transform: scale(1.08); filter: brightness(1.5); }
+/* Spritesheet animation using CSS custom property for sheet width */
+@keyframes sprite-step {
+  from { background-position-x: 0px; }
+  to { background-position-x: var(--sheet-width); }
 }
 
-.receptor-pulse {
-  animation: receptor-pulse 0.5s ease-in-out infinite;
+/* Receptor beat pulse - short burst */
+@keyframes receptor-pulse {
+  0%, 24.9% { filter: brightness(1.6); }
+  25%, 100% { filter: brightness(0.7); }
 }
 
 @layer utilities {
