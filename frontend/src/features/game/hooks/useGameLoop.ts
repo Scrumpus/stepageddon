@@ -43,6 +43,12 @@ export function useGameLoop({
   const animationRef = useRef<number | null>(null);
   const processedStepsRef = useRef<Set<string>>(new Set());
 
+  // Stable refs for callbacks to avoid restarting the game loop
+  const onFinishRef = useRef(onFinish);
+  onFinishRef.current = onFinish;
+  const onMissRef = useRef(onMiss);
+  onMissRef.current = onMiss;
+
   // Calculate arrow speed based on tempo
   const arrowSpeed = getArrowSpeed(tempo);
 
@@ -78,7 +84,7 @@ export function useGameLoop({
 
           if (timeUntilHit < -0.2) {
             processedStepsRef.current.add(arrowKey);
-            onMiss();
+            onMissRef.current();
             return;
           }
 
@@ -105,7 +111,7 @@ export function useGameLoop({
 
       // Check if song is finished (0.5s buffer)
       if (currentTime >= songDuration - 0.5) {
-        onFinish();
+        onFinishRef.current();
         return;
       }
 
@@ -119,7 +125,7 @@ export function useGameLoop({
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [gameState, steps, songDuration, audioRef, onFinish, onMiss, arrowSpeed]);
+  }, [gameState, steps, songDuration, audioRef, arrowSpeed]);
 
   return {
     currentTime,
