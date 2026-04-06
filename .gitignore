@@ -25,6 +25,9 @@ dist/
 dist-ssr/
 *.local
 
+# Chart data
+charts/
+
 # Environment
 .env
 .env.local
