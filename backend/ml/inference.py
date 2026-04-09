@@ -16,7 +16,10 @@ import librosa
 
 from ml.model import StepChartModel
 from ml.dataset import DEFAULT_DENSITY_BY_ID, DENSITY_MEAN, DENSITY_STD
-from ml.prepare_data import SAMPLE_RATE, N_MELS, HOP_LENGTH, N_FFT, FRAMES_PER_SECOND
+from ml.prepare_data import (
+    SAMPLE_RATE, N_MELS, HOP_LENGTH, N_FFT, FRAMES_PER_SECOND,
+    N_INPUT_CHANNELS, compute_rhythm_channels,
+)
 from modules.step_generator.schemas import (
     Chart, Step, StepType, Direction, BeatSubdivision,
 )
@@ -78,7 +81,7 @@ class MLChartGenerator:
         # Extract model hyperparameters from checkpoint
         args = checkpoint.get('args', {})
         self.model = StepChartModel(
-            n_mels=80,
+            n_mels=N_INPUT_CHANNELS,
             hidden_dim=args.get('hidden_dim', 256),
             n_heads=args.get('n_heads', 8),
             n_transformer_layers=args.get('n_layers', 4),
@@ -155,7 +158,12 @@ class MLChartGenerator:
         )
         mel_db = librosa.power_to_db(mel, ref=np.max)
         mel_db = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
-        mel_frames = mel_db.T.astype(np.float32)  # [T, N_MELS]
+        mel_only = mel_db.T.astype(np.float32)  # [T, N_MELS]
+
+        # Rhythm-aware auxiliary channels must match training layout —
+        # concatenated after the mel bins along the feature axis.
+        rhythm = compute_rhythm_channels(y, sr, mel_only.shape[0]).astype(np.float32)
+        mel_frames = np.concatenate([mel_only, rhythm], axis=-1)  # [T, N_INPUT_CHANNELS]
 
         # Detect tempo and beats for post-processing
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
@@ -166,7 +174,7 @@ class MLChartGenerator:
 
         # Run model inference in chunks
         logger.info(f"Running inference (difficulty={difficulty}, id={difficulty_id})...")
-        raw_predictions = self._predict_chunked(
+        raw_predictions, placement_probs = self._predict_chunked(
             mel_frames, difficulty_id, target_density
         )
 
@@ -174,7 +182,7 @@ class MLChartGenerator:
         diff_config = get_difficulty_config(difficulty)
         logger.info("Post-processing predictions...")
         steps = self._postprocess(
-            raw_predictions, tempo, beat_times, duration, diff_config
+            raw_predictions, placement_probs, tempo, beat_times, duration, diff_config
         )
 
         chart = Chart(
@@ -205,10 +213,15 @@ class MLChartGenerator:
             target_density: desired chart density in steps/sec
 
         Returns:
-            [T, 4, 4] float32 softmax probabilities
+            tuple of (arrow_probs, placement_probs) where
+                arrow_probs: [T, 4, 3] float32 sigmoid probabilities, last
+                    axis = (tap, hold_state, hold_end).
+                placement_probs: [T] float32 sigmoid probability that any
+                    arrow has a step at this frame.
         """
         T = mel_frames.shape[0]
-        all_probs = np.zeros((T, 4, 4), dtype=np.float32)
+        all_probs = np.zeros((T, 4, 3), dtype=np.float32)
+        all_placement = np.zeros(T, dtype=np.float32)
         all_counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -222,7 +235,10 @@ class MLChartGenerator:
 
             # Pad if chunk is shorter than expected
             if chunk.shape[0] < self.chunk_frames:
-                pad = np.zeros((self.chunk_frames - chunk.shape[0], N_MELS), dtype=np.float32)
+                pad = np.zeros(
+                    (self.chunk_frames - chunk.shape[0], mel_frames.shape[1]),
+                    dtype=np.float32,
+                )
                 chunk = np.concatenate([chunk, pad], axis=0)
 
             mel_tensor = torch.from_numpy(chunk).unsqueeze(0).to(self.device)
@@ -231,23 +247,29 @@ class MLChartGenerator:
                 [density_norm], dtype=torch.float32, device=self.device
             )
 
-            logits = self.model(mel_tensor, diff_tensor, density_tensor)  # [1, chunk_frames, 4, 4]
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            logits = self.model(mel_tensor, diff_tensor, density_tensor)
+            tap_p = torch.sigmoid(logits['tap'])[0]
+            hold_state_p = torch.sigmoid(logits['hold_state'])[0]
+            hold_end_p = torch.sigmoid(logits['hold_end'])[0]
+            probs = torch.stack([tap_p, hold_state_p, hold_end_p], dim=-1).cpu().numpy()
+            placement_p = torch.sigmoid(logits['placement'])[0].cpu().numpy()
 
-            # Accumulate (only valid portion, not padding)
             valid_len = min(end - start, self.chunk_frames)
             all_probs[start:start + valid_len] += probs[:valid_len]
+            all_placement[start:start + valid_len] += placement_p[:valid_len]
             all_counts[start:start + valid_len] += 1.0
 
         # Average overlapping regions
         all_counts = np.maximum(all_counts, 1.0)
         all_probs /= all_counts[:, None, None]
+        all_placement /= all_counts
 
-        return all_probs
+        return all_probs, all_placement
 
     def _postprocess(
         self,
         probs: np.ndarray,
+        placement_probs: np.ndarray,
         tempo: float,
         beat_times: np.ndarray,
         duration: float,
@@ -266,10 +288,26 @@ class MLChartGenerator:
         """
         T = probs.shape[0]
 
+        # probs axis layout from _predict_chunked: [T, 4, 3] = (tap, hold_state, hold_end)
+        TAP_IDX, HOLD_STATE_IDX, HOLD_END_IDX = 0, 1, 2
+
+        # Combine the per-arrow tap head with the arrow-agnostic placement
+        # head: p(tap_i) ≈ p(placement) * p(arrow=i | placement). The
+        # placement head is trained explicitly against "any arrow has a
+        # step here", so this product gives an absolute-confidence signal
+        # that scales from ~0 in silence to ~1 on real onsets — much
+        # cleaner for NMS thresholding than the raw tap head alone.
+        tap_gated = probs[:, :, TAP_IDX] * placement_probs[:, None]  # [T, 4]
+        logger.info(
+            f"[postprocess debug] placement: max={placement_probs.max():.4f} "
+            f"mean={placement_probs.mean():.4f} "
+            f"p95={np.percentile(placement_probs, 95):.4f}"
+        )
+
         # ---- DEBUG: probability distribution diagnostics ----
-        tap_probs_all = probs[:, :, 1]
-        hold_start_all = probs[:, :, 2]
-        hold_end_all = probs[:, :, 3]
+        tap_probs_all = probs[:, :, TAP_IDX]
+        hold_state_all = probs[:, :, HOLD_STATE_IDX]
+        hold_end_all = probs[:, :, HOLD_END_IDX]
         logger.info(f"[postprocess debug] probs.shape={probs.shape}")
         logger.info(
             f"[postprocess debug] tap: max={tap_probs_all.max():.4f} "
@@ -278,7 +316,7 @@ class MLChartGenerator:
             f"p99={np.percentile(tap_probs_all, 99):.4f}"
         )
         logger.info(
-            f"[postprocess debug] hold_start max={hold_start_all.max():.4f}  "
+            f"[postprocess debug] hold_state max={hold_state_all.max():.4f}  "
             f"hold_end max={hold_end_all.max():.4f}"
         )
         any_arrow_max = tap_probs_all.max(axis=1)
@@ -293,13 +331,14 @@ class MLChartGenerator:
         nms_window_frames = max(1, int(round(min_gap * FRAMES_PER_SECOND)))
 
         # ---- Step 1: per-arrow tap peak picking via NMS ----
-        # No absolute confidence gate: softmax across 4 classes means even
-        # confident taps cap around ~0.3. Let NMS + density top-N do the
-        # selection so post-processing is self-calibrating across retrainings.
-        tap_floor = 1e-4  # ignore essentially-zero noise only
+        # Tap head is now a per-arrow sigmoid, so absolute confidence is
+        # meaningful (caps near 1.0 on well-trained models). We still keep
+        # a tiny floor + NMS so post-processing stays self-calibrating if
+        # the trained model is underconfident.
+        tap_floor = 1e-3
         tap_candidates = []  # list of {time, arrow, confidence, type='tap'}
         for arrow in range(4):
-            tap_probs = probs[:, arrow, 1]  # [T]
+            tap_probs = tap_gated[:, arrow]  # [T]
             for frame in range(T):
                 p = float(tap_probs[frame])
                 if p < tap_floor:
@@ -318,31 +357,41 @@ class MLChartGenerator:
                     'confidence': p,
                 })
 
-        # ---- Step 2: hold detection (independent threshold) ----
+        # ---- Step 2: hold detection via hold_state run-length decoding ----
+        # Find contiguous runs where hold_state > threshold. The run start is
+        # the note onset, the last frame in the run is the release; duration
+        # is the span in seconds. No start/end pairing required — this is
+        # the big win from the three-head reformulation.
         hold_events = []
+        hold_thr = self.confidence_threshold
         for arrow in range(4):
-            in_hold = False
-            start_time = 0.0
-            start_conf = 0.0
-            for frame in range(T):
-                p_start = float(probs[frame, arrow, 2])
-                p_end = float(probs[frame, arrow, 3])
-                t = frame / FRAMES_PER_SECOND
-                if not in_hold and p_start > self.confidence_threshold:
-                    in_hold = True
-                    start_time = t
-                    start_conf = p_start
-                elif in_hold and p_end > self.confidence_threshold:
-                    hold_dur = t - start_time
-                    in_hold = False
-                    if 0.2 <= hold_dur <= 5.0:
-                        hold_events.append({
-                            'time': start_time,
-                            'arrow': arrow,
-                            'type': 'hold',
-                            'hold_duration': hold_dur,
-                            'confidence': (start_conf + p_end) / 2,
-                        })
+            state = probs[:, arrow, HOLD_STATE_IDX] > hold_thr  # [T] bool
+            if not state.any():
+                continue
+            # Build (start, end_inclusive) runs.
+            edges = np.diff(state.astype(np.int8), prepend=0, append=0)
+            starts = np.where(edges == 1)[0]
+            ends = np.where(edges == -1)[0] - 1  # inclusive end
+            for s, e in zip(starts, ends):
+                start_time = s / FRAMES_PER_SECOND
+                end_time = (e + 1) / FRAMES_PER_SECOND  # release just after last in-hold frame
+                hold_dur = end_time - start_time
+                if not (0.2 <= hold_dur <= 5.0):
+                    continue
+                # Confidence = mean hold_state prob over the run, gently
+                # boosted by the peak hold_end prob near the release (the
+                # end head is the more informative of the two for choosing
+                # between competing candidates).
+                run_conf = float(probs[s:e + 1, arrow, HOLD_STATE_IDX].mean())
+                end_window = probs[max(0, e - 2):e + 2, arrow, HOLD_END_IDX]
+                end_conf = float(end_window.max()) if end_window.size else 0.0
+                hold_events.append({
+                    'time': start_time,
+                    'arrow': arrow,
+                    'type': 'hold',
+                    'hold_duration': hold_dur,
+                    'confidence': 0.7 * run_conf + 0.3 * end_conf,
+                })
 
         # ---- Step 3: difficulty-aware density targeting ----
         # Compute target tap count from preset density (steps/sec)

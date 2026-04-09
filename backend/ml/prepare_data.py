@@ -39,6 +39,12 @@ HOP_LENGTH = 220  # ~100 fps (22050 / 220 = 100.23 fps)
 N_FFT = 2048
 FRAMES_PER_SECOND = SAMPLE_RATE / HOP_LENGTH  # ~100.23
 
+# Rhythm-aware auxiliary channels concatenated to the mel features.
+# Exposing these explicitly lets the model attend to onset density and
+# beat phase without having to reconstruct them from raw mel bins.
+N_RHYTHM_CHANNELS = 2   # onset_strength, beat_phase
+N_INPUT_CHANNELS = N_MELS + N_RHYTHM_CHANNELS  # 82
+
 # Label encoding
 LABEL_NONE = 0
 LABEL_TAP = 1
@@ -46,12 +52,16 @@ LABEL_HOLD_START = 2
 LABEL_HOLD_END = 3
 
 
-def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
+def extract_audio_features(audio_path: str):
     """
-    Extract mel spectrogram from audio file.
+    Extract mel spectrogram + rhythm auxiliary channels from audio.
 
     Returns:
-        [T, N_MELS] float16 array, or None on failure.
+        (mel, rhythm) tuple where
+            mel:    [T, N_MELS] float16, normalized to [0, 1]
+            rhythm: [T, N_RHYTHM_CHANNELS] float16 with columns
+                (onset_strength_norm, beat_phase).
+        Returns None on failure.
     """
     try:
         y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
@@ -67,11 +77,76 @@ def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
         y=y, sr=sr, n_mels=N_MELS, hop_length=HOP_LENGTH, n_fft=N_FFT,
     )
     mel_db = librosa.power_to_db(mel, ref=np.max)
-
-    # Normalize to [0, 1]
     mel_db = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+    mel_out = mel_db.T.astype(np.float16)           # [T, N_MELS]
+    n_frames = mel_out.shape[0]
 
-    return mel_db.T.astype(np.float16)  # [T, N_MELS]
+    rhythm = compute_rhythm_channels(y, sr, n_frames)
+    return mel_out, rhythm.astype(np.float16)
+
+
+def compute_rhythm_channels(y: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+    """
+    Compute (onset_strength, beat_phase) aligned to the mel frame grid.
+
+    onset_strength: normalized to [0, 1] per song so the scale is
+        comparable across dynamic ranges.
+    beat_phase: a sawtooth that ramps 0 → ~1 between consecutive detected
+        beats, wraps to 0 on each beat. Silence / un-detected regions get
+        phase 0.
+
+    Shape: [n_frames, 2] float32.
+    """
+    # Onset strength at the exact hop_length used for mel frames.
+    onset_env = librosa.onset.onset_strength(
+        y=y, sr=sr, hop_length=HOP_LENGTH,
+    )
+    # Length may be off-by-one vs mel; pad/trim.
+    onset_env = _fit_length(onset_env, n_frames)
+    denom = float(onset_env.max()) if onset_env.size else 1.0
+    onset_env = onset_env / (denom + 1e-8)
+    onset_env = np.clip(onset_env, 0.0, 1.0)
+
+    # Beat phase: sawtooth between consecutive beat frames.
+    try:
+        _, beat_frames = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=HOP_LENGTH,
+        )
+    except Exception:
+        beat_frames = np.array([], dtype=np.int64)
+
+    phase = np.zeros(n_frames, dtype=np.float32)
+    if len(beat_frames) >= 2:
+        for i in range(len(beat_frames) - 1):
+            a = int(beat_frames[i])
+            b = int(beat_frames[i + 1])
+            if b <= a or a >= n_frames:
+                continue
+            b = min(b, n_frames)
+            span = b - a
+            if span > 0:
+                phase[a:b] = np.linspace(0.0, 1.0, span, endpoint=False)
+    return np.stack([onset_env.astype(np.float32), phase], axis=-1)  # [T, 2]
+
+
+def _fit_length(x: np.ndarray, n: int) -> np.ndarray:
+    """Pad/trim a 1-D array to length n."""
+    if x.shape[0] == n:
+        return x
+    if x.shape[0] > n:
+        return x[:n]
+    out = np.zeros(n, dtype=x.dtype)
+    out[:x.shape[0]] = x
+    return out
+
+
+# Backwards-compatible shim: some callers imported extract_mel_spectrogram
+# directly. Keep it returning just the mel so they don't break.
+def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
+    out = extract_audio_features(audio_path)
+    if out is None:
+        return None
+    return out[0]
 
 
 def notes_to_frame_labels(notes, n_frames: int) -> np.ndarray:
@@ -134,10 +209,11 @@ def process_chart_directory(chart_dir: Path, output_dir: Path, index: int) -> li
     if sm is None or not sm.charts:
         return []
 
-    # Extract mel spectrogram
-    mel = extract_mel_spectrogram(str(audio_file))
-    if mel is None:
+    # Extract mel spectrogram + rhythm channels
+    features = extract_audio_features(str(audio_file))
+    if features is None:
         return []
+    mel, rhythm = features
 
     n_frames = mel.shape[0]
     primary_bpm = sm.primary_bpm
@@ -162,6 +238,7 @@ def process_chart_directory(chart_dir: Path, output_dir: Path, index: int) -> li
         np.savez_compressed(
             output_dir / filename,
             mel=mel,
+            rhythm=rhythm,
             labels=labels,
         )
 
