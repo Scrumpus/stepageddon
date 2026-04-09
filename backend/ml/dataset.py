@@ -5,12 +5,13 @@ Loads preprocessed mel spectrograms and frame-aligned labels,
 returns random chunks for training.
 """
 
+import hashlib
 import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler, Subset
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,13 @@ class StepChartDataset(Dataset):
         chunk_frames: int = 500,
         is_train: bool = True,
         n_mels: int = 80,
+        onset_smooth_sigma: float = 1.5,
+        augment: bool = True,
+        spec_time_masks: int = 2,
+        spec_time_width: int = 20,
+        spec_freq_masks: int = 2,
+        spec_freq_width: int = 10,
+        gain_jitter_db: float = 3.0,
     ):
         """
         Args:
@@ -70,6 +78,23 @@ class StepChartDataset(Dataset):
         self.chunk_frames = chunk_frames
         self.is_train = is_train
         self.n_mels = n_mels
+        self.onset_smooth_sigma = float(onset_smooth_sigma)
+        self.augment = bool(augment) and is_train
+        self.spec_time_masks = spec_time_masks
+        self.spec_time_width = spec_time_width
+        self.spec_freq_masks = spec_freq_masks
+        self.spec_freq_width = spec_freq_width
+        self.gain_jitter_db = gain_jitter_db
+
+        # Precomputed Gaussian kernel for onset label smoothing.
+        if self.onset_smooth_sigma > 0:
+            radius = max(1, int(round(self.onset_smooth_sigma * 3)))
+            t = np.arange(-radius, radius + 1, dtype=np.float32)
+            kernel = np.exp(-0.5 * (t / self.onset_smooth_sigma) ** 2)
+            kernel /= kernel.max()  # keep peak at 1.0 after convolution
+            self._onset_kernel = kernel
+        else:
+            self._onset_kernel = None
 
         with open(manifest_path, 'r') as f:
             self.manifest = json.load(f)
@@ -128,12 +153,69 @@ class StepChartDataset(Dataset):
         density = step_frames / chunk_seconds
         density_norm = (density - DENSITY_MEAN) / DENSITY_STD
 
+        # Build onset target (soft during training, hard during val)
+        onset_hard = (labels_chunk > 0).astype(np.float32)         # [T, 4]
+        if self.is_train and self._onset_kernel is not None:
+            onset_soft = self._smooth_onset(onset_hard)
+        else:
+            onset_soft = onset_hard
+
+        # Type target: 0=tap, 1=hold_start, 2=hold_end; -100 where no note
+        # (labels_chunk - 1 maps {1,2,3} -> {0,1,2}; {0} -> -1, then to -100)
+        type_target = labels_chunk.astype(np.int64) - 1
+        type_target[type_target < 0] = -100
+
+        # Mel augmentation (training only)
+        if self.augment:
+            mel_chunk = self._augment_mel(mel_chunk)
+
         return (
             torch.from_numpy(mel_chunk),
             torch.tensor(difficulty, dtype=torch.long),
             torch.tensor(density_norm, dtype=torch.float32),
-            torch.from_numpy(labels_chunk),
+            torch.from_numpy(onset_soft),
+            torch.from_numpy(type_target),
         )
+
+    # ------------------------------------------------------------------
+    # Augmentation helpers
+    # ------------------------------------------------------------------
+
+    def _smooth_onset(self, onset_hard: np.ndarray) -> np.ndarray:
+        """Convolve a [T, 4] hard onset map with a 1-D Gaussian along time."""
+        k = self._onset_kernel
+        out = np.zeros_like(onset_hard)
+        for a in range(onset_hard.shape[1]):
+            out[:, a] = np.convolve(onset_hard[:, a], k, mode='same')
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    def _augment_mel(self, mel: np.ndarray) -> np.ndarray:
+        """SpecAugment (time+freq masks) + small gain jitter. In-place safe."""
+        mel = mel.copy()
+        T, F = mel.shape
+
+        # Gain jitter: uniform in [-gain_db, +gain_db] applied as linear scale.
+        if self.gain_jitter_db > 0:
+            db = np.random.uniform(-self.gain_jitter_db, self.gain_jitter_db)
+            mel = mel * (10.0 ** (db / 20.0))
+
+        # Time masks
+        for _ in range(self.spec_time_masks):
+            w = int(np.random.randint(0, self.spec_time_width + 1))
+            if w == 0 or w >= T:
+                continue
+            t0 = int(np.random.randint(0, T - w + 1))
+            mel[t0:t0 + w, :] = 0.0
+
+        # Freq masks
+        for _ in range(self.spec_freq_masks):
+            w = int(np.random.randint(0, self.spec_freq_width + 1))
+            if w == 0 or w >= F:
+                continue
+            f0 = int(np.random.randint(0, F - w + 1))
+            mel[:, f0:f0 + w] = 0.0
+
+        return mel.astype(np.float32)
 
 
 def compute_class_weights(manifest_path: str, data_dir: str, n_classes: int = 4) -> torch.Tensor:
@@ -210,6 +292,118 @@ def make_balanced_difficulty_sampler(
         num_samples=len(indices),
         replacement=True,
     )
+
+
+def _entry_song_key(entry: dict) -> str:
+    """Best-effort stable song key for by-song splitting.
+
+    Tries common manifest fields in order; falls back to the filename stem
+    with the difficulty token stripped.
+    """
+    for k in ('song_id', 'song_key', 'sm_path', 'song_title', 'title'):
+        if k in entry and entry[k]:
+            return str(entry[k])
+    stem = Path(entry['filename']).stem
+    for tok in ('_beginner', '_easy', '_medium', '_hard', '_challenge'):
+        if stem.endswith(tok):
+            return stem[:-len(tok)]
+    return stem
+
+
+def split_entries_by_song(
+    entries: List[dict],
+    val_fraction: float = 0.1,
+    seed: int = 42,
+) -> Tuple[List[int], List[int]]:
+    """Hash-based by-song train/val split over entry indices.
+
+    All entries belonging to the same song (regardless of difficulty) end up
+    in the same partition, so val metrics aren't leaked by in-song chunks.
+    """
+    rng = np.random.default_rng(seed)
+    songs = {}
+    for i, e in enumerate(entries):
+        songs.setdefault(_entry_song_key(e), []).append(i)
+    song_keys = sorted(songs.keys())
+    rng.shuffle(song_keys)
+    n_val = max(1, int(round(len(song_keys) * val_fraction)))
+    val_songs = set(song_keys[:n_val])
+    train_idx, val_idx = [], []
+    for key, idxs in songs.items():
+        (val_idx if key in val_songs else train_idx).extend(idxs)
+    logger.info(
+        f"By-song split: {len(song_keys)} songs -> "
+        f"{len(train_idx)} train entries, {len(val_idx)} val entries"
+    )
+    return sorted(train_idx), sorted(val_idx)
+
+
+def compute_note_counts(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+) -> np.ndarray:
+    """Load labels once per entry and return an int64 array of note counts.
+
+    A "note" is a frame with any arrow in {tap, hold_start, hold_end}.
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    counts = np.zeros(len(manifest), dtype=np.int64)
+    for i in idxs:
+        labels = np.load(data_dir / manifest[i]['filename'])['labels']
+        counts[i] = int((labels > 0).any(axis=1).sum())
+    return counts
+
+
+def make_note_weighted_sampler(
+    entry_indices: List[int],
+    note_counts: np.ndarray,
+    num_samples: Optional[int] = None,
+) -> WeightedRandomSampler:
+    """Weight entries proportionally to max(note_count, 1) for training.
+
+    Passed to a DataLoader wrapping a Subset(full_dataset, entry_indices).
+    The sampler indexes *into the subset*, so weights must match that order.
+    """
+    weights = np.asarray(
+        [max(int(note_counts[i]), 1) for i in entry_indices], dtype=np.float64
+    )
+    weights = weights / weights.sum() * len(weights)
+    if num_samples is None:
+        num_samples = len(entry_indices)
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(weights).double(),
+        num_samples=num_samples,
+        replacement=True,
+    )
+
+
+def compute_onset_prior(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+    sample_limit: int = 200,
+) -> float:
+    """Empirical per-frame per-arrow onset rate (fraction of frames with a note).
+
+    Used to bias-init the onset head so the model starts at the correct base
+    rate for a highly imbalanced frame-level prediction problem.
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    if len(idxs) > sample_limit:
+        step = max(1, len(idxs) // sample_limit)
+        idxs = idxs[::step][:sample_limit]
+    pos = 0
+    total = 0
+    for i in idxs:
+        labels = np.load(data_dir / manifest[i]['filename'])['labels']
+        pos += int((labels > 0).sum())
+        total += int(labels.size)
+    p = pos / max(total, 1)
+    logger.info(f"Empirical per-frame per-arrow onset rate: {p:.6f}")
+    return float(p)
 
 
 def compute_default_density_per_difficulty(

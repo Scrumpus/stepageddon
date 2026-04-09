@@ -85,11 +85,14 @@ class MLChartGenerator:
             n_difficulties=5,
         ).to(self.device)
 
-        # New checkpoints have a density_proj layer in each FiLM block; old ones
-        # do not. strict=False so old checkpoints still load (the density layer
-        # is zero-init, so the model behaves as before until retrained).
+        # Prefer EMA weights if present (the current training script saves them
+        # alongside raw weights and selects best by val metrics on EMA).
+        state_dict = checkpoint.get('ema_state_dict') or checkpoint['model_state_dict']
+        if checkpoint.get('ema_state_dict') is not None:
+            logger.info("Loading EMA weights from checkpoint.")
+        # strict=False: tolerate minor schema drift between training runs.
         missing, unexpected = self.model.load_state_dict(
-            checkpoint['model_state_dict'], strict=False
+            state_dict, strict=False
         )
         if missing:
             logger.warning(f"Checkpoint missing keys (zero-initialized): {missing}")
@@ -166,7 +169,7 @@ class MLChartGenerator:
 
         # Run model inference in chunks
         logger.info(f"Running inference (difficulty={difficulty}, id={difficulty_id})...")
-        raw_predictions = self._predict_chunked(
+        onset_probs, type_probs = self._predict_chunked(
             mel_frames, difficulty_id, target_density
         )
 
@@ -174,7 +177,7 @@ class MLChartGenerator:
         diff_config = get_difficulty_config(difficulty)
         logger.info("Post-processing predictions...")
         steps = self._postprocess(
-            raw_predictions, tempo, beat_times, duration, diff_config
+            onset_probs, type_probs, tempo, beat_times, duration, diff_config
         )
 
         chart = Chart(
@@ -195,32 +198,26 @@ class MLChartGenerator:
         mel_frames: np.ndarray,
         difficulty_id: int,
         target_density: float,
-    ) -> np.ndarray:
+    ):
         """
         Run model on overlapping chunks and merge predictions.
 
-        Args:
-            mel_frames: [T, N_MELS] float32
-            difficulty_id: int 0-4
-            target_density: desired chart density in steps/sec
-
         Returns:
-            [T, 4, 4] float32 softmax probabilities
+            onset_probs: [T, 4] float32 sigmoid("note present")
+            type_probs:  [T, 4, 3] float32 softmax over {tap, hold_start, hold_end}
         """
         T = mel_frames.shape[0]
-        all_probs = np.zeros((T, 4, 4), dtype=np.float32)
-        all_counts = np.zeros(T, dtype=np.float32)
+        onset_sum = np.zeros((T, 4), dtype=np.float32)
+        type_sum = np.zeros((T, 4, 3), dtype=np.float32)
+        counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
-
-        # Normalize density to match training-time scale.
         density_norm = (target_density - DENSITY_MEAN) / DENSITY_STD
 
         for start in range(0, T, stride):
             end = min(start + self.chunk_frames, T)
             chunk = mel_frames[start:end]
 
-            # Pad if chunk is shorter than expected
             if chunk.shape[0] < self.chunk_frames:
                 pad = np.zeros((self.chunk_frames - chunk.shape[0], N_MELS), dtype=np.float32)
                 chunk = np.concatenate([chunk, pad], axis=0)
@@ -231,118 +228,113 @@ class MLChartGenerator:
                 [density_norm], dtype=torch.float32, device=self.device
             )
 
-            logits = self.model(mel_tensor, diff_tensor, density_tensor)  # [1, chunk_frames, 4, 4]
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            onset_logits, type_logits = self.model(mel_tensor, diff_tensor, density_tensor)
+            onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0]       # [T_chunk, 4]
+            type_p = torch.softmax(type_logits.float(), dim=-1).cpu().numpy()[0]  # [T_chunk, 4, 3]
 
-            # Accumulate (only valid portion, not padding)
             valid_len = min(end - start, self.chunk_frames)
-            all_probs[start:start + valid_len] += probs[:valid_len]
-            all_counts[start:start + valid_len] += 1.0
+            onset_sum[start:start + valid_len] += onset_p[:valid_len]
+            type_sum[start:start + valid_len] += type_p[:valid_len]
+            counts[start:start + valid_len] += 1.0
 
-        # Average overlapping regions
-        all_counts = np.maximum(all_counts, 1.0)
-        all_probs /= all_counts[:, None, None]
-
-        return all_probs
+        counts = np.maximum(counts, 1.0)
+        onset_probs = onset_sum / counts[:, None]
+        type_probs = type_sum / counts[:, None, None]
+        return onset_probs, type_probs
 
     def _postprocess(
         self,
-        probs: np.ndarray,
+        onset_probs: np.ndarray,   # [T, 4]
+        type_probs: np.ndarray,    # [T, 4, 3]  (0=tap, 1=hold_start, 2=hold_end)
         tempo: float,
         beat_times: np.ndarray,
         duration: float,
         diff_config,
     ) -> List[Step]:
         """
-        Convert raw model probabilities into Step objects.
+        Convert (onset, type) probabilities into Step objects.
 
         Pipeline:
-            1. Per-arrow peak picking (NMS) on tap probability over time
-            2. Detect hold_start/hold_end events via independent threshold
-            3. Difficulty-aware density target: keep top-N tap events globally
-            4. Snap to beat grid; enforce min_gap from preset
-            5. Cap simultaneous arrows per frame based on difficulty
-            6. Build Step objects
+            1. Per-arrow onset peak picking (NMS) on sigmoid(onset_logits)
+            2. For each picked onset: argmax over type head decides
+               tap / hold_start / hold_end
+            3. Pair hold_start -> hold_end per arrow to form holds
+            4. Difficulty-aware density target: keep top-N tap events globally
+            5. Snap to beat grid; enforce min_gap from preset
+            6. Cap simultaneous arrows per frame based on difficulty
+            7. Build Step objects
         """
-        T = probs.shape[0]
+        T = onset_probs.shape[0]
 
-        # ---- DEBUG: probability distribution diagnostics ----
-        tap_probs_all = probs[:, :, 1]
-        hold_start_all = probs[:, :, 2]
-        hold_end_all = probs[:, :, 3]
-        logger.info(f"[postprocess debug] probs.shape={probs.shape}")
         logger.info(
-            f"[postprocess debug] tap: max={tap_probs_all.max():.4f} "
-            f"mean={tap_probs_all.mean():.4f} "
-            f"p95={np.percentile(tap_probs_all, 95):.4f} "
-            f"p99={np.percentile(tap_probs_all, 99):.4f}"
+            f"[postprocess debug] onset_probs.shape={onset_probs.shape} "
+            f"max={onset_probs.max():.4f} mean={onset_probs.mean():.4f} "
+            f"p95={np.percentile(onset_probs, 95):.4f} "
+            f"p99={np.percentile(onset_probs, 99):.4f}"
         )
-        logger.info(
-            f"[postprocess debug] hold_start max={hold_start_all.max():.4f}  "
-            f"hold_end max={hold_end_all.max():.4f}"
-        )
-        any_arrow_max = tap_probs_all.max(axis=1)
-        for thr in (0.1, 0.2, 0.3, 0.5):
-            logger.info(
-                f"[postprocess debug] frames with any-arrow tap > {thr}: "
-                f"{int((any_arrow_max > thr).sum())}/{T}"
-            )
 
-        # min_gap from preset overrides constructor default
         min_gap = max(diff_config.min_gap, self.min_note_gap)
         nms_window_frames = max(1, int(round(min_gap * FRAMES_PER_SECOND)))
 
-        # ---- Step 1: per-arrow tap peak picking via NMS ----
-        # No absolute confidence gate: softmax across 4 classes means even
-        # confident taps cap around ~0.3. Let NMS + density top-N do the
-        # selection so post-processing is self-calibrating across retrainings.
-        tap_floor = 1e-4  # ignore essentially-zero noise only
-        tap_candidates = []  # list of {time, arrow, confidence, type='tap'}
+        # ---- Step 1+2: per-arrow onset NMS + type decoding ----
+        tap_candidates = []     # list of {time, arrow, confidence}
+        hold_start_events = []  # per-arrow list of (frame, time, confidence)
+        hold_end_events = []    # per-arrow list of (frame, time, confidence)
+        per_arrow_starts = [[] for _ in range(4)]
+        per_arrow_ends = [[] for _ in range(4)]
+
         for arrow in range(4):
-            tap_probs = probs[:, arrow, 1]  # [T]
+            onset = onset_probs[:, arrow]  # [T]
             for frame in range(T):
-                p = float(tap_probs[frame])
-                if p < tap_floor:
+                p = float(onset[frame])
+                if p < max(self.confidence_threshold, 1e-4):
                     continue
                 lo = max(0, frame - nms_window_frames)
                 hi = min(T, frame + nms_window_frames + 1)
-                if p < tap_probs[lo:hi].max():
+                if p < onset[lo:hi].max():
                     continue
                 t = frame / FRAMES_PER_SECOND
                 if t < 0 or t > duration:
                     continue
-                tap_candidates.append({
-                    'time': t,
-                    'arrow': arrow,
-                    'type': 'tap',
-                    'confidence': p,
-                })
+                ttype = int(np.argmax(type_probs[frame, arrow]))
+                if ttype == 0:
+                    tap_candidates.append({
+                        'time': t, 'arrow': arrow, 'type': 'tap', 'confidence': p,
+                    })
+                elif ttype == 1:
+                    per_arrow_starts[arrow].append((frame, t, p))
+                else:  # ttype == 2
+                    per_arrow_ends[arrow].append((frame, t, p))
 
-        # ---- Step 2: hold detection (independent threshold) ----
+        # ---- Step 3: pair hold_start -> nearest following hold_end ----
         hold_events = []
         for arrow in range(4):
-            in_hold = False
-            start_time = 0.0
-            start_conf = 0.0
-            for frame in range(T):
-                p_start = float(probs[frame, arrow, 2])
-                p_end = float(probs[frame, arrow, 3])
-                t = frame / FRAMES_PER_SECOND
-                if not in_hold and p_start > self.confidence_threshold:
-                    in_hold = True
-                    start_time = t
-                    start_conf = p_start
-                elif in_hold and p_end > self.confidence_threshold:
-                    hold_dur = t - start_time
-                    in_hold = False
-                    if 0.2 <= hold_dur <= 5.0:
-                        hold_events.append({
-                            'time': start_time,
-                            'arrow': arrow,
-                            'type': 'hold',
-                            'hold_duration': hold_dur,
-                            'confidence': (start_conf + p_end) / 2,
-                        })
+            ends = per_arrow_ends[arrow][:]
+            ends_idx = 0
+            ends.sort(key=lambda x: x[0])
+            for sf, st, sp in per_arrow_starts[arrow]:
+                # advance ends_idx to first end with frame > sf
+                while ends_idx < len(ends) and ends[ends_idx][0] <= sf:
+                    ends_idx += 1
+                if ends_idx >= len(ends):
+                    # No matching end; treat as tap fallback
+                    tap_candidates.append({
+                        'time': st, 'arrow': arrow, 'type': 'tap', 'confidence': sp,
+                    })
+                    continue
+                ef, et, ep = ends[ends_idx]
+                hold_dur = et - st
+                if 0.2 <= hold_dur <= 5.0:
+                    hold_events.append({
+                        'time': st, 'arrow': arrow, 'type': 'hold',
+                        'hold_duration': hold_dur,
+                        'confidence': (sp + ep) / 2.0,
+                    })
+                    ends_idx += 1
+                else:
+                    tap_candidates.append({
+                        'time': st, 'arrow': arrow, 'type': 'tap', 'confidence': sp,
+                    })
 
         # ---- Step 3: difficulty-aware density targeting ----
         # Compute target tap count from preset density (steps/sec)
