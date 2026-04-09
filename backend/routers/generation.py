@@ -24,11 +24,24 @@ audio_processor = AudioProcessor()
 
 audio_downloader = AudioDownloader()
 
+# Initialize ML generator if enabled
+ml_generator = None
+if settings.USE_ML_GENERATION:
+    try:
+        from ml import MLChartGenerator
+        logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
+        ml_generator = MLChartGenerator(model_path=settings.ML_MODEL_PATH)
+        logger.info("ML chart generator loaded successfully")
+    except Exception as e:
+        logger.warning(f"Failed to load ML generator, falling back to algorithmic: {e}", exc_info=True)
+else:
+    logger.info("USE_ML_GENERATION is false; using algorithmic generator")
+
 
 class GenerateRequest(BaseModel):
     """Request model for URL-based generation"""
     url: str = Field(..., description="YouTube or Spotify URL")
-    difficulty: str = Field("intermediate", description="Difficulty level")
+    difficulty: str = Field("medium", description="Difficulty level")
 
 
 class GenerateResponse(BaseModel):
@@ -42,14 +55,14 @@ class GenerateResponse(BaseModel):
 @router.post("/generate-steps")
 async def generate_steps_from_file(
     file: UploadFile = File(...),
-    difficulty: str = Form("intermediate")
+    difficulty: str = Form("medium")
 ):
     """
     Generate step chart from uploaded audio file
     
     Args:
         file: Audio file (MP3, WAV, OGG, FLAC)
-        difficulty: beginner, intermediate, or expert
+        difficulty: beginner, easy, medium, hard, or challenge
     """
     try:
         logger.info(f"Received file upload: {file.filename}, difficulty: {difficulty}")
@@ -97,9 +110,12 @@ async def generate_steps_from_file(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
         
-        # Generate steps
+        # Generate steps (ML or algorithmic)
         logger.info(f"Generating {difficulty} steps...")
-        chart = ChartGenerationPipeline.generate_from_audio(file_path, difficulty)
+        if ml_generator is not None:
+            chart = ml_generator.generate_from_audio(file_path, difficulty)
+        else:
+            chart = ChartGenerationPipeline.generate_from_audio(file_path, difficulty)
         steps = ChartExporter.to_json(chart)
 
         # Prepare response
@@ -164,9 +180,14 @@ async def generate_steps_from_url(request: GenerateRequest):
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
         
-        # Generate steps
+        # Generate steps (ML or algorithmic)
         logger.info(f"Generating {request.difficulty} steps...")
-        chart = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
+        if ml_generator is not None:
+            logger.info("ML Generator")
+            chart = ml_generator.generate_from_audio(file_path, request.difficulty)
+        else:
+            logger.info("Algorithmic Generator")
+            chart = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
         steps = ChartExporter.to_json(chart)
 
         # Prepare response

@@ -32,10 +32,11 @@ class Settings(BaseSettings):
     
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    
-    # Generation Settings
-    AI_MODEL: str = "claude-sonnet-4-20250514"
-    MAX_GENERATION_TIME: int = 30
+
+    # ML Model Settings
+    USE_ML_GENERATION: bool = os.getenv("USE_ML_GENERATION", "false").lower() == "true"
+    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model_2.pt")
+    #ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
     
     class Config:
         env_file = ".env"

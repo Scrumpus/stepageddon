@@ -12,23 +12,40 @@ from .schemas import DifficultyConfig
 DIFFICULTY_PRESETS = {
     "beginner": DifficultyConfig(
         name="beginner",
-        min_density=0.6,
-        max_density=1.2,
+        min_density=0.5,
+        max_density=1.0,
         grid_resolution=4,          # quarter notes only (downbeats)
+        use_onsets=False,
+        onset_threshold=0.35,
+        allowed_patterns=["single"],
+        max_stream_length=0,
+        max_drill_length=0,
+        hold_percentage=0.10,
+        min_hold_duration=0.8,
+        max_hold_duration=2.0,
+        energy_scale_factor=0.25,
+        min_gap=0.40,
+    ),
+
+    "easy": DifficultyConfig(
+        name="easy",
+        min_density=0.9,
+        max_density=1.6,
+        grid_resolution=4,          # mostly quarter notes
         use_onsets=False,
         onset_threshold=0.3,
         allowed_patterns=["single"],
         max_stream_length=0,
         max_drill_length=0,
         hold_percentage=0.15,
-        min_hold_duration=0.8,
-        max_hold_duration=2.0,
-        energy_scale_factor=0.3,
-        min_gap=0.35,
+        min_hold_duration=0.7,
+        max_hold_duration=2.5,
+        energy_scale_factor=0.4,
+        min_gap=0.30,
     ),
 
-    "intermediate": DifficultyConfig(
-        name="intermediate",
+    "medium": DifficultyConfig(
+        name="medium",
         min_density=1.3,
         max_density=2.3,
         grid_resolution=8,          # eighth notes
@@ -44,8 +61,8 @@ DIFFICULTY_PRESETS = {
         min_gap=0.15,
     ),
 
-    "expert": DifficultyConfig(
-        name="expert",
+    "hard": DifficultyConfig(
+        name="hard",
         min_density=2.2,
         max_density=4.0,
         grid_resolution=16,         # sixteenth notes
@@ -61,8 +78,8 @@ DIFFICULTY_PRESETS = {
         min_gap=0.08,
     ),
 
-    "insane": DifficultyConfig(
-        name="insane",
+    "challenge": DifficultyConfig(
+        name="challenge",
         min_density=3.5,
         max_density=6.0,
         grid_resolution=16,
@@ -85,7 +102,7 @@ def get_difficulty_config(difficulty: str) -> DifficultyConfig:
     Get configuration for a difficulty level with validation.
 
     Args:
-        difficulty: Difficulty level ('beginner', 'intermediate', 'expert', 'insane')
+        difficulty: Difficulty level ('beginner', 'easy', 'medium', 'hard', 'challenge')
 
     Returns:
         DifficultyConfig for the requested difficulty
