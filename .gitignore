@@ -60,3 +60,4 @@ build/
 # Testing
 .coverage
 coverage/
+backend/ml/checkpoints/*.pt

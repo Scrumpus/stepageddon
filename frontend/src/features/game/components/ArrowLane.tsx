@@ -41,6 +41,14 @@ const ARROW_ROTATION: Record<Direction, number> = {
 //   arrow-up-4th.png, arrow-up-8th.png, arrow-up-16th.png
 //   arrow-right-4th.png, arrow-right-8th.png, arrow-right-16th.png
 //   receptor-left.png, receptor-down.png, receptor-up.png, receptor-right.png
+// CSS filters to recolor arrows by beat subdivision
+// Base arrows are blue (~210° hue). hue-rotate shifts from there.
+const SUBDIVISION_FILTERS: Record<BeatSubdivision, string> = {
+  '4th': 'none',                                    // default blue
+  '8th': 'hue-rotate(150deg) saturate(1.3)',         // red
+  '16th': 'hue-rotate(70deg) saturate(1.3)',         // purple
+};
+
 const SPRITE_FRAMES = 4;
 
 const ARROW_SHEETS: Record<BeatSubdivision, Record<Direction, string>> = {
@@ -90,6 +98,7 @@ function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: 
         backgroundSize: `${sheetWidth}px ${size}px`,
         '--sheet-width': `${-sheetWidth}px`,
         animation: `sprite-step ${beatDuration}s steps(${SPRITE_FRAMES}) infinite`,
+        filter: SUBDIVISION_FILTERS[subdivision],
       } as React.CSSProperties}
     />
   );

@@ -26,17 +26,21 @@ export const DIFFICULTY_INFO: Record<DifficultyLevel, DifficultyInfo> = {
     name: 'Beginner',
     color: 'text-green-400'
   },
-  intermediate: {
-    name: 'Intermediate',
+  easy: {
+    name: 'Easy',
+    color: 'text-lime-400'
+  },
+  medium: {
+    name: 'Medium',
     color: 'text-yellow-400'
   },
-  expert: {
-    name: 'Expert',
-    color: 'text-red-400'
+  hard: {
+    name: 'Hard',
+    color: 'text-orange-400'
   },
-  insane: {
-    name: 'Insane',
-    color: 'text-red-800'
+  challenge: {
+    name: 'Challenge',
+    color: 'text-red-500'
   }
 } as const;
 
