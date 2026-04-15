@@ -56,7 +56,7 @@ interface AppProviderProps {
 function AppProvider({ children }: AppProviderProps) {
   // Game flow state
   const [gameState, setGameState] = useState<GameState>(GameState.MENU);
-  const [difficulty, setDifficulty] = useState<DifficultyLevel>('intermediate');
+  const [difficulty, setDifficulty] = useState<DifficultyLevel>('medium');
 
   // Song data
   const [songData, setSongData] = useState<SongInfo | null>(null);

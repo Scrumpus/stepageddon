@@ -81,7 +81,7 @@ export const VISUAL_CONFIG = {
   VISIBLE_WINDOW: 2,       // Seconds of lookahead for visible arrows
   SPAWN_Y: 700,            // Y position where arrows spawn (bottom)
   // Speed is calculated based on tempo: faster tempo = faster arrows
-  BASE_SPEED: 300,         // Base pixels per second at 100 BPM
+  BASE_SPEED: 240,         // Base pixels per second at 100 BPM
   TEMPO_SPEED_FACTOR: 2.5, // Speed multiplier per BPM
 } as const;
 
@@ -90,7 +90,7 @@ export const VISUAL_CONFIG = {
  */
 export function getArrowSpeed(tempo: number): number {
   // Scale speed with tempo: 120 BPM = ~400px/s, 180 BPM = ~550px/s
-  return VISUAL_CONFIG.BASE_SPEED + (tempo - 100) * VISUAL_CONFIG.TEMPO_SPEED_FACTOR;
+  return VISUAL_CONFIG.BASE_SPEED;
 }
 
 /**
