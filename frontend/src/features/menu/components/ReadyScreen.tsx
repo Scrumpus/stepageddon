@@ -101,7 +101,7 @@ function ReadyScreen() {
 
             <button
               onClick={handleStart}
-              className="flex-1 py-4 bg-gradient-to-r from-game-primary to-game-accent rounded-lg font-semibold hover:shadow-lg hover:shadow-game-accent/50 transition-all flex items-center justify-center gap-2"
+              className="flex-1 py-4 bg-game-primary rounded-lg font-semibold hover:shadow-lg hover:shadow-game-accent/50 transition-all flex items-center justify-center gap-2"
             >
               <Play className="w-5 h-5" />
               Start Game

@@ -71,7 +71,7 @@ function GameHUD({
       {/* Progress Bar */}
       <div className="h-1">
         <div
-          className="h-full bg-gradient-to-r from-game-primary to-game-accent transition-all"
+          className="h-full bg-game-primary transition-all"
           style={{ width: `${(currentTime / songInfo.duration) * 100}%` }}
         />
       </div>

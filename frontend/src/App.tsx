@@ -14,7 +14,7 @@ function App() {
   const { gameState } = useApp();
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-game-bg via-purple-900/20 to-game-bg">
+    <div className="min-h-screen bg-game-bg">
       {/* Render current screen */}
       {gameState === GameState.MENU && <MenuScreen />}
       {gameState === GameState.LOADING && <LoadingScreen />}

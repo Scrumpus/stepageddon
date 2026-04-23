@@ -16,7 +16,7 @@ function PauseOverlay({ onResume }: PauseOverlayProps) {
         <p className="text-gray-400 mb-8">Press ESC or click Play to resume</p>
         <button
           onClick={onResume}
-          className="px-8 py-4 bg-gradient-to-r from-game-primary to-game-accent rounded-lg font-semibold hover:shadow-lg transition-all"
+          className="px-8 py-4 bg-game-primary rounded-lg font-semibold hover:shadow-lg transition-all"
         >
           <Play className="w-6 h-6 inline mr-2" />
           Resume

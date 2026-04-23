@@ -8,9 +8,9 @@ export default {
     extend: {
       colors: {
         'game-bg': '#0f0f1e',
-        'game-primary': '#6366f1',
-        'game-secondary': '#8b5cf6',
-        'game-accent': '#ec4899',
+        'game-primary': '#06b6d4',
+        'game-secondary': '#14b8a6',
+        'game-accent': '#2563eb',
       },
       animation: {
         'arrow-scroll': 'scroll 2s linear',
