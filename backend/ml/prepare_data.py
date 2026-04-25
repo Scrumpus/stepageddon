@@ -34,7 +34,7 @@ except ImportError:
     print("librosa is required: pip install librosa")
     sys.exit(1)
 
-from ml.sm_parser import parse_sm_file
+from services.sm_parser import parse_sm_file
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
