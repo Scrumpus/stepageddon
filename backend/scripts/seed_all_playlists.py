@@ -11,8 +11,8 @@ Usage:
     uv run python -m scripts.seed_all_playlists --root "DDR 1st-A20 Plus" --limit-per-game 5
     uv run python -m scripts.seed_all_playlists --skip-songs   # only build playlists
     uv run python -m scripts.seed_all_playlists --skip-playlists  # only import songs
-    uv run python -m scripts.seed_all_playlists --strip-prefix   # name = "DDR 1st Mix" not "[01] DDR 1st Mix"
-    uv run python -m scripts.seed_all_playlists --dry-run        # parse only, no DB writes
+    uv run python -m scripts.seed_all_playlists --keep-prefix   # keep "[01] " prefix in names
+    uv run python -m scripts.seed_all_playlists --dry-run       # parse only, no DB writes
 
 Idempotent: re-running is safe.
 """
@@ -81,7 +81,7 @@ async def run(args: argparse.Namespace) -> int:
                     await session.commit()
 
                 if not args.skip_playlists:
-                    name: Optional[str] = stripped_name(game) if args.strip_prefix else None
+                    name: Optional[str] = None if args.keep_prefix else stripped_name(game)
                     playlist = await build_playlist_for_game(
                         session,
                         game=game,
@@ -115,8 +115,8 @@ def main() -> int:
                         help="Only build playlists from already-seeded songs")
     parser.add_argument("--skip-playlists", action="store_true",
                         help="Only import songs; don't create playlists")
-    parser.add_argument("--strip-prefix", action="store_true",
-                        help='Drop "[NN] " prefix from playlist names')
+    parser.add_argument("--keep-prefix", action="store_true",
+                        help='Keep the "[NN] " prefix in playlist names (default: stripped)')
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the plan without touching DB or filesystem")
     parser.add_argument("--log-level", default="INFO")
