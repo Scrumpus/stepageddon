@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from routers import generation, audio, songs
+from routers import generation, audio, songs, playlists
 from core.config import settings
 from db.session import engine
 
@@ -102,6 +102,7 @@ async def health_check():
 app.include_router(generation.router, prefix="/api", tags=["generation"])
 app.include_router(audio.router, prefix="/api", tags=["audio"])
 app.include_router(songs.router, prefix="/api", tags=["songs"])
+app.include_router(playlists.router, prefix="/api", tags=["playlists"])
 
 
 # Global exception handler
