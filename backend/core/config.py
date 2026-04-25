@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql+asyncpg://beatsync:beatsync@localhost:5432/beatsync",
+        "postgresql+asyncpg://stepageddon:stepageddon@localhost:5432/stepageddon",
     )
     
     # CORS

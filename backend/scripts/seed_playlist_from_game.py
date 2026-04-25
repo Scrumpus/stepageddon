@@ -27,58 +27,82 @@ from db.session import AsyncSessionLocal
 logger = logging.getLogger(__name__)
 
 
-async def run(game: str, name: Optional[str], description: Optional[str]) -> int:
+async def build_playlist_for_game(
+    session,
+    *,
+    game: str,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    log_songs: bool = False,
+) -> Optional[Playlist]:
+    """Find-or-create a playlist named after the game and replace membership
+    with every DDR song whose ``ddr_game`` matches.
+
+    Caller commits. Returns the Playlist (or None if no songs were found).
+    """
     playlist_name = name or game
 
-    async with AsyncSessionLocal() as session:
-        songs = list(
-            (
-                await session.execute(
-                    select(Song)
-                    .where(Song.source == SongSource.DDR, Song.ddr_game == game)
-                    .order_by(Song.title)
-                )
-            ).scalars()
-        )
-        if not songs:
-            logger.error(
-                "No DDR songs found with ddr_game=%r — run `scripts.seed_ddr --game %r` first",
-                game, game,
+    songs = list(
+        (
+            await session.execute(
+                select(Song)
+                .where(Song.source == SongSource.DDR, Song.ddr_game == game)
+                .order_by(Song.title)
             )
-            return 1
-
-        playlist = (
-            await session.execute(select(Playlist).where(Playlist.name == playlist_name))
-        ).scalar_one_or_none()
-        if playlist is None:
-            playlist = Playlist(name=playlist_name, description=description or game)
-            session.add(playlist)
-            await session.flush()
-            logger.info("Created playlist %s (%s)", playlist_name, playlist.id)
-        else:
-            if description is not None and description != playlist.description:
-                playlist.description = description
-            logger.info("Reusing playlist %s (%s)", playlist_name, playlist.id)
-
-        # Replace membership wholesale.
-        await session.execute(
-            delete(PlaylistSong).where(PlaylistSong.playlist_id == playlist.id)
+        ).scalars()
+    )
+    if not songs:
+        logger.warning(
+            "No DDR songs found for game=%r — run scripts.seed_ddr first", game
         )
+        return None
+
+    playlist = (
+        await session.execute(select(Playlist).where(Playlist.name == playlist_name))
+    ).scalar_one_or_none()
+    if playlist is None:
+        playlist = Playlist(name=playlist_name, description=description or game)
+        session.add(playlist)
         await session.flush()
+        logger.info("Created playlist %s (%s)", playlist_name, playlist.id)
+    else:
+        if description is not None and description != playlist.description:
+            playlist.description = description
+        logger.info("Reusing playlist %s (%s)", playlist_name, playlist.id)
 
-        for position, song in enumerate(songs):
-            session.add(
-                PlaylistSong(
-                    playlist_id=playlist.id,
-                    song_id=song.id,
-                    position=position,
-                )
+    await session.execute(
+        delete(PlaylistSong).where(PlaylistSong.playlist_id == playlist.id)
+    )
+    await session.flush()
+
+    for position, song in enumerate(songs):
+        session.add(
+            PlaylistSong(
+                playlist_id=playlist.id,
+                song_id=song.id,
+                position=position,
             )
-        await session.commit()
+        )
 
-        logger.info("✓ %s: %d songs", playlist_name, len(songs))
+    logger.info("✓ %s: %d songs", playlist_name, len(songs))
+    if log_songs:
         for s in songs:
             logger.info("  %s — %s", s.title, s.artist or "Unknown")
+    return playlist
+
+
+async def run(game: str, name: Optional[str], description: Optional[str]) -> int:
+    async with AsyncSessionLocal() as session:
+        playlist = await build_playlist_for_game(
+            session,
+            game=game,
+            name=name,
+            description=description,
+            log_songs=True,
+        )
+        if playlist is None:
+            return 1
+        await session.commit()
     return 0
 
 
