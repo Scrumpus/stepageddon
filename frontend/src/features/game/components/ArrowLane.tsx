@@ -26,13 +26,6 @@ const ARROW_ROTATION: Record<Direction, number> = {
 // Spritesheet config
 // Each file is a horizontal strip of 4 frames (e.g., 512x128 for 128px frames)
 // Frames cycle through inner section lighting: dim → 1 lit → 2 lit → all lit
-//
-// Drop into public/arrows/:
-//   arrow-left-4th.png, arrow-left-8th.png, arrow-left-16th.png  (different colors)
-//   arrow-down-4th.png, arrow-down-8th.png, arrow-down-16th.png
-//   arrow-up-4th.png, arrow-up-8th.png, arrow-up-16th.png
-//   arrow-right-4th.png, arrow-right-8th.png, arrow-right-16th.png
-//   receptor-left.png, receptor-down.png, receptor-up.png, receptor-right.png
 // CSS filters to recolor arrows by beat subdivision
 // Base arrows are blue (~210° hue). hue-rotate shifts from there.
 const SUBDIVISION_FILTERS: Record<BeatSubdivision, string> = {
@@ -40,6 +33,9 @@ const SUBDIVISION_FILTERS: Record<BeatSubdivision, string> = {
   '8th': 'hue-rotate(150deg) saturate(1.3)',         // red
   '16th': 'hue-rotate(70deg) saturate(1.3)',         // purple
 };
+
+// Hold notes override subdivision color so the mechanic reads at a glance.
+const HOLD_FILTER = 'hue-rotate(120deg) saturate(1.5) brightness(1.05)';   // pink
 
 const SPRITE_FRAMES = 4;
 
@@ -57,9 +53,10 @@ const RECEPTOR_SHEETS: Record<Direction, string> = {
   [Direction.RIGHT]: '/arrows/receptor-right.png',
 };
 
-function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: {
+function ArrowImage({ direction, subdivision = '4th', isHold = false, size = 64, tempo = 120 }: {
   direction: Direction;
   subdivision?: BeatSubdivision;
+  isHold?: boolean;
   size?: number;
   tempo?: number;
 }) {
@@ -76,7 +73,7 @@ function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: 
         backgroundSize: `${sheetWidth}px ${size}px`,
         '--sheet-width': `${-sheetWidth}px`,
         animation: `sprite-step ${beatDuration}s steps(${SPRITE_FRAMES}) infinite`,
-        filter: SUBDIVISION_FILTERS[subdivision],
+        filter: isHold ? HOLD_FILTER : SUBDIVISION_FILTERS[subdivision],
       } as React.CSSProperties}
     />
   );
@@ -112,6 +109,8 @@ function HoldTrail({
   subdivision = '4th',
   length,
   width,
+  arrowSpeed,
+  tempo,
   progress = 0,
   isActive = false,
 }: {
@@ -119,15 +118,26 @@ function HoldTrail({
   subdivision?: BeatSubdivision;
   length: number;
   width: number;
+  arrowSpeed: number;
+  tempo: number;
   progress?: number;  // 0-1 indicating how much of the hold has been completed
   isActive?: boolean; // Whether the hold is currently being held
 }) {
   if (length <= 0) return null;
 
-  const tileCount = Math.max(1, Math.ceil(length / width));
+  // Space trail tiles every 16th note so the column reads as a denser ribbon
+  // rather than discrete arrow-sized blocks.
+  const sixteenthSeconds = 60 / tempo / 4;
+  const tileSpacing = Math.max(1, sixteenthSeconds * arrowSpeed);
+  const tileCount = Math.max(1, Math.ceil(length / tileSpacing));
   const sheet = ARROW_SHEETS[direction];
   const sheetWidth = width * SPRITE_FRAMES;
-  const filter = SUBDIVISION_FILTERS[subdivision];
+  // Hold trails always render in pink so the mechanic stays distinct from the
+  // subdivision-based color of one-shot taps.
+  const filter = HOLD_FILTER;
+  // Subdivision is currently unused for trails; kept on the prop for parity
+  // with the head and future tweaks.
+  void subdivision;
   const baseOpacity = isActive ? 1 : 0.7;
 
   return (
@@ -135,9 +145,12 @@ function HoldTrail({
       className="absolute"
       style={{
         width,
-        // Start just below the arrow head so the column reads as a continuation
-        top: width,
+        // Anchor the trail to the head's top so the first tile sits beneath the
+        // arrow head rather than after a head-sized gap (which read as a missing
+        // first beat with dense 16th-note tile spacing).
+        top: 0,
         left: 0,
+        height: length + width,
       }}
     >
       {Array.from({ length: tileCount }, (_, i) => {
@@ -149,7 +162,10 @@ function HoldTrail({
         return (
           <div
             key={i}
+            className="absolute"
             style={{
+              top: i * tileSpacing,
+              left: 0,
               width,
               height: width,
               backgroundImage: `url(${sheet})`,
@@ -237,19 +253,24 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                 subdivision={subdivision}
                 length={trailLength}
                 width={arrowSize}
+                arrowSpeed={arrowSpeed}
+                tempo={tempo}
                 progress={holdProgress}
                 isActive={isActivelyHeld}
               />
             )}
-            {/* Arrow head (rotated) */}
+            {/* Arrow head (rotated) - keep above the trail so it covers the
+                tiles drawn behind it (trail starts at the head's top). */}
             <div
+              className="relative"
               style={{
                 width: arrowSize,
                 height: arrowSize,
                 transform: `rotate(${rotation}deg)`,
+                zIndex: 1,
               }}
             >
-              <ArrowImage direction={arrow.direction} subdivision={subdivision} size={arrowSize} tempo={tempo} />
+              <ArrowImage direction={arrow.direction} subdivision={subdivision} isHold={!!isHold} size={arrowSize} tempo={tempo} />
             </div>
           </div>
         );
