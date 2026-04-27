@@ -3,15 +3,16 @@
  */
 
 import { useState } from 'react';
-import { ListMusic, Sparkles } from 'lucide-react';
+import { Disc3, ListMusic, Sparkles } from 'lucide-react';
 import { useApp } from '@/app/providers/AppProvider';
 import { useStepGeneration } from '../hooks';
 import DifficultySelector from './DifficultySelector';
 import FileUploader from './FileUploader';
 import UrlInput from './UrlInput';
 import { PlaylistsTab } from '@/features/playlists/components';
+import { SongsTab } from '@/features/songs/components';
 
-type Tab = 'playlists' | 'create';
+type Tab = 'playlists' | 'songs' | 'create';
 
 function MenuScreen() {
   const { difficulty, setDifficulty } = useApp();
@@ -37,6 +38,12 @@ function MenuScreen() {
             label="Playlists"
           />
           <TabButton
+            active={tab === 'songs'}
+            onClick={() => setTab('songs')}
+            icon={<Disc3 className="w-4 h-4" />}
+            label="Songs"
+          />
+          <TabButton
             active={tab === 'create'}
             onClick={() => setTab('create')}
             icon={<Sparkles className="w-4 h-4" />}
@@ -46,9 +53,9 @@ function MenuScreen() {
 
         {/* Main Card */}
         <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-6 sm:p-8 shadow-2xl border border-white/10">
-          {tab === 'playlists' ? (
-            <PlaylistsTab />
-          ) : (
+          {tab === 'playlists' && <PlaylistsTab />}
+          {tab === 'songs' && <SongsTab />}
+          {tab === 'create' && (
             <div className="space-y-6">
               <DifficultySelector
                 difficulty={difficulty}
