@@ -15,14 +15,6 @@ interface ArrowLaneProps {
   tempo: number;       // BPM for beat-synced spritesheet animation
 }
 
-// DDR-style color scheme
-const ARROW_COLORS: Record<Direction, { main: string; glow: string; bg: string }> = {
-  [Direction.LEFT]: { main: '#ff6bf3', glow: '#ff6bf3', bg: 'rgba(255, 107, 243, 0.15)' },
-  [Direction.DOWN]: { main: '#00d4ff', glow: '#00d4ff', bg: 'rgba(0, 212, 255, 0.15)' },
-  [Direction.UP]: { main: '#00ff87', glow: '#00ff87', bg: 'rgba(0, 255, 135, 0.15)' },
-  [Direction.RIGHT]: { main: '#ff4757', glow: '#ff4757', bg: 'rgba(255, 71, 87, 0.15)' },
-};
-
 // Arrow rotation for each direction (set to 0 when using pre-rotated PNGs)
 const ARROW_ROTATION: Record<Direction, number> = {
   [Direction.LEFT]: 0,
@@ -51,25 +43,11 @@ const SUBDIVISION_FILTERS: Record<BeatSubdivision, string> = {
 
 const SPRITE_FRAMES = 4;
 
-const ARROW_SHEETS: Record<BeatSubdivision, Record<Direction, string>> = {
-  '4th': {
-    [Direction.LEFT]: '/arrows/arrow-left-4th.png',
-    [Direction.DOWN]: '/arrows/arrow-down-4th.png',
-    [Direction.UP]: '/arrows/arrow-up-4th.png',
-    [Direction.RIGHT]: '/arrows/arrow-right-4th.png',
-  },
-  '8th': {
-    [Direction.LEFT]: '/arrows/arrow-left-8th.png',
-    [Direction.DOWN]: '/arrows/arrow-down-8th.png',
-    [Direction.UP]: '/arrows/arrow-up-8th.png',
-    [Direction.RIGHT]: '/arrows/arrow-right-8th.png',
-  },
-  '16th': {
-    [Direction.LEFT]: '/arrows/arrow-left-16th.png',
-    [Direction.DOWN]: '/arrows/arrow-down-16th.png',
-    [Direction.UP]: '/arrows/arrow-up-16th.png',
-    [Direction.RIGHT]: '/arrows/arrow-right-16th.png',
-  },
+const ARROW_SHEETS: Record<Direction, string> = {
+  [Direction.LEFT]: '/arrows/arrow-left.png',
+  [Direction.DOWN]: '/arrows/arrow-down.png',
+  [Direction.UP]: '/arrows/arrow-up.png',
+  [Direction.RIGHT]: '/arrows/arrow-right.png',
 };
 
 const RECEPTOR_SHEETS: Record<Direction, string> = {
@@ -86,7 +64,7 @@ function ArrowImage({ direction, subdivision = '4th', size = 64, tempo = 120 }: 
   tempo?: number;
 }) {
   const beatDuration = 60 / tempo;
-  const sheet = ARROW_SHEETS[subdivision][direction];
+  const sheet = ARROW_SHEETS[direction];
   const sheetWidth = size * SPRITE_FRAMES;
 
   return (
@@ -126,64 +104,64 @@ function ReceptorImage({ direction, size = 64, tempo = 120 }: {
   );
 }
 
-// Hold trail component
+// Hold trail - classic DDR style: a vertical column of repeated direction arrows.
+// Trail length is fixed; tiles fade individually as the hold's elapsed portion
+// passes the receptor.
 function HoldTrail({
-  color,
+  direction,
+  subdivision = '4th',
   length,
   width,
-  glowColor,
   progress = 0,
   isActive = false,
 }: {
-  color: string;
+  direction: Direction;
+  subdivision?: BeatSubdivision;
   length: number;
   width: number;
-  glowColor: string;
   progress?: number;  // 0-1 indicating how much of the hold has been completed
   isActive?: boolean; // Whether the hold is currently being held
 }) {
-  const trailWidth = width * 0.35;  // Trail is narrower than arrow
-  // Shrink trail from bottom as hold progresses
-  const remainingLength = length * (1 - progress);
-  // Active holds glow brighter
-  const activeGlow = isActive ? 1.5 : 1;
+  if (length <= 0) return null;
+
+  const tileCount = Math.max(1, Math.ceil(length / width));
+  const sheet = ARROW_SHEETS[direction];
+  const sheetWidth = width * SPRITE_FRAMES;
+  const filter = SUBDIVISION_FILTERS[subdivision];
+  const baseOpacity = isActive ? 1 : 0.7;
 
   return (
     <div
-      className="absolute transition-all duration-75"
+      className="absolute"
       style={{
-        width: trailWidth,
-        height: Math.max(remainingLength, 0),
-        left: (width - trailWidth) / 2,
-        top: width * 0.6,  // Start from bottom of arrow head
-        background: `linear-gradient(to bottom, ${color}, ${color}88 20%, ${color}66 80%, ${color}33)`,
-        borderRadius: trailWidth / 2,
-        boxShadow: `0 0 ${10 * activeGlow}px ${glowColor}66, inset 0 0 8px rgba(255,255,255,0.3)`,
-        opacity: isActive ? 1 : 0.7,
+        width,
+        // Start just below the arrow head so the column reads as a continuation
+        top: width,
+        left: 0,
       }}
     >
-      {/* Inner glow line */}
-      <div
-        className="absolute left-1/2 -translate-x-1/2 h-full"
-        style={{
-          width: trailWidth * 0.4,
-          background: `linear-gradient(to bottom, rgba(255,255,255,0.6), rgba(255,255,255,0.2) 50%, transparent)`,
-          borderRadius: trailWidth / 2,
-        }}
-      />
-      {/* End cap - only show if trail has length */}
-      {remainingLength > trailWidth && (
-        <div
-          className="absolute bottom-0 left-1/2 -translate-x-1/2"
-          style={{
-            width: trailWidth * 1.5,
-            height: trailWidth * 1.5,
-            background: color,
-            borderRadius: '50%',
-            boxShadow: `0 0 ${15 * activeGlow}px ${glowColor}`,
-          }}
-        />
-      )}
+      {Array.from({ length: tileCount }, (_, i) => {
+        // Each tile represents 1 / tileCount of progress; clamp to [0.2, 1] so
+        // played-through tiles remain dimly visible.
+        const consumption = progress * tileCount - i;
+        const opacity = Math.max(0.2, Math.min(1, 1 - consumption)) * baseOpacity;
+
+        return (
+          <div
+            key={i}
+            style={{
+              width,
+              height: width,
+              backgroundImage: `url(${sheet})`,
+              // Static first frame: pin sheet to its left edge, no animation.
+              backgroundPosition: '0 0',
+              backgroundSize: `${sheetWidth}px ${width}px`,
+              filter,
+              opacity,
+            }}
+          />
+        );
+      })}
     </div>
   );
 }
@@ -230,12 +208,12 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
         const directionIndex = DIRECTIONS.indexOf(arrow.direction);
         const x = startX + directionIndex * (arrowSize + gap);
         const arrowKey = `${arrow.stepIndex}-${arrow.arrowIndex}`;
-        const colors = ARROW_COLORS[arrow.direction];
         const rotation = ARROW_ROTATION[arrow.direction];
 
         // Calculate hold trail length if this is a hold note
         const isHold = arrow.type === 'hold' && arrow.hold_duration;
         const trailLength = isHold ? arrow.hold_duration! * arrowSpeed : 0;
+        const subdivision: BeatSubdivision = arrow.beat_subdivision ?? '4th';
 
         // Find if this hold is being actively held
         const activeHold = activeHolds.find((h) => h.arrowKey === arrowKey);
@@ -255,10 +233,10 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
             {/* Hold trail (not rotated - stays vertical) */}
             {isHold && (
               <HoldTrail
-                color={colors.main}
+                direction={arrow.direction}
+                subdivision={subdivision}
                 length={trailLength}
                 width={arrowSize}
-                glowColor={colors.glow}
                 progress={holdProgress}
                 isActive={isActivelyHeld}
               />
@@ -271,7 +249,7 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
                 transform: `rotate(${rotation}deg)`,
               }}
             >
-              <ArrowImage direction={arrow.direction} subdivision={arrow.beat_subdivision} size={arrowSize} tempo={tempo} />
+              <ArrowImage direction={arrow.direction} subdivision={subdivision} size={arrowSize} tempo={tempo} />
             </div>
           </div>
         );
