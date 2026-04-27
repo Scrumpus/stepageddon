@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     AUDIO_STORAGE_PATH: str = os.getenv("AUDIO_STORAGE_PATH", "./audio_storage")
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
     MAX_DURATION_SECONDS: int = int(os.getenv("MAX_DURATION_SECONDS", "600"))
+
+    # Database
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://stepageddon:stepageddon@localhost:5432/stepageddon",
+    )
     
     # CORS
     CORS_ORIGINS: List[str] = os.getenv(

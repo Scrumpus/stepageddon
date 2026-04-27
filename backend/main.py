@@ -11,8 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from routers import generation, audio
+from routers import generation, audio, songs, playlists
 from core.config import settings
+from db.session import engine
 
 # Load environment variables
 load_dotenv()
@@ -49,9 +50,10 @@ async def lifespan(app: FastAPI):
     logger.info("✓ Beat Sync Backend Ready!")
     
     yield
-    
+
     # Shutdown
     logger.info("🛑 Beat Sync Backend Shutting Down...")
+    await engine.dispose()
 
 
 # Create FastAPI app
@@ -99,6 +101,8 @@ async def health_check():
 # Include routers
 app.include_router(generation.router, prefix="/api", tags=["generation"])
 app.include_router(audio.router, prefix="/api", tags=["audio"])
+app.include_router(songs.router, prefix="/api", tags=["songs"])
+app.include_router(playlists.router, prefix="/api", tags=["playlists"])
 
 
 # Global exception handler
