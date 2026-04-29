@@ -71,8 +71,14 @@ function ArrowImage({ direction, subdivision = '4th', isHold = false, size = 64,
         height: size,
         backgroundImage: `url(${sheet})`,
         backgroundSize: `${sheetWidth}px ${size}px`,
-        '--sheet-width': `${-sheetWidth}px`,
-        animation: `sprite-step ${beatDuration}s steps(${SPRITE_FRAMES}) infinite`,
+        // Hold heads stay on the first sprite frame (no beat-pulse animation)
+        // so they read as a sustained mechanic rather than a tap.
+        ...(isHold
+          ? { backgroundPosition: '0 0' }
+          : {
+              '--sheet-width': `${-sheetWidth}px`,
+              animation: `sprite-step ${beatDuration}s steps(${SPRITE_FRAMES}) infinite`,
+            }),
         filter: isHold ? HOLD_FILTER : SUBDIVISION_FILTERS[subdivision],
       } as React.CSSProperties}
     />
