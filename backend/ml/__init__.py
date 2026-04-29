@@ -1,9 +1,8 @@
 """
 ML-based step chart generation module.
 
-Provides MLChartGenerator as a drop-in alternative to
-ChartGenerationPipeline for generating step charts using
-a trained neural network.
+Provides MLChartGenerator, the sole entry point for generating
+step charts from audio using a trained neural network.
 """
 
 

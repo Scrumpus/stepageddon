@@ -14,7 +14,7 @@ from typing import Optional
 
 from services import AudioProcessor, AudioDownloader
 from services.chart_persistence import persist_user_song
-from modules.step_generator import ChartGenerationPipeline, ChartExporter
+from ml import MLChartGenerator
 from core.config import settings
 from db import get_session
 
@@ -27,18 +27,9 @@ audio_processor = AudioProcessor()
 
 audio_downloader = AudioDownloader()
 
-# Initialize ML generator if enabled
-ml_generator = None
-if settings.USE_ML_GENERATION:
-    try:
-        from ml import MLChartGenerator
-        logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
-        ml_generator = MLChartGenerator(model_path=settings.ML_MODEL_PATH)
-        logger.info("ML chart generator loaded successfully")
-    except Exception as e:
-        logger.warning(f"Failed to load ML generator, falling back to algorithmic: {e}", exc_info=True)
-else:
-    logger.info("USE_ML_GENERATION is false; using algorithmic generator")
+logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
+ml_generator = MLChartGenerator(model_path=settings.ML_MODEL_PATH)
+logger.info("ML chart generator loaded successfully")
 
 
 class GenerateRequest(BaseModel):
@@ -115,13 +106,9 @@ async def generate_steps_from_file(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
 
-        # Generate steps (ML or algorithmic)
         logger.info(f"Generating {difficulty} steps...")
-        if ml_generator is not None:
-            chart = ml_generator.generate_from_audio(file_path, difficulty)
-        else:
-            chart = ChartGenerationPipeline.generate_from_audio(file_path, difficulty)
-        steps = ChartExporter.to_json(chart)
+        chart = ml_generator.generate_from_audio(file_path, difficulty)
+        steps = chart.to_json_dict()
 
         await persist_user_song(
             session,
@@ -132,7 +119,7 @@ async def generate_steps_from_file(
             chart=chart,
             difficulty_name=difficulty,
             difficulty_level=0,
-            generator="ml" if ml_generator is not None else "algorithmic",
+            generator="ml",
         )
 
         # Prepare response
@@ -201,15 +188,9 @@ async def generate_steps_from_url(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
 
-        # Generate steps (ML or algorithmic)
         logger.info(f"Generating {request.difficulty} steps...")
-        if ml_generator is not None:
-            logger.info("ML Generator")
-            chart = ml_generator.generate_from_audio(file_path, request.difficulty)
-        else:
-            logger.info("Algorithmic Generator")
-            chart = ChartGenerationPipeline.generate_from_audio(file_path, request.difficulty)
-        steps = ChartExporter.to_json(chart)
+        chart = ml_generator.generate_from_audio(file_path, request.difficulty)
+        steps = chart.to_json_dict()
 
         await persist_user_song(
             session,
@@ -220,7 +201,7 @@ async def generate_steps_from_url(
             chart=chart,
             difficulty_name=request.difficulty,
             difficulty_level=0,
-            generator="ml" if ml_generator is not None else "algorithmic",
+            generator="ml",
         )
 
         # Prepare response

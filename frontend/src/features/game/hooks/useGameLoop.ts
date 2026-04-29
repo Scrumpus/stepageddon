@@ -5,7 +5,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { GameState } from '@/types/common.types';
-import { Step, ActiveArrow } from '../types/step.types';
+import { Step, ActiveArrow, ActiveHold } from '../types/step.types';
 import { VISUAL_CONFIG, getArrowSpeed } from '../types/game.types';
 
 interface UseGameLoopParams {
@@ -14,6 +14,7 @@ interface UseGameLoopParams {
   gameState: GameState;
   songDuration: number;
   tempo: number;
+  activeHolds: ActiveHold[];
   onFinish: () => void;
   onMiss: () => void;
 }
@@ -34,6 +35,7 @@ export function useGameLoop({
   gameState,
   songDuration,
   tempo,
+  activeHolds,
   onFinish,
   onMiss,
 }: UseGameLoopParams): UseGameLoopReturn {
@@ -48,6 +50,9 @@ export function useGameLoop({
   onFinishRef.current = onFinish;
   const onMissRef = useRef(onMiss);
   onMissRef.current = onMiss;
+  // Read latest activeHolds inside the rAF loop without restarting it.
+  const activeHoldsRef = useRef(activeHolds);
+  activeHoldsRef.current = activeHolds;
 
   // Calculate arrow speed based on tempo
   const arrowSpeed = getArrowSpeed(tempo);
@@ -73,24 +78,36 @@ export function useGameLoop({
 
       steps.forEach((step, stepIndex) => {
         const timeUntilHit = step.time - currentTime;
+        const isHold = step.type === 'hold' && !!step.hold_duration;
+        const holdDuration = step.hold_duration ?? 0;
 
         // Check for missed arrows (-200ms grace period)
         // Each arrow in the step is tracked separately
         step.arrows.forEach((direction, arrowIndex) => {
           const arrowKey = `${stepIndex}-${arrowIndex}`;
+          const isProcessed = processedStepsRef.current.has(arrowKey);
+          const isOngoingHold =
+            isHold && activeHoldsRef.current.some((h) => h.arrowKey === arrowKey);
 
-          // Skip if already processed
-          if (processedStepsRef.current.has(arrowKey)) return;
-
-          if (timeUntilHit < -0.2) {
+          if (!isProcessed && timeUntilHit < -0.2) {
             processedStepsRef.current.add(arrowKey);
             onMissRef.current();
             return;
           }
 
-          // Show arrows in visible window (-200ms to +2s)
+          // Once processed, only keep hold notes around — and only while the
+          // hold is still being tracked (so missed holds vanish, hit holds
+          // keep their trail visible until release/end).
+          if (isProcessed && !isOngoingHold) return;
+
+          // Hold notes that are being held extend the visible window past 0
+          // until the hold's end time, so the trail stays on screen.
+          const lowerBound = isOngoingHold ? -(holdDuration + 0.2) : -0.2;
+
+          // Show arrows in visible window (-200ms to +2s for taps; longer for
+          // active holds so the trail persists through the hold duration).
           // Arrows float UP: spawn at bottom (SPAWN_Y) and move to top (HIT_ZONE_Y)
-          if (timeUntilHit >= -0.2 && timeUntilHit <= visibleWindow) {
+          if (timeUntilHit >= lowerBound && timeUntilHit <= visibleWindow) {
             const y = VISUAL_CONFIG.HIT_ZONE_Y + (timeUntilHit * arrowSpeed);
             newActiveArrows.push({
               time: step.time,

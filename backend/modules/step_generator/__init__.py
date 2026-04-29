@@ -1,31 +1,26 @@
 """
-Step Generator Module
+Step Generator Schemas
 
-Deterministic DDR-style chart generation from audio analysis.
-This module provides a complete pipeline from audio file to playable step chart.
+Shared chart schemas and difficulty presets used by the ML generator
+(`ml.inference.MLChartGenerator`) and the persistence / parser layers.
 
-Main API:
-    ChartGenerationPipeline: High-level pipeline for chart generation
-    ChartExporter: Export charts to JSON format
-    StepGenerator: Core generation algorithm
-
-Example:
-    >>> from modules.step_generator import ChartGenerationPipeline
-    >>> chart = ChartGenerationPipeline.generate_from_audio('song.mp3', 'intermediate')
+Generation itself lives in `ml/`; this package now only provides the
+data structures and difficulty configs.
 """
 
-from .pipeline import ChartGenerationPipeline, ChartExporter
-from .generator import StepGenerator
-from .schemas import Chart, Step, StepType, Direction, DifficultyConfig, Beat, EnergySection, BeatSubdivision
+from .schemas import (
+    Chart,
+    Step,
+    StepType,
+    Direction,
+    DifficultyConfig,
+    Beat,
+    EnergySection,
+    BeatSubdivision,
+)
 from .difficulty import DIFFICULTY_PRESETS, get_difficulty_config
-from .patterns import PatternTemplate
-
-__version__ = '3.0.0'
 
 __all__ = [
-    "ChartGenerationPipeline",
-    "ChartExporter",
-    "StepGenerator",
     "Chart",
     "Step",
     "StepType",
@@ -36,5 +31,4 @@ __all__ = [
     "BeatSubdivision",
     "DIFFICULTY_PRESETS",
     "get_difficulty_config",
-    "PatternTemplate",
 ]

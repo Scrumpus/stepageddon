@@ -254,11 +254,7 @@ class FootStateArrowAssigner:
 
 
 class MLChartGenerator:
-    """
-    Generate step charts using the trained neural network.
-
-    Drop-in alternative to ChartGenerationPipeline.
-    """
+    """Generate step charts using the trained neural network."""
 
     def __init__(
         self,
@@ -360,8 +356,6 @@ class MLChartGenerator:
     ) -> Chart:
         """
         Generate a step chart from an audio file.
-
-        Compatible with ChartGenerationPipeline.generate_from_audio() interface.
 
         Args:
             audio_path: Path to audio file
@@ -619,6 +613,11 @@ class MLChartGenerator:
             note_events = holds + taps[:remaining]
 
         # Step 4: Beat-snap
+        # Snap each event to a 16th-note grid anchored at beat_times[0] and
+        # remember which grid slot it landed in. The slot index drives the
+        # subdivision color downstream — using the integer index avoids the
+        # float / tempo-estimation drift that breaks modular-arithmetic
+        # subdivision derivation.
         if self.snap_to_beats and len(beat_times) > 1:
             beat_interval = 60.0 / tempo
             grid = []
@@ -631,6 +630,7 @@ class MLChartGenerator:
             for event in note_events:
                 nearest_idx = int(np.argmin(np.abs(grid - event['time'])))
                 event['time'] = float(grid[nearest_idx])
+                event['grid_idx'] = nearest_idx
 
         # Step 5: Sort and enforce minimum gap
         note_events.sort(key=lambda e: e['time'])
@@ -654,7 +654,9 @@ class MLChartGenerator:
 
         for i, event in enumerate(note_events):
             t = round(event['time'], 3)
-            subdivision = self._get_beat_subdivision(t, tempo, beat_times)
+            subdivision = self._subdivision_from_grid(
+                event.get('grid_idx'), t, tempo, beat_times,
+            )
 
             # Look up per-event audio features from the precomputed curves
             frame_idx = int(round(t * FRAMES_PER_SECOND))
@@ -706,23 +708,42 @@ class MLChartGenerator:
 
         return steps
 
-    def _get_beat_subdivision(
-        self, time: float, tempo: float, beat_times: np.ndarray
+    # 16th-grid index → DDR-style subdivision color, mirroring the
+    # rational-beat logic in services/sm_parser._beat_subdivision:
+    #   slot 0  → on the beat      → quarter (red)
+    #   slot 2  → on the half-beat → eighth  (blue)
+    #   slot 1, 3 → quarter-beat   → sixteenth (yellow)
+    _SUBDIVISION_BY_SLOT = (
+        BeatSubdivision.QUARTER,
+        BeatSubdivision.SIXTEENTH,
+        BeatSubdivision.EIGHTH,
+        BeatSubdivision.SIXTEENTH,
+    )
+
+    def _subdivision_from_grid(
+        self,
+        grid_idx: Optional[int],
+        time: float,
+        tempo: float,
+        beat_times: np.ndarray,
     ) -> BeatSubdivision:
-        """Determine the beat subdivision of a note time."""
-        if len(beat_times) == 0:
+        """Subdivision from the snap-grid slot when available, else fall back
+        to modular phase. The slot path is exact integer math and matches the
+        sm_parser convention; the modular path only runs when snap_to_beats is
+        disabled or the audio had < 2 detected beats.
+        """
+        if grid_idx is not None:
+            return self._SUBDIVISION_BY_SLOT[grid_idx % 4]
+
+        if len(beat_times) == 0 or tempo <= 0:
             return BeatSubdivision.QUARTER
 
         beat_interval = 60.0 / tempo
+        anchor = float(beat_times[0])
+        beat_position = ((time - anchor) % beat_interval) / beat_interval
 
-        # Find position within the beat (0.0 to 1.0)
-        beat_position = (time % beat_interval) / beat_interval
-
-        # Quarter note: lands on the beat (position ~0.0 or ~1.0)
         if beat_position < 0.125 or beat_position > 0.875:
             return BeatSubdivision.QUARTER
-        # Eighth note: lands on the half-beat (position ~0.5)
         if abs(beat_position - 0.5) < 0.125:
             return BeatSubdivision.EIGHTH
-        # Sixteenth note: lands at 0.25 or 0.75
         return BeatSubdivision.SIXTEENTH

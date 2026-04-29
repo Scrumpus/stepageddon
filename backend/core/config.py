@@ -40,12 +40,11 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ML Model Settings
-    USE_ML_GENERATION: bool = os.getenv("USE_ML_GENERATION", "false").lower() == "true"
     ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model_2.pt")
-    #ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
     
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
