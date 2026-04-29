@@ -134,10 +134,10 @@ function HoldTrail({
 }) {
   if (length <= 0) return null;
 
-  // Space trail tiles every 16th note so the column reads as a denser ribbon
+  // Space trail tiles every 32nd note so the column reads as a denser ribbon
   // rather than discrete arrow-sized blocks.
-  const sixteenthSeconds = 60 / tempo / 4;
-  const tileSpacing = Math.max(1, sixteenthSeconds * arrowSpeed);
+  const thirtySecondSeconds = 60 / tempo / 8;
+  const tileSpacing = Math.max(1, thirtySecondSeconds * arrowSpeed);
   const tileCount = Math.max(1, Math.ceil(length / tileSpacing));
   const sheet = ARROW_SHEETS[direction];
   const sheetWidth = width * SPRITE_FRAMES;
