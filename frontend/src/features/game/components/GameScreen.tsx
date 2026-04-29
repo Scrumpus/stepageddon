@@ -85,6 +85,16 @@ function GameScreen() {
 
   if (!songData) return null;
 
+  const addScore = useCallback((points: number) => setScore((prev) => prev + points), []);
+
+  // Hold tracking hook (declared before useGameLoop so its activeHolds can
+  // feed back into the game loop — we keep hit holds in activeArrows until
+  // their hold ends so the trail stays on screen).
+  const { activeHolds, startHold, releaseHold, updateHolds } = useHoldTracking({
+    combo,
+    onScoreUpdate: addScore,
+  });
+
   // Game loop hook
   const { currentTime, activeArrows, processedStepsRef } = useGameLoop({
     audioRef,
@@ -92,16 +102,9 @@ function GameScreen() {
     gameState,
     songDuration: songData.duration,
     tempo: songData.tempo || 120,
+    activeHolds,
     onFinish: finishGame,
     onMiss: handleMiss,
-  });
-
-  const addScore = useCallback((points: number) => setScore((prev) => prev + points), []);
-
-  // Hold tracking hook
-  const { activeHolds, startHold, releaseHold, updateHolds } = useHoldTracking({
-    combo,
-    onScoreUpdate: addScore,
   });
 
   // Update holds each frame when playing

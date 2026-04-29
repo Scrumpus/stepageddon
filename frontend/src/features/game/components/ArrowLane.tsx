@@ -36,6 +36,9 @@ const SUBDIVISION_FILTERS: Record<BeatSubdivision, string> = {
 
 // Hold notes override subdivision color so the mechanic reads at a glance.
 const HOLD_FILTER = 'hue-rotate(120deg) saturate(1.5) brightness(1.05)';   // pink
+// Solid pink that visually matches the HOLD_FILTER output, used as the body
+// fill behind trail tiles so transparent gaps in the arrow PNGs don't bleed.
+const HOLD_BODY_COLOR = '#ff4fa3';
 
 const SPRITE_FRAMES = 4;
 
@@ -144,7 +147,14 @@ function HoldTrail({
   // Subdivision is currently unused for trails; kept on the prop for parity
   // with the head and future tweaks.
   void subdivision;
-  const baseOpacity = isActive ? 1 : 0.7;
+  // Fully opaque so a later hold's trail cleanly covers the previous note's
+  // trail / head where they overlap (DDR-style lap).
+  const baseOpacity = 1;
+  void isActive;
+
+  // Inset the body bar slightly so it reads as the arrow's interior column
+  // rather than a full-width block.
+  const bodyInset = Math.round(width * 0.18);
 
   return (
     <div
@@ -159,6 +169,19 @@ function HoldTrail({
         height: length + width,
       }}
     >
+      {/* Solid body fill: covers transparent gaps in the tile arrows so the
+          trail reads as one opaque ribbon. Tiles render above this. */}
+      <div
+        className="absolute"
+        style={{
+          top: width / 2,
+          left: bodyInset,
+          width: width - bodyInset * 2,
+          height: Math.max(0, length),
+          backgroundColor: HOLD_BODY_COLOR,
+          opacity: baseOpacity,
+        }}
+      />
       {Array.from({ length: tileCount }, (_, i) => {
         // Each tile represents 1 / tileCount of progress; clamp to [0.2, 1] so
         // played-through tiles remain dimly visible.
@@ -250,6 +273,10 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
               top: `${arrow.y}px`,
               left: `calc(50% + ${x}px)`,
               width: arrowSize,
+              // Group head + trail into one stacking context so a later arrow
+              // (later in DOM = later in time) renders entirely on top of any
+              // earlier arrow it overlaps — DDR-style note lapping.
+              isolation: 'isolate',
             }}
           >
             {/* Hold trail (not rotated - stays vertical) */}
