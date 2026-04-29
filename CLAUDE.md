@@ -81,30 +81,17 @@ The backend has a three-layer step generation architecture:
 
 Output: Comprehensive analysis dict with beat_times, onset_times, energy_profile, spectral_features, structure boundaries
 
-**Layer 2: Step Generation** - Modular Package Structure
+**Layer 2: Step Generation** — ML model
 
-The step generation system follows FastAPI best practices with a modular structure in `backend/modules/step_generator/`
+Chart generation is handled by a trained PyTorch model loaded at app startup.
 
-**Module Structure:**
-```
-backend/modules/step_generator/
-├── __init__.py          # Public API exports
-├── schemas.py           # Pydantic models (Beat, Step, Chart, etc.)
-├── difficulty.py        # Difficulty configurations
-├── audio_analysis.py    # Librosa-based analysis functions
-├── patterns.py          # Pattern templates (streams, jumps, holds)
-├── generator.py         # Core StepGenerator class
-└── pipeline.py          # ChartGenerationPipeline & ChartExporter
-```
+- **Entry point**: `ml.inference.MLChartGenerator.generate_from_audio(audio_path, difficulty)` → `Chart`
+- **Module**: `backend/ml/` (model in `model.py`, inference in `inference.py`, training in `train.py`)
+- **Checkpoint path**: `settings.ML_MODEL_PATH` (defaults to `./ml/checkpoints/best_model_2.pt`)
+- **Schemas**: `backend/modules/step_generator/` now contains only the shared Pydantic schemas (`Chart`, `Step`, `Direction`, `StepType`, `BeatSubdivision`, `DifficultyConfig`) and the difficulty presets (`DIFFICULTY_PRESETS`, `get_difficulty_config`) consumed by the ML inference path, persistence, and the `.sm` parser.
+- **JSON serialization**: `Chart.to_json_dict()` returns the API response shape.
 
-**Primary Generator:** `step_generator` module
-- **Entry Point**: `ChartGenerationPipeline.generate_from_audio()`
-- **Implements**: STEP_ENGINE.md contract
-- **Features**: Grid-locked timing, deterministic, TAP and HOLD notes
-- **Schemas**: Pydantic BaseModel for validation and serialization
-- **Import**: `from modules.step_generator import ChartGenerationPipeline, ChartExporter`
-
-**Legacy Generators** (still available for backward compatibility):
+If the checkpoint can't be loaded, app startup fails fast — there is no algorithmic fallback.
 
 **Layer 3: API Routers** (`backend/routers/`):
 - `generation.py` - POST endpoints for chart generation (file upload or URL)
@@ -113,82 +100,8 @@ backend/modules/step_generator/
 **Complete Flow**:
 ```
 Upload/URL → Router validates → AudioDownloader (if URL) → AudioProcessor analyzes
-→ StepGenerator creates chart → Response with steps + audio URL
+→ MLChartGenerator predicts chart → Chart.to_json_dict() → Response with steps + audio URL
 ```
-
-### Step Generation Engine
-
-The step generator follows strict design principles documented in `backend/STEP_ENGINE.md`:
-
-1. **Grid-Locked Timing**: All steps align to musical grid (quarter/eighth/sixteenth notes based on difficulty)
-2. **Determinism**: Same audio + difficulty = identical chart every time
-3. **Playability First**: Readable charts preferred over dense ones
-4. **Foot Logic**: Arrow selection uses cost function to avoid awkward patterns (consecutive same arrows, excessive same-foot usage, crossovers)
-
-**Difficulty System** (from `step_generator_new.py`):
-
-The new generator uses detailed `DifficultyConfig` dataclasses with precise parameters:
-
-- **Beginner**:
-  - Density: 0.6-1.2 steps/second
-  - Grid: Downbeats only (quarter notes)
-  - Singles only, no jumps
-  - 15% holds (0.8-2.0s duration)
-  - No crossovers, no brackets
-  - Energy scale: 0.3x
-
-- **Intermediate**:
-  - Density: 1.3-2.3 steps/second
-  - Grid: Downbeats + upbeats + offbeats (eighth notes)
-  - Singles + doubles
-  - 20% holds (0.6-3.0s duration)
-  - Max 2 consecutive jumps, max 6-note streams
-  - Crossovers allowed
-  - Energy scale: 0.6x
-
-- **Expert**:
-  - Density: 2.2-4.0 steps/second
-  - Grid: All subdivisions (sixteenth notes)
-  - Singles + doubles + brackets
-  - 25% holds (0.5-4.0s duration)
-  - Max 4 consecutive jumps, max 16-note streams
-  - Crossovers + brackets allowed
-  - Energy scale: 1.0x
-
-**Data Structures** (`step_generator_new.py`):
-```python
-@dataclass
-class Beat:
-    time: float
-    strength: float
-    beat_type: str  # 'downbeat', 'upbeat', 'offbeat'
-    measure_position: int  # 0-3 for 4/4 time
-    is_strong: bool
-
-@dataclass
-class Step:
-    time: float
-    arrows: List[Direction]  # Direction.LEFT/DOWN/UP/RIGHT
-    step_type: StepType  # StepType.TAP or StepType.HOLD
-    hold_duration: Optional[float]  # Required for HOLD, None for TAP
-
-@dataclass
-class Chart:
-    steps: List[Step]
-    difficulty: str
-    tempo: float
-    duration: float
-```
-
-**Algorithm Overview**:
-1. `analyze_beats()` - Classify all beats as downbeat/upbeat/offbeat in 4/4 time
-2. `detect_subdivisions()` - Find eighth/sixteenth note positions based on onsets
-3. `analyze_energy_sections()` - Segment song into low/medium/high/climax intensity
-4. `detect_sustained_notes()` - Find melodic holds using pitch tracking
-5. Place steps on grid with energy-aware density
-6. Apply foot logic and cost function for arrow selection
-7. Insert holds on sustained notes (15-25% of steps)
-8. Export to JSON via `ChartExporter.to_json()`
 
 ### Frontend Architecture
 
@@ -320,9 +233,8 @@ Content-Type: application/json
 
 **Backend** (`.env` in `backend/`):
 ```env
-# Required for AI mode only (optional)
-ANTHROPIC_API_KEY=sk-ant-...
-USE_AI_GENERATION=false  # Set to true for AI mode
+# Path to the trained step-chart model checkpoint
+ML_MODEL_PATH=./ml/checkpoints/best_model_2.pt
 
 # Optional - for Spotify support
 SPOTIFY_CLIENT_ID=...
@@ -346,56 +258,21 @@ VITE_API_URL=http://localhost:8000
 
 ### Modifying Step Generation Logic
 
-When working with the step generator:
+Generation lives in `backend/ml/`. The model is trained offline; the API only runs inference.
 
-1. **Read STEP_ENGINE.md first** - Contains the complete design contract and requirements
-2. **Primary module**: `backend/modules/step_generator/` (follows FastAPI best practices)
-3. **Test across difficulties** - Each has vastly different grid subdivision and density limits
-4. **Verify determinism** - Use same audio file + difficulty multiple times, compare outputs
-5. **Check playability** - Patterns must be physically feasible (avoid same arrow spam, impossible crossovers)
+- **Inference entry point**: `ml.inference.MLChartGenerator.generate_from_audio(audio_path, difficulty)` returns a `Chart`.
+- **Schemas / difficulty presets**: `backend/modules/step_generator/{schemas,difficulty}.py` — shared by the ML inference path, `services/chart_persistence.py`, and `services/sm_parser.py`.
+- **Training**: `backend/ml/train.py`, `prepare_data.py`, `dataset.py`, `model.py`. Checkpoints land in `backend/ml/checkpoints/`.
+- **Behavior tuning at inference time**: see `MLChartGenerator.__init__` knobs (`chunk_frames`, `overlap_frames`, `confidence_threshold`, `min_note_gap`, `snap_to_beats`).
 
-**Module Organization**:
-- `schemas.py` - Pydantic models (Beat, Step, Chart, Direction, StepType) with validation
-- `difficulty.py` - Configuration and presets
-- `audio_analysis.py` - Librosa-based analysis functions
-- `patterns.py` - Reusable pattern templates
-- `generator.py` - Core StepGenerator class
-- `pipeline.py` - High-level orchestration
-
-**Key Entry Points**:
 ```python
-# Main pipeline (from pipeline.py)
-from modules.step_generator import ChartGenerationPipeline, ChartExporter
-chart = ChartGenerationPipeline.generate_from_audio(audio_path, difficulty)
-json_data = ChartExporter.to_json(chart)
-
-# Core analysis functions (from audio_analysis.py)
-from modules.step_generator import analyze_beats, detect_subdivisions, analyze_energy
-beats, tempo = analyze_beats(y, sr)
-subdivisions = detect_subdivisions(y, sr, beat_times)
-energy_sections = analyze_energy(y, sr)
-
-# Pattern generation (from patterns.py)
-from modules.step_generator import PatternTemplate
-stream = PatternTemplate.single_stream(start_time, count, interval, Direction.LEFT)
-jump = PatternTemplate.jump_pattern(time, 'corners')
-
-# Working with Pydantic models
-from modules.step_generator import Step, StepType, Direction
-step = Step(time=1.5, arrows=[Direction.LEFT], step_type=StepType.TAP)
-# Pydantic handles validation automatically
+from ml import MLChartGenerator
+gen = MLChartGenerator(model_path="./ml/checkpoints/best_model_2.pt")
+chart = gen.generate_from_audio("song.mp3", "medium")
+response = chart.to_json_dict()
 ```
 
-**Difficulty Presets**: Located in `backend/modules/step_generator/difficulty.py`
-- Modify density ranges, hold percentages, grid subdivisions in `DIFFICULTY_PRESETS` dict
-- Add new difficulty: Create new `DifficultyConfig` Pydantic model instance
-- Use `get_difficulty_config(name)` for validated access
-
-**Pydantic Benefits**:
-- Automatic validation of all data structures
-- Easy serialization to/from JSON
-- Type checking and IDE autocompletion
-- FastAPI integration for request/response models
+**Difficulty Presets**: `backend/modules/step_generator/difficulty.py` (`DIFFICULTY_PRESETS`, `get_difficulty_config`). Used by ML inference for difficulty conditioning; the algorithmic density/grid fields remain on `DifficultyConfig` for compatibility but are no longer interpreted by a placement algorithm.
 
 ### Adjusting Timing Windows
 
@@ -406,25 +283,13 @@ To modify hit detection timing in the frontend:
 3. Timing is ± the value (e.g., PERFECT: 50 means ±50ms = 100ms window)
 4. Test with different BPM songs (faster songs need tighter windows)
 
-### Adding New Audio Features
-
-To extract additional features from audio:
-
-1. Add extraction logic to `AudioProcessor._extract_spectral_features()` or create new method
-2. Include in return dict from `analyze_audio()`
-3. Access in step generator via `audio_analysis['your_feature']`
-4. Use in placement decisions or pattern generation
-
 ### Debugging Step Generation
 
-Common issues and solutions:
+- **No notes / sparse output**: Check `confidence_threshold` and `min_note_gap` on `MLChartGenerator`.
+- **Notes feel off-beat**: Verify `snap_to_beats=True` and inspect the librosa beat track on the input audio.
+- **Server fails to start**: `ML_MODEL_PATH` likely points to a missing/incompatible checkpoint. There is no algorithmic fallback — fix the path or restore the file.
 
-- **Steps feel off-beat**: Check `analyze_beats()` tempo detection. Songs with tempo changes or complex rhythms may need manual BPM hints.
-- **Too many/few steps**: Adjust `min_density` / `max_density` in difficulty preset
-- **Awkward patterns**: Review cost function in arrow selection logic
-- **No holds appearing**: Check `hold_percentage` in preset, verify `detect_sustained_notes()` is finding melodic content
-
-**Logging**: Step generator has extensive logging at INFO level. Run backend with `LOG_LEVEL=DEBUG` for verbose output.
+**Logging**: Run backend with `LOG_LEVEL=DEBUG` for verbose ML inference logs.
 
 ### Frontend State Flow
 
@@ -454,7 +319,7 @@ State changes via `setGameState()` in `App.jsx`. All screens receive state via p
 - **Supported formats**:
   - Upload: MP3, WAV, OGG, FLAC
   - URLs: YouTube (via yt-dlp), Spotify (30-second previews via spotipy)
-- **Generation mode**: Set `USE_AI_GENERATION=true` in backend `.env` for AI mode (requires Anthropic API key)
+- **Generation**: ML-only via `MLChartGenerator`; checkpoint loaded at startup from `ML_MODEL_PATH`
 - **Sample rate**: All audio loaded at 22050 Hz for consistency
 
 ## Troubleshooting

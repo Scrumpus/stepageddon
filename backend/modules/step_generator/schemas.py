@@ -89,6 +89,35 @@ class Chart(BaseModel):
         """Get only hold notes."""
         return [s for s in self.steps if s.step_type == StepType.HOLD]
 
+    def to_json_dict(self) -> dict:
+        """Serialize chart to a JSON-compatible dict for API responses."""
+        steps_data = []
+        for step in self.steps:
+            step_dict = {
+                'time': round(step.time, 3),
+                'arrows': [a.value for a in step.arrows],
+                'type': step.step_type.value,
+                'beat_subdivision': step.beat_subdivision.value,
+            }
+            if step.step_type == StepType.HOLD:
+                step_dict['hold_duration'] = round(step.hold_duration, 3)
+            steps_data.append(step_dict)
+
+        return {
+            'difficulty': self.difficulty,
+            'tempo': round(self.tempo, 1),
+            'duration': round(self.duration, 2),
+            'steps': steps_data,
+            'stats': {
+                'total_steps': len(self.steps),
+                'total_arrows': sum(len(s.arrows) for s in self.steps),
+                'tap_notes': len(self.get_taps()),
+                'hold_notes': len(self.get_holds()),
+                'singles': len([s for s in self.steps if len(s.arrows) == 1]),
+                'doubles': len([s for s in self.steps if len(s.arrows) == 2]),
+            },
+        }
+
     model_config = {"frozen": False}
 
 

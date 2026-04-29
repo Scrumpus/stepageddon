@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def _step_to_dict(step) -> dict:
-    """Mirror `ChartExporter.to_json()` per-step shape so frontend stays unchanged."""
+    """Mirror `Chart.to_json_dict()` per-step shape so frontend stays unchanged."""
     out = {
         "time": round(step.time, 3),
         "arrows": [a.value for a in step.arrows],

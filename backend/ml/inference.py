@@ -254,11 +254,7 @@ class FootStateArrowAssigner:
 
 
 class MLChartGenerator:
-    """
-    Generate step charts using the trained neural network.
-
-    Drop-in alternative to ChartGenerationPipeline.
-    """
+    """Generate step charts using the trained neural network."""
 
     def __init__(
         self,
@@ -360,8 +356,6 @@ class MLChartGenerator:
     ) -> Chart:
         """
         Generate a step chart from an audio file.
-
-        Compatible with ChartGenerationPipeline.generate_from_audio() interface.
 
         Args:
             audio_path: Path to audio file
