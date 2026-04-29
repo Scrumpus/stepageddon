@@ -49,4 +49,6 @@ export interface ActiveHold {
   lastTickTime: number;      // Last time we awarded hold points
   totalDuration: number;     // Original hold duration
   holdProgress: number;      // Progress 0-1 for animation
+  released: boolean;         // True after the player has let go (trail still
+                             // renders, but stops awarding tick points)
 }

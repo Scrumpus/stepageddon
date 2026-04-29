@@ -91,6 +91,7 @@ export function useHitDetection({
             lastTickTime: currentTime,
             totalDuration: closest.hold_duration,
             holdProgress: 0,
+            released: false,
           });
         }
       } else {

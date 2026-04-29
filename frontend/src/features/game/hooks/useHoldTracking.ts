@@ -36,7 +36,12 @@ export function useHoldTracking({
   }, []);
 
   const releaseHold = useCallback((direction: Direction) => {
-    setActiveHolds((prev) => prev.filter((h) => h.direction !== direction));
+    // Mark the hold as released rather than removing it: the trail keeps
+    // rendering through to the natural endTime, but no further tick points
+    // accrue and the active glow turns off.
+    setActiveHolds((prev) =>
+      prev.map((h) => (h.direction === direction && !h.released ? { ...h, released: true } : h))
+    );
   }, []);
 
   const updateHolds = useCallback(
@@ -48,8 +53,10 @@ export function useHoldTracking({
         for (const hold of prev) {
           // Check if hold is completed
           if (currentTime >= hold.endTime) {
-            // Award completion bonus
-            totalPoints += calculateHoldCompletionBonus(comboRef.current);
+            // Award completion bonus only if the player held all the way through.
+            if (!hold.released) {
+              totalPoints += calculateHoldCompletionBonus(comboRef.current);
+            }
             // Don't add to updated list - hold is done
             continue;
           }
@@ -58,11 +65,11 @@ export function useHoldTracking({
           const elapsed = currentTime - hold.startTime;
           const progress = Math.min(elapsed / hold.totalDuration, 1);
 
-          // Check if we should award tick points
+          // Check if we should award tick points (only while still pressed).
           const timeSinceLastTick = currentTime - hold.lastTickTime;
           let newLastTickTime = hold.lastTickTime;
 
-          if (timeSinceLastTick >= HOLD_SCORING.TICK_INTERVAL) {
+          if (!hold.released && timeSinceLastTick >= HOLD_SCORING.TICK_INTERVAL) {
             // Calculate number of ticks since last update
             const tickCount = Math.floor(timeSinceLastTick / HOLD_SCORING.TICK_INTERVAL);
             totalPoints += calculateHoldTickPoints(comboRef.current) * tickCount;

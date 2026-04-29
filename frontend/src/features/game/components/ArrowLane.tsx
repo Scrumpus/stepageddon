@@ -150,7 +150,11 @@ function HoldTrail({
   // Fully opaque so a later hold's trail cleanly covers the previous note's
   // trail / head where they overlap (DDR-style lap).
   const baseOpacity = 1;
-  void isActive;
+  // While the player is holding the note, brighten the whole trail with a
+  // pink drop-shadow glow so the active state reads instantly.
+  const activeGlow = isActive
+    ? 'drop-shadow(0 0 6px rgba(255, 105, 180, 0.95)) drop-shadow(0 0 14px rgba(255, 105, 180, 0.7))'
+    : '';
 
   // Inset the body bar slightly so it reads as the arrow's interior column
   // rather than a full-width block.
@@ -167,6 +171,7 @@ function HoldTrail({
         top: 0,
         left: 0,
         height: length + width,
+        filter: activeGlow || undefined,
       }}
     >
       {/* Solid body fill: covers transparent gaps in the tile arrows so the
@@ -188,6 +193,14 @@ function HoldTrail({
         const consumption = progress * tileCount - i;
         const opacity = Math.max(0.2, Math.min(1, 1 - consumption)) * baseOpacity;
 
+        // Classic DDR quirk: the down arrow's trail stacks so each earlier
+        // tile covers the next one (the last/bottom tile is covered by the
+        // tile above it). Invert z-order for 'down' to reproduce that.
+        // Across all directions, the first tile sits on top so it cleanly
+        // tucks under the arrow head.
+        const zIndex =
+          i === 0 ? tileCount + 1 : direction === 'down' ? tileCount - i : i;
+
         return (
           <div
             key={i}
@@ -203,6 +216,7 @@ function HoldTrail({
               backgroundSize: `${sheetWidth}px ${width}px`,
               filter,
               opacity,
+              zIndex,
             }}
           />
         );
@@ -263,7 +277,9 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
         // Find if this hold is being actively held
         const activeHold = activeHolds.find((h) => h.arrowKey === arrowKey);
         const holdProgress = activeHold?.holdProgress ?? 0;
-        const isActivelyHeld = !!activeHold;
+        // Trail persists for the whole hold (even after release), but the
+        // glow only lights up while the player is still pressing the key.
+        const isActivelyHeld = !!activeHold && !activeHold.released;
 
         return (
           <div
