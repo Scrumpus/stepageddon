@@ -46,6 +46,9 @@ function GameScreen() {
     points: number;
   } | null>(null);
   const processedStepsRefP1 = useRef<Set<string>>(new Set());
+  // Synchronously-tracked combo ref. Always update alongside setCombo so
+  // back-to-back press events read the post-write value before re-render.
+  const comboRefP1 = useRef(0);
 
   // P2 state — always created so the hook order stays stable; only wired
   // visually and to the keyboard when isDualMode.
@@ -58,24 +61,42 @@ function GameScreen() {
     points: number;
   } | null>(null);
   const processedStepsRefP2 = useRef<Set<string>>(new Set());
+  const comboRefP2 = useRef(0);
 
-  // Show judgment feedback
+  // Show judgment feedback. Cancel any pending hide-timeout so back-to-back
+  // hits don't clear the newer judgment when the earlier timer expires.
+  const judgmentTimeoutRef = useRef<number | null>(null);
+  const judgmentTimeoutRef2 = useRef<number | null>(null);
   const showJudgment = useCallback((judgment: Judgment, points: number) => {
+    if (judgmentTimeoutRef.current !== null) {
+      clearTimeout(judgmentTimeoutRef.current);
+    }
     setJudgmentDisplay({ judgment, points });
-    setTimeout(() => setJudgmentDisplay(null), 500);
+    judgmentTimeoutRef.current = window.setTimeout(() => {
+      setJudgmentDisplay(null);
+      judgmentTimeoutRef.current = null;
+    }, 500);
   }, []);
   const showJudgment2 = useCallback((judgment: Judgment, points: number) => {
+    if (judgmentTimeoutRef2.current !== null) {
+      clearTimeout(judgmentTimeoutRef2.current);
+    }
     setJudgmentDisplay2({ judgment, points });
-    setTimeout(() => setJudgmentDisplay2(null), 500);
+    judgmentTimeoutRef2.current = window.setTimeout(() => {
+      setJudgmentDisplay2(null);
+      judgmentTimeoutRef2.current = null;
+    }, 500);
   }, []);
 
   // Handle miss
   const handleMiss = useCallback(() => {
+    comboRefP1.current = 0;
     setCombo(0);
     setHitAccuracy((prev) => ({ ...prev, miss: prev.miss + 1 }));
     showJudgment(Judgment.MISS, 0);
   }, [showJudgment]);
   const handleMiss2 = useCallback(() => {
+    comboRefP2.current = 0;
     setCombo2(0);
     setHitAccuracy2((prev) => ({ ...prev, miss: prev.miss + 1 }));
     showJudgment2(Judgment.MISS, 0);
@@ -112,6 +133,8 @@ function GameScreen() {
     setGameMode(newMode);
     processedStepsRefP1.current.clear();
     processedStepsRefP2.current.clear();
+    comboRefP1.current = 0;
+    comboRefP2.current = 0;
     setCombo(0);
     setCombo2(0);
   }, [setGameMode]);
@@ -174,10 +197,11 @@ function GameScreen() {
   const { checkHit: checkHit1 } = useHitDetection({
     activeArrows,
     processedStepsRef: processedStepsRefP1,
-    combo,
+    comboRef: comboRefP1,
     currentTime,
     onScoreUpdate: addScore,
     onComboUpdate: useCallback((newCombo: number) => {
+      comboRefP1.current = newCombo;
       setCombo(newCombo);
       setMaxCombo((prev) => Math.max(prev, newCombo));
     }, []),
@@ -200,10 +224,11 @@ function GameScreen() {
   const { checkHit: checkHit2 } = useHitDetection({
     activeArrows,
     processedStepsRef: processedStepsRefP2,
-    combo: combo2,
+    comboRef: comboRefP2,
     currentTime,
     onScoreUpdate: addScore2,
     onComboUpdate: useCallback((newCombo: number) => {
+      comboRefP2.current = newCombo;
       setCombo2(newCombo);
       setMaxCombo2((prev) => Math.max(prev, newCombo));
     }, []),
@@ -224,14 +249,16 @@ function GameScreen() {
 
   // Miss tracking — once per player against their own ref.
   useMissTracking({
-    activeArrows,
+    steps,
+    currentTime,
     processedStepsRef: processedStepsRefP1,
     activeHolds: activeHolds1,
     gameState,
     onMiss: handleMiss,
   });
   useMissTracking({
-    activeArrows,
+    steps,
+    currentTime,
     processedStepsRef: processedStepsRefP2,
     activeHolds: activeHolds2,
     gameState,

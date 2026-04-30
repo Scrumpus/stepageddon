@@ -42,9 +42,11 @@ function JudgmentDisplay({ judgment, combo, centerPercent = 50 }: JudgmentDispla
           )}
         </div>
       )}
-      <div className="mt-3 text-3xl font-bold text-game-accent">
-        {combo}x
-      </div>
+      {combo >= 4 && (
+        <div className="mt-3 text-3xl font-bold text-game-accent">
+          {combo}x
+        </div>
+      )}
     </div>
   );
 }

@@ -77,7 +77,7 @@ export const HOLD_SCORING = {
  */
 export const VISUAL_CONFIG = {
   HIT_ZONE_Y: 80,          // Y position of hit zone (near top)
-  ARROW_SIZE: 72,          // Arrow size in pixels
+  ARROW_SIZE: 90,          // Arrow size in pixels
   // Seconds of lookahead. Arrows spawn at HIT_ZONE_Y + VISIBLE_WINDOW *
   // arrowSpeed; with the playfield clipped via overflow-hidden, the arrow's
   // initial Y lands well below the bottom edge so it slides naturally up

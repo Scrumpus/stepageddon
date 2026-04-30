@@ -12,7 +12,10 @@ import { evaluateHit, calculatePoints } from '../utils/scoring';
 interface UseHitDetectionParams {
   activeArrows: ActiveArrow[];
   processedStepsRef: React.MutableRefObject<Set<string>>;
-  combo: number;
+  // Ref (not value) so checkHit always reads the latest combo even before
+  // the next render commits. Prevents a press-after-miss race overwriting
+  // setCombo(0) with stale value + 1.
+  comboRef: React.MutableRefObject<number>;
   currentTime: number;
   onScoreUpdate: (points: number) => void;
   onComboUpdate: (newCombo: number) => void;
@@ -33,7 +36,7 @@ interface UseHitDetectionReturn {
 export function useHitDetection({
   activeArrows,
   processedStepsRef,
-  combo,
+  comboRef,
   currentTime,
   onScoreUpdate,
   onComboUpdate,
@@ -70,7 +73,7 @@ export function useHitDetection({
 
       // Update score and combo
       if (judgment !== Judgment.MISS) {
-        const newCombo = combo + 1;
+        const newCombo = comboRef.current + 1;
         const points = calculatePoints(judgment, newCombo);
 
         onScoreUpdate(points);
@@ -101,7 +104,7 @@ export function useHitDetection({
     [
       activeArrows,
       processedStepsRef,
-      combo,
+      comboRef,
       currentTime,
       onScoreUpdate,
       onComboUpdate,
