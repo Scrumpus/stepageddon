@@ -116,10 +116,6 @@ export const KEY_MAP_P2: Record<string, Direction> = {
   D: Direction.RIGHT,
 };
 
-// When true, render a second arrow lane on the right with independent input
-// and scoring. Hard-coded for now; flip in source to test dual mode.
-export const IS_DUAL_MODE = false;
-
 /**
  * Arrow directions array for iteration
  */

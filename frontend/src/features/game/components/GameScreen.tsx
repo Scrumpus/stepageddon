@@ -4,13 +4,12 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { GameState } from '@/types/common.types';
+import { GameState, GameMode } from '@/types/common.types';
 import { useApp } from '@/app/providers/AppProvider';
 import {
   Judgment,
   HitAccuracy,
   getArrowSpeed,
-  IS_DUAL_MODE,
   KEY_MAP,
   KEY_MAP_P2,
 } from '../types/game.types';
@@ -31,7 +30,8 @@ import PauseOverlay from './PauseOverlay';
 const EMPTY_HIT_ACCURACY: HitAccuracy = { perfect: 0, good: 0, ok: 0, miss: 0 };
 
 function GameScreen() {
-  const { steps, audioRef, songData, setGameResults, resetGame } = useApp();
+  const { steps, audioRef, songData, setGameResults, resetGame, gameMode, setGameMode } = useApp();
+  const isDualMode = gameMode === 'dual';
 
   // Local game state
   const [gameState, setGameState] = useState<GameState>(GameState.PLAYING);
@@ -48,7 +48,7 @@ function GameScreen() {
   const processedStepsRefP1 = useRef<Set<string>>(new Set());
 
   // P2 state — always created so the hook order stays stable; only wired
-  // visually and to the keyboard when IS_DUAL_MODE.
+  // visually and to the keyboard when isDualMode.
   const [score2, setScore2] = useState(0);
   const [combo2, setCombo2] = useState(0);
   const [_maxCombo2, setMaxCombo2] = useState(0);
@@ -103,6 +103,19 @@ function GameScreen() {
     });
   }, [setGameResults]);
 
+  // Switch mode mid-run from the pause overlay. Reset per-player processed
+  // sets and combos so the new mode starts clean (otherwise stale ref entries
+  // would mark already-passed arrows as already-resolved for the freshly
+  // activated player). Score / hit accuracy are NOT reset — those are
+  // cumulative for this run.
+  const handleModeChange = useCallback((newMode: GameMode) => {
+    setGameMode(newMode);
+    processedStepsRefP1.current.clear();
+    processedStepsRefP2.current.clear();
+    setCombo(0);
+    setCombo2(0);
+  }, [setGameMode]);
+
   // Toggle pause
   const togglePause = useCallback(() => {
     setGameState((prev) => {
@@ -134,8 +147,8 @@ function GameScreen() {
   } = useHoldTracking({ combo: combo2, onScoreUpdate: addScore2 });
 
   const mergedHolds = useMemo(
-    () => (IS_DUAL_MODE ? [...activeHolds1, ...activeHolds2] : activeHolds1),
-    [activeHolds1, activeHolds2]
+    () => (isDualMode ? [...activeHolds1, ...activeHolds2] : activeHolds1),
+    [isDualMode, activeHolds1, activeHolds2]
   );
 
   // Game loop hook — pure: emits time + visible arrows for both players.
@@ -153,9 +166,9 @@ function GameScreen() {
   useEffect(() => {
     if (gameState === GameState.PLAYING) {
       updateHolds1(currentTime);
-      if (IS_DUAL_MODE) updateHolds2(currentTime);
+      if (isDualMode) updateHolds2(currentTime);
     }
-  }, [currentTime, gameState, updateHolds1, updateHolds2]);
+  }, [currentTime, gameState, isDualMode, updateHolds1, updateHolds2]);
 
   // Hit detection — P1
   const { checkHit: checkHit1 } = useHitDetection({
@@ -224,7 +237,7 @@ function GameScreen() {
     gameState,
     // Suppress P2 miss bookkeeping in solo mode — otherwise a P1-hit arrow
     // would fire P2 misses behind the scenes and clutter the (unused) P2 state.
-    onMiss: IS_DUAL_MODE ? handleMiss2 : NOOP,
+    onMiss: isDualMode ? handleMiss2 : NOOP,
   });
 
   // Keyboard input — P1 always; P2 only listens to keys when dual-mode is on.
@@ -238,7 +251,7 @@ function GameScreen() {
   });
   const { activeKeys: activeKeys2 } = useKeyboardInput({
     gameState,
-    keyMap: IS_DUAL_MODE ? KEY_MAP_P2 : EMPTY_KEYMAP,
+    keyMap: isDualMode ? KEY_MAP_P2 : EMPTY_KEYMAP,
     onArrowPress: checkHit2,
     onArrowRelease: releaseHold2,
     onPause: togglePause,
@@ -259,7 +272,7 @@ function GameScreen() {
     <div className="min-h-screen flex flex-col">
       <GameHUD
         score={score}
-        score2={IS_DUAL_MODE ? score2 : undefined}
+        score2={isDualMode ? score2 : undefined}
         currentTime={currentTime}
         songInfo={songData}
         gameState={gameState}
@@ -278,7 +291,7 @@ function GameScreen() {
           processedStepsRef={processedStepsRefP1}
         />
 
-        {IS_DUAL_MODE && (
+        {isDualMode && (
           <ArrowLane
             activeArrows={activeArrows}
             activeKeys={activeKeys2}
@@ -296,7 +309,7 @@ function GameScreen() {
           centerPercent={25}
         />
 
-        {IS_DUAL_MODE && (
+        {isDualMode && (
           <JudgmentDisplay
             judgment={judgmentDisplay2}
             combo={combo2}
@@ -305,7 +318,13 @@ function GameScreen() {
         )}
       </div>
 
-      {gameState === GameState.PAUSED && <PauseOverlay onResume={togglePause} />}
+      {gameState === GameState.PAUSED && (
+        <PauseOverlay
+          onResume={togglePause}
+          mode={gameMode}
+          onModeChange={handleModeChange}
+        />
+      )}
     </div>
   );
 }

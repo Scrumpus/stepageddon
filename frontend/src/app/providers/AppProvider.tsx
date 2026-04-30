@@ -4,7 +4,7 @@
  */
 
 import { createContext, useContext, useState, useRef, useEffect, ReactNode } from 'react';
-import { GameState, DifficultyLevel, SongInfo } from '@/types/common.types';
+import { GameState, DifficultyLevel, GameMode, SongInfo } from '@/types/common.types';
 import { Step } from '@/features/game/types/step.types';
 import { GameResults } from '@/features/results/types/results.types';
 import { useToast } from '@/hooks/useToast';
@@ -18,6 +18,8 @@ interface AppContextValue {
   // User inputs
   difficulty: DifficultyLevel;
   setDifficulty: (difficulty: DifficultyLevel) => void;
+  gameMode: GameMode;
+  setGameMode: (mode: GameMode) => void;
 
   // Song data
   songData: SongInfo | null;
@@ -57,6 +59,7 @@ function AppProvider({ children }: AppProviderProps) {
   // Game flow state
   const [gameState, setGameState] = useState<GameState>(GameState.MENU);
   const [difficulty, setDifficulty] = useState<DifficultyLevel>('medium');
+  const [gameMode, setGameMode] = useState<GameMode>('single');
 
   // Song data
   const [songData, setSongData] = useState<SongInfo | null>(null);
@@ -105,6 +108,8 @@ function AppProvider({ children }: AppProviderProps) {
     setGameState,
     difficulty,
     setDifficulty,
+    gameMode,
+    setGameMode,
     songData,
     setSongData,
     steps,
