@@ -33,10 +33,8 @@ function GameScreen() {
   const { steps, audioRef, songData, setGameResults, resetGame, gameMode, setGameMode } = useApp();
   const isDualMode = gameMode === 'dual';
 
-  // Local game state
   const [gameState, setGameState] = useState<GameState>(GameState.PLAYING);
 
-  // P1 state
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
   const [_maxCombo, setMaxCombo] = useState(0);
@@ -46,12 +44,9 @@ function GameScreen() {
     points: number;
   } | null>(null);
   const processedStepsRefP1 = useRef<Set<string>>(new Set());
-  // Synchronously-tracked combo ref. Always update alongside setCombo so
-  // back-to-back press events read the post-write value before re-render.
+
   const comboRefP1 = useRef(0);
 
-  // P2 state — always created so the hook order stays stable; only wired
-  // visually and to the keyboard when isDualMode.
   const [score2, setScore2] = useState(0);
   const [combo2, setCombo2] = useState(0);
   const [_maxCombo2, setMaxCombo2] = useState(0);
@@ -63,8 +58,6 @@ function GameScreen() {
   const processedStepsRefP2 = useRef<Set<string>>(new Set());
   const comboRefP2 = useRef(0);
 
-  // Show judgment feedback. Cancel any pending hide-timeout so back-to-back
-  // hits don't clear the newer judgment when the earlier timer expires.
   const judgmentTimeoutRef = useRef<number | null>(null);
   const judgmentTimeoutRef2 = useRef<number | null>(null);
   const showJudgment = useCallback((judgment: Judgment, points: number) => {
@@ -88,7 +81,6 @@ function GameScreen() {
     }, 500);
   }, []);
 
-  // Handle miss
   const handleMiss = useCallback(() => {
     comboRefP1.current = 0;
     setCombo(0);
@@ -102,7 +94,6 @@ function GameScreen() {
     showJudgment2(Judgment.MISS, 0);
   }, [showJudgment2]);
 
-  // Finish game — P1 results only for now (results screen is single-player).
   const finishGame = useCallback(() => {
     setHitAccuracy((currentAccuracy) => {
       setScore((currentScore) => {
@@ -124,11 +115,6 @@ function GameScreen() {
     });
   }, [setGameResults]);
 
-  // Switch mode mid-run from the pause overlay. Reset per-player processed
-  // sets and combos so the new mode starts clean (otherwise stale ref entries
-  // would mark already-passed arrows as already-resolved for the freshly
-  // activated player). Score / hit accuracy are NOT reset — those are
-  // cumulative for this run.
   const handleModeChange = useCallback((newMode: GameMode) => {
     setGameMode(newMode);
     processedStepsRefP1.current.clear();
@@ -139,7 +125,6 @@ function GameScreen() {
     setCombo2(0);
   }, [setGameMode]);
 
-  // Toggle pause
   const togglePause = useCallback(() => {
     setGameState((prev) => {
       if (prev === GameState.PLAYING) return GameState.PAUSED;
@@ -153,9 +138,6 @@ function GameScreen() {
   const addScore = useCallback((points: number) => setScore((prev) => prev + points), []);
   const addScore2 = useCallback((points: number) => setScore2((prev) => prev + points), []);
 
-  // Hold tracking — one per player. activeHolds for both feeds the loop's
-  // visibility extension so a hold trail rendered in either lane stays on
-  // screen through to release/end.
   const {
     activeHolds: activeHolds1,
     startHold: startHold1,
