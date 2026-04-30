@@ -9,13 +9,14 @@ import { useStepGeneration } from '../hooks';
 import DifficultySelector from './DifficultySelector';
 import FileUploader from './FileUploader';
 import UrlInput from './UrlInput';
+import ModeSelector from './ModeSelector';
 import { PlaylistsTab } from '@/features/playlists/components';
 import { SongsTab } from '@/features/songs/components';
 
 type Tab = 'playlists' | 'songs' | 'create';
 
 function MenuScreen() {
-  const { difficulty, setDifficulty } = useApp();
+  const { difficulty, setDifficulty, gameMode, setGameMode } = useApp();
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [tab, setTab] = useState<Tab>('playlists');
 
@@ -23,10 +24,15 @@ function MenuScreen() {
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="max-w-2xl w-full">
         {/* Title */}
-        <div className="text-center mb-8">
+        <div className="text-center mb-4">
           <h1 className="text-6xl font-bold mb-4 text-game-primary">
             Stepageddon
           </h1>
+        </div>
+
+        {/* Mode toggle (applies to all tabs) */}
+        <div className="flex justify-center mb-6">
+          <ModeSelector mode={gameMode} onModeChange={setGameMode} />
         </div>
 
         {/* Tabs */}

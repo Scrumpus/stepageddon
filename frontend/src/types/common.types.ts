@@ -20,6 +20,11 @@ export interface SongInfo {
 export type DifficultyLevel = 'beginner' | 'easy' | 'medium' | 'hard' | 'challenge';
 
 /**
+ * Single-player or two-player local mode.
+ */
+export type GameMode = 'single' | 'dual';
+
+/**
  * Game state machine states
  */
 export enum GameState {

@@ -13,6 +13,13 @@ interface ArrowLaneProps {
   activeHolds: ActiveHold[];
   arrowSpeed: number;  // Pixels per second for calculating hold trail length
   tempo: number;       // BPM for beat-synced spritesheet animation
+  // Horizontal center of this lane as a percent of the playfield width.
+  // 50 = single centered lane (default). 25/75 = left/right lane in dual mode.
+  centerPercent?: number;
+  // This player's processed-steps set. Hit/missed taps in this set are
+  // hidden so the arrow vanishes on hit (held holds remain visible until
+  // the hold ends).
+  processedStepsRef?: React.MutableRefObject<Set<string>>;
 }
 
 // Arrow rotation for each direction (set to 0 when using pre-rotated PNGs)
@@ -225,20 +232,30 @@ function HoldTrail({
   );
 }
 
-function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }: ArrowLaneProps) {
+function ArrowLane({
+  activeArrows,
+  activeKeys,
+  activeHolds,
+  arrowSpeed,
+  tempo,
+  centerPercent = 50,
+  processedStepsRef,
+}: ArrowLaneProps) {
   const arrowSize = VISUAL_CONFIG.ARROW_SIZE;
   const gap = 16;
   const totalWidth = (arrowSize * 4) + (gap * 3);
   const startX = -totalWidth / 2;
 
   return (
-    <div className="flex-1 relative overflow-hidden bg-gradient-to-b from-black/50 to-transparent">
+    <div className="absolute inset-0 pointer-events-none">
 
       {/* Target Zone (Receptors) */}
       <div
-        className="absolute left-1/2 transform -translate-x-1/2 flex z-20"
+        className="absolute flex z-20"
         style={{
           top: `${VISUAL_CONFIG.HIT_ZONE_Y}px`,
+          left: `${centerPercent}%`,
+          transform: 'translateX(-50%)',
           gap: `${gap}px`,
         }}
       >
@@ -281,13 +298,20 @@ function ArrowLane({ activeArrows, activeKeys, activeHolds, arrowSpeed, tempo }:
         // glow only lights up while the player is still pressing the key.
         const isActivelyHeld = !!activeHold && !activeHold.released;
 
+        // Hide taps the player has already resolved (hit or missed). Holds
+        // stay visible while the player is still in the middle of the hold
+        // so the trail keeps rendering through to release/end.
+        if (processedStepsRef?.current.has(arrowKey) && !activeHold) {
+          return null;
+        }
+
         return (
           <div
             key={arrowKey}
             className="absolute"
             style={{
               top: `${arrow.y}px`,
-              left: `calc(50% + ${x}px)`,
+              left: `calc(${centerPercent}% + ${x}px)`,
               width: arrowSize,
               // Group head + trail into one stacking context so a later arrow
               // (later in DOM = later in time) renders entirely on top of any

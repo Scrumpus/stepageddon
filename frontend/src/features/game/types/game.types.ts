@@ -77,8 +77,12 @@ export const HOLD_SCORING = {
  */
 export const VISUAL_CONFIG = {
   HIT_ZONE_Y: 80,          // Y position of hit zone (near top)
-  ARROW_SIZE: 72,          // Arrow size in pixels
-  VISIBLE_WINDOW: 2,       // Seconds of lookahead for visible arrows
+  ARROW_SIZE: 90,          // Arrow size in pixels
+  // Seconds of lookahead. Arrows spawn at HIT_ZONE_Y + VISIBLE_WINDOW *
+  // arrowSpeed; with the playfield clipped via overflow-hidden, the arrow's
+  // initial Y lands well below the bottom edge so it slides naturally up
+  // into view rather than popping in mid-air.
+  VISIBLE_WINDOW: 5,
   SPAWN_Y: 700,            // Y position where arrows spawn (bottom)
   // Speed is calculated based on tempo: faster tempo = faster arrows
   BASE_SPEED: 200,         // Base pixels per second at 100 BPM
@@ -94,13 +98,26 @@ export function getArrowSpeed(tempo: number): number {
 }
 
 /**
- * Key mapping for arrow controls
+ * Key mapping for player 1 (arrow keys)
  */
 export const KEY_MAP: Record<string, Direction> = {
   'ArrowLeft': Direction.LEFT,
   'ArrowDown': Direction.DOWN,
   'ArrowUp': Direction.UP,
   'ArrowRight': Direction.RIGHT
+};
+
+// Player 2 uses WASD. e.key is case-sensitive, so cover both letter cases for
+// when caps lock is on or shift is held.
+export const KEY_MAP_P2: Record<string, Direction> = {
+  a: Direction.LEFT,
+  A: Direction.LEFT,
+  s: Direction.DOWN,
+  S: Direction.DOWN,
+  w: Direction.UP,
+  W: Direction.UP,
+  d: Direction.RIGHT,
+  D: Direction.RIGHT,
 };
 
 /**
