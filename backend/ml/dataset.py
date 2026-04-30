@@ -450,6 +450,73 @@ def compute_onset_prior(
     return float(p)
 
 
+def compute_type_class_distribution(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+    sample_limit: int = 400,
+) -> np.ndarray:
+    """Empirical P(class | onset) over {tap, jump, hold_start}.
+
+    Reads `labels_<diff>` arrays directly from the v3 npz files.
+    Returns a 3-vector that sums to 1 (well-defined as long as any onsets
+    were observed; falls back to uniform otherwise).
+
+    Used for two things:
+      1. Bias-init the type head's final layer to log(prior).
+      2. Derive inverse-frequency class weights for the type-head CE loss.
+    Both push the model away from the "always predict tap" trivial solution.
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    if len(idxs) > sample_limit:
+        step = max(1, len(idxs) // sample_limit)
+        idxs = idxs[::step][:sample_limit]
+    counts = np.zeros(3, dtype=np.int64)
+    for i in idxs:
+        entry = manifest[i]
+        labels = np.load(data_dir / entry['filename'])[entry['labels_key']]
+        # labels: 0=none, 1=tap, 2=jump, 3=hold_start
+        counts[0] += int((labels == 1).sum())
+        counts[1] += int((labels == 2).sum())
+        counts[2] += int((labels == 3).sum())
+    total = counts.sum()
+    if total == 0:
+        logger.warning("No onsets found while computing type prior; using uniform.")
+        return np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
+    prior = counts.astype(np.float64) / float(total)
+    logger.info(
+        f"Type class distribution: tap={prior[0]:.4f} "
+        f"jump={prior[1]:.4f} hold_start={prior[2]:.4f} "
+        f"(counts={counts.tolist()})"
+    )
+    return prior.astype(np.float32)
+
+
+def class_weights_from_prior(
+    prior: np.ndarray,
+    smoothing: float = 0.5,
+    max_weight: float = 12.0,
+) -> torch.Tensor:
+    """Inverse-frequency class weights with sqrt smoothing + a cap.
+
+    Pure inverse frequency on a heavily skewed prior (e.g. tap=0.9,
+    hold=0.03) produces weights like [1, 9, 30] which destabilizes
+    training — the type loss explodes whenever the rare class shows up.
+    Sqrt smoothing (`prior ** smoothing`) flattens the ratio, and the cap
+    prevents any single class from dominating the gradient.
+
+    Returns a length-3 tensor in {tap, jump, hold_start} order, normalized
+    so the mean weight is 1.0 (preserves overall type-loss magnitude).
+    """
+    p = np.asarray(prior, dtype=np.float64).clip(min=1e-6)
+    raw = 1.0 / (p ** smoothing)
+    raw = np.minimum(raw, max_weight)
+    raw = raw / raw.mean()  # mean weight = 1
+    logger.info(f"Type class weights (smoothing={smoothing}): {raw.tolist()}")
+    return torch.from_numpy(raw.astype(np.float32))
+
+
 def compute_default_density_per_difficulty(
     manifest_path: str,
     data_dir: str,

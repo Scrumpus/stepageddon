@@ -18,7 +18,7 @@ scalar linear.
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -256,6 +256,9 @@ class StepChartModel(nn.Module):
     """
 
     N_NOTE_TYPES = 3
+    TYPE_TAP = 0
+    TYPE_JUMP = 1
+    TYPE_HOLD_START = 2
 
     def __init__(
         self,
@@ -312,6 +315,27 @@ class StepChartModel(nn.Module):
         assert isinstance(final, nn.Linear)
         nn.init.constant_(final.bias, bias)
 
+    def set_type_prior(self, priors) -> None:
+        """Initialize the type head's final bias to log(prior) per class.
+
+        priors: iterable of length N_NOTE_TYPES giving P(class | onset)
+            for {tap, jump, hold_start}. With this init, a freshly built
+            model produces softmax probabilities matching the empirical
+            class distribution at step 0, which is the right starting
+            point on a heavily imbalanced 3-way head.
+        """
+        priors = torch.as_tensor(list(priors), dtype=torch.float32)
+        assert priors.numel() == self.N_NOTE_TYPES, (
+            f"expected {self.N_NOTE_TYPES} priors, got {priors.numel()}"
+        )
+        priors = priors.clamp_min(1e-6)
+        priors = priors / priors.sum()
+        log_priors = torch.log(priors)
+        final = self.type_head[-1]
+        assert isinstance(final, nn.Linear)
+        with torch.no_grad():
+            final.bias.copy_(log_priors)
+
     def forward(
         self,
         mel: torch.Tensor,
@@ -364,11 +388,24 @@ class StepChartLoss(nn.Module):
         pos_weight: float = 10.0,
         type_weight: float = 1.0,
         duration_weight: float = 1.0,
+        type_class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.register_buffer('pos_weight', torch.tensor(float(pos_weight)))
         self.type_weight = type_weight
         self.duration_weight = duration_weight
+        # Per-class CE weights for the type head ({tap, jump, hold_start}).
+        # Without these, the head collapses to "always predict tap" because
+        # taps dominate the imbalanced supervision. Registered as a buffer
+        # so it moves with .to(device) and survives state-dict round-trips.
+        if type_class_weights is None:
+            type_class_weights = torch.ones(3, dtype=torch.float32)
+        else:
+            type_class_weights = torch.as_tensor(
+                type_class_weights, dtype=torch.float32
+            )
+            assert type_class_weights.numel() == 3
+        self.register_buffer('type_class_weights', type_class_weights)
 
     def forward(
         self,
@@ -386,7 +423,11 @@ class StepChartLoss(nn.Module):
         B, T, C = type_logits.shape
         type_flat = type_logits.reshape(-1, C)
         target_flat = type_target.reshape(-1)
-        type_loss = F.cross_entropy(type_flat, target_flat, ignore_index=-100)
+        type_loss = F.cross_entropy(
+            type_flat, target_flat,
+            weight=self.type_class_weights,
+            ignore_index=-100,
+        )
 
         # Duration loss: only at hold_start frames (type_target == HOLD_START_CLASS)
         hold_mask = (type_target == self.HOLD_START_CLASS)  # [B, T]

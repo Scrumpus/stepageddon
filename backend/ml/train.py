@@ -47,9 +47,11 @@ from ml.dataset import (
     DENSITY_STD,
     FRAMES_PER_SECOND,
     StepChartDataset,
+    class_weights_from_prior,
     compute_default_density_per_difficulty,
     compute_note_counts,
     compute_onset_prior,
+    compute_type_class_distribution,
     make_note_weighted_sampler,
     split_entries_by_song,
 )
@@ -94,6 +96,7 @@ class BuildOutputs:
     note_counts: np.ndarray
     onset_prior: float
     default_density_by_id: torch.Tensor
+    type_prior: np.ndarray  # [3] P(class | onset) over {tap, jump, hold_start}
 
 
 def build_dataloaders(args) -> BuildOutputs:
@@ -116,6 +119,9 @@ def build_dataloaders(args) -> BuildOutputs:
     # Per-entry note counts (for weighted sampler + onset prior)
     note_counts = compute_note_counts(full_dataset.entries, str(data_dir))
     onset_prior = compute_onset_prior(full_dataset.entries, str(data_dir), train_idx)
+    type_prior = compute_type_class_distribution(
+        full_dataset.entries, str(data_dir), train_idx,
+    )
 
     # Training: random chunks w/ augmentation + note-weighted sampling
     train_subset = Subset(full_dataset, train_idx)
@@ -172,10 +178,16 @@ def build_dataloaders(args) -> BuildOutputs:
         note_counts=note_counts,
         onset_prior=onset_prior,
         default_density_by_id=default_density_by_id,
+        type_prior=type_prior,
     )
 
 
-def build_model(args, onset_prior: float, device: torch.device) -> StepChartModel:
+def build_model(
+    args,
+    onset_prior: float,
+    type_prior: np.ndarray,
+    device: torch.device,
+) -> StepChartModel:
     model = StepChartModel(
         n_mels=80,
         hidden_dim=args.hidden_dim,
@@ -185,6 +197,7 @@ def build_model(args, onset_prior: float, device: torch.device) -> StepChartMode
         dropout=args.dropout,
     ).to(device)
     model.set_onset_prior(onset_prior)
+    model.set_type_prior(type_prior)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
     return model
@@ -209,15 +222,23 @@ def build_optimizer_and_scheduler(
     return optimizer, scheduler
 
 
-def build_loss(onset_prior: float, args) -> StepChartLoss:
+def build_loss(
+    onset_prior: float, type_prior: np.ndarray, args,
+) -> StepChartLoss:
     # pos_weight = (1 - p) / p gives unit-mean BCE; clamp to avoid extremes
     p = max(onset_prior, 1e-5)
     pos_weight = min(max((1.0 - p) / p, 1.0), 200.0)
     logger.info(f"BCE pos_weight = {pos_weight:.2f} (from onset_prior={p:.4f})")
+    type_class_weights = class_weights_from_prior(
+        type_prior,
+        smoothing=args.type_weight_smoothing,
+        max_weight=args.type_weight_cap,
+    )
     return StepChartLoss(
         pos_weight=pos_weight,
         type_weight=args.type_weight,
         duration_weight=args.duration_weight,
+        type_class_weights=type_class_weights,
     )
 
 
@@ -390,6 +411,14 @@ def validate(
     type_correct = 0
     type_total = 0
 
+    # Per-class confusion for {tap=0, jump=1, hold_start=2}.
+    # tp[c] = correctly predicted as c; fp[c] = predicted c but actually
+    # other; fn[c] = actually c but predicted other. Computed only on
+    # frames with a true onset (mask = type_target >= 0).
+    type_tp = np.zeros(3, dtype=np.int64)
+    type_fp = np.zeros(3, dtype=np.int64)
+    type_fn = np.zeros(3, dtype=np.int64)
+
     dur_abs_errors = []
 
     for mel, difficulty, density, onset_soft, type_target, duration_target in loader:
@@ -423,8 +452,16 @@ def validate(
         type_pred = type_logits.argmax(dim=-1)  # [B, T]
         mask = type_target >= 0  # [B, T]
         if mask.any():
-            type_correct += (type_pred[mask] == type_target[mask]).sum().item()
-            type_total += int(mask.sum().item())
+            tp_flat = type_pred[mask].cpu().numpy()
+            tt_flat = type_target[mask].cpu().numpy()
+            type_correct += int((tp_flat == tt_flat).sum())
+            type_total += int(tt_flat.size)
+            for c in range(3):
+                pred_c = (tp_flat == c)
+                true_c = (tt_flat == c)
+                type_tp[c] += int((pred_c & true_c).sum())
+                type_fp[c] += int((pred_c & ~true_c).sum())
+                type_fn[c] += int((~pred_c & true_c).sum())
 
         # Duration MAE on hold_start frames
         hold_mask = (type_target == 2)  # hold_start class
@@ -439,6 +476,17 @@ def validate(
 
     dur_mae = float(np.concatenate(dur_abs_errors).mean()) if dur_abs_errors else 0.0
 
+    def _f1(tp, fp, fn):
+        prec_c = tp / max(tp + fp, 1)
+        rec_c = tp / max(tp + fn, 1)
+        f1_c = 2 * prec_c * rec_c / (prec_c + rec_c + 1e-8)
+        return float(prec_c), float(rec_c), float(f1_c)
+
+    tap_p, tap_r, tap_f1 = _f1(type_tp[0], type_fp[0], type_fn[0])
+    jump_p, jump_r, jump_f1 = _f1(type_tp[1], type_fp[1], type_fn[1])
+    hold_p, hold_r, hold_f1 = _f1(type_tp[2], type_fp[2], type_fn[2])
+    type_macro_f1 = (tap_f1 + jump_f1 + hold_f1) / 3.0
+
     return {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
@@ -448,6 +496,10 @@ def validate(
         'tol_recall': rec,
         'tol_f1': f1,
         'type_acc': type_correct / max(type_total, 1),
+        'tap_f1': tap_f1, 'tap_p': tap_p, 'tap_r': tap_r,
+        'jump_f1': jump_f1, 'jump_p': jump_p, 'jump_r': jump_r,
+        'hold_f1': hold_f1, 'hold_p': hold_p, 'hold_r': hold_r,
+        'type_macro_f1': type_macro_f1,
         'dur_mae': dur_mae,
     }
 
@@ -468,6 +520,7 @@ def save_checkpoint(
     default_density_by_id: torch.Tensor,
     mel_mean: float,
     mel_std: float,
+    type_prior: np.ndarray,
     args,
 ) -> None:
     ckpt = {
@@ -485,6 +538,10 @@ def save_checkpoint(
         # apply the exact same input normalization the model was trained on.
         'mel_mean': float(mel_mean),
         'mel_std': float(mel_std),
+        # Empirical P(class | onset) over {tap, jump, hold_start} on the
+        # train split. Inference uses this for logit adjustment to undo
+        # the prior bias learned by the type head.
+        'type_prior': [float(x) for x in type_prior],
         'args': vars(args) if not isinstance(args, dict) else args,
         'git_sha': _git_sha(),
     }
@@ -512,6 +569,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--warmup-epochs', type=float, default=2.0)
     parser.add_argument('--type-weight', type=float, default=1.0)
     parser.add_argument('--duration-weight', type=float, default=1.0)
+    parser.add_argument('--type-weight-smoothing', type=float, default=0.5,
+                        help='Exponent for inverse-frequency type-class weights '
+                             '(0=uniform, 1=raw inverse-frequency)')
+    parser.add_argument('--type-weight-cap', type=float, default=12.0,
+                        help='Max per-class CE weight after smoothing')
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--num-workers', type=int, default=2)
     parser.add_argument('--ema-decay', type=float, default=0.999)
@@ -534,8 +596,8 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     built = build_dataloaders(args)
-    model = build_model(args, built.onset_prior, device)
-    criterion = build_loss(built.onset_prior, args).to(device)
+    model = build_model(args, built.onset_prior, built.type_prior, device)
+    criterion = build_loss(built.onset_prior, built.type_prior, args).to(device)
     steps_per_epoch = max(1, len(built.train_loader))
     optimizer, scheduler = build_optimizer_and_scheduler(model, args, steps_per_epoch)
     scaler = GradScaler('cuda')
@@ -587,6 +649,11 @@ def main():
             f"(P={val_metrics['tol_precision']:.3f} "
             f"R={val_metrics['tol_recall']:.3f}) "
             f"type_acc={val_metrics['type_acc']:.3f} "
+            f"type_F1[tap/jump/hold]="
+            f"{val_metrics['tap_f1']:.3f}/"
+            f"{val_metrics['jump_f1']:.3f}/"
+            f"{val_metrics['hold_f1']:.3f} "
+            f"(macro={val_metrics['type_macro_f1']:.3f}) "
             f"dur_mae={val_metrics['dur_mae']:.3f}s "
             f"| lr={lr:.2e} | {elapsed:.1f}s"
         )
@@ -597,6 +664,7 @@ def main():
             optimizer, scheduler, scaler, val_metrics,
             built.default_density_by_id,
             built.full_dataset.mel_mean, built.full_dataset.mel_std,
+            built.type_prior,
             args,
         )
 
