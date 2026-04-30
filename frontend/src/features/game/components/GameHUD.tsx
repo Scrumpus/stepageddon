@@ -1,5 +1,6 @@
 /**
- * Game HUD - displays score, combo, song info, and controls
+ * Game HUD - displays score(s), song info, and controls.
+ * Combo lives under the per-player judgment, not in the HUD.
  */
 
 import { Pause, Play, Home } from 'lucide-react';
@@ -7,7 +8,8 @@ import { GameState, SongInfo } from '@/types/common.types';
 
 interface GameHUDProps {
   score: number;
-  combo: number;
+  // Optional P2 score; when present, the score block shows P1/P2 side by side.
+  score2?: number;
   currentTime: number;
   songInfo: SongInfo;
   gameState: GameState;
@@ -17,27 +19,29 @@ interface GameHUDProps {
 
 function GameHUD({
   score,
-  combo,
+  score2,
   currentTime,
   songInfo,
   gameState,
   onPause,
   onReturnToMenu,
 }: GameHUDProps) {
+  const dualMode = score2 !== undefined;
   return (
     <>
       {/* Header */}
       <div className="bg-black/50 backdrop-blur-sm p-4 flex items-center justify-between">
         <div className="flex items-center gap-6">
           <div>
-            <div className="text-sm text-gray-400">Score</div>
+            <div className="text-sm text-gray-400">{dualMode ? 'P1 Score' : 'Score'}</div>
             <div className="text-2xl font-bold">{score.toLocaleString()}</div>
           </div>
-
-          <div>
-            <div className="text-sm text-gray-400">Combo</div>
-            <div className="text-2xl font-bold text-game-accent">{combo}x</div>
-          </div>
+          {dualMode && (
+            <div>
+              <div className="text-sm text-gray-400">P2 Score</div>
+              <div className="text-2xl font-bold">{score2!.toLocaleString()}</div>
+            </div>
+          )}
         </div>
 
         <div className="text-center">

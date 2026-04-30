@@ -94,7 +94,7 @@ export function getArrowSpeed(tempo: number): number {
 }
 
 /**
- * Key mapping for arrow controls
+ * Key mapping for player 1 (arrow keys)
  */
 export const KEY_MAP: Record<string, Direction> = {
   'ArrowLeft': Direction.LEFT,
@@ -102,6 +102,23 @@ export const KEY_MAP: Record<string, Direction> = {
   'ArrowUp': Direction.UP,
   'ArrowRight': Direction.RIGHT
 };
+
+// Player 2 uses WASD. e.key is case-sensitive, so cover both letter cases for
+// when caps lock is on or shift is held.
+export const KEY_MAP_P2: Record<string, Direction> = {
+  a: Direction.LEFT,
+  A: Direction.LEFT,
+  s: Direction.DOWN,
+  S: Direction.DOWN,
+  w: Direction.UP,
+  W: Direction.UP,
+  d: Direction.RIGHT,
+  D: Direction.RIGHT,
+};
+
+// When true, render a second arrow lane on the right with independent input
+// and scoring. Hard-coded for now; flip in source to test dual mode.
+export const IS_DUAL_MODE = false;
 
 /**
  * Arrow directions array for iteration

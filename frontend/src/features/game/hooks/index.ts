@@ -3,3 +3,4 @@ export { useHitDetection } from './useHitDetection';
 export { useKeyboardInput } from './useKeyboardInput';
 export { useAudioPlayer } from './useAudioPlayer';
 export { useHoldTracking } from './useHoldTracking';
+export { useMissTracking } from './useMissTracking';
