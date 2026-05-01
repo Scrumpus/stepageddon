@@ -270,7 +270,7 @@ class MLChartGenerator:
         device: str = None,
         chunk_frames: int = 500,
         overlap_frames: int = 100,
-        confidence_threshold: float = 0.3,
+        confidence_threshold: Optional[float] = None,
         min_note_gap: float = 0.05,
         snap_to_beats: bool = True,
         type_logit_adjust: float = 1.0,
@@ -303,7 +303,14 @@ class MLChartGenerator:
         self.device = torch.device(device)
         self.chunk_frames = chunk_frames
         self.overlap_frames = overlap_frames
-        self.confidence_threshold = confidence_threshold
+        # confidence_threshold may be None at construction; load_model will
+        # populate it from the checkpoint's saved best_threshold (calibrated
+        # by the validation F1 sweep). Falls back to 0.3 if neither the
+        # constructor nor the checkpoint provides a value.
+        self._confidence_threshold_override = confidence_threshold
+        self.confidence_threshold = (
+            float(confidence_threshold) if confidence_threshold is not None else 0.3
+        )
         self.min_note_gap = min_note_gap
         self.snap_to_beats = snap_to_beats
         self.type_logit_adjust = float(type_logit_adjust)
@@ -392,6 +399,25 @@ class MLChartGenerator:
             f"Type prior [{source}]: tap={tp[0]:.3f} "
             f"jump={tp[1]:.3f} hold_start={tp[2]:.3f}"
         )
+
+        # Pull the calibrated decision threshold if the checkpoint stored
+        # one. Caller-supplied confidence_threshold always wins.
+        ckpt_thr = checkpoint.get('best_threshold')
+        if self._confidence_threshold_override is not None:
+            logger.info(
+                f"Onset threshold = {self.confidence_threshold:.3f} (caller override)"
+            )
+        elif ckpt_thr is not None:
+            self.confidence_threshold = float(ckpt_thr)
+            logger.info(
+                f"Onset threshold = {self.confidence_threshold:.3f} "
+                f"(from checkpoint best_threshold)"
+            )
+        else:
+            logger.warning(
+                f"Checkpoint has no best_threshold; using default "
+                f"{self.confidence_threshold:.3f}. Retrain to calibrate."
+            )
 
         # Pull mel whitening stats if present. Their presence is also the
         # signal that this checkpoint was trained on the v2 fixed-dB pipeline,

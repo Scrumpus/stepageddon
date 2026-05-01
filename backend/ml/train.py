@@ -188,6 +188,7 @@ def build_model(
     type_prior: np.ndarray,
     device: torch.device,
 ) -> StepChartModel:
+    tcn_dilations = tuple(int(x) for x in args.tcn_dilations.split(','))
     model = StepChartModel(
         n_mels=80,
         hidden_dim=args.hidden_dim,
@@ -195,6 +196,8 @@ def build_model(
         n_transformer_layers=args.n_layers,
         n_difficulties=5,
         dropout=args.dropout,
+        tcn_dilations=tcn_dilations,
+        onset_head_layers=args.onset_head_layers,
     ).to(device)
     model.set_onset_prior(onset_prior)
     model.set_type_prior(type_prior)
@@ -225,10 +228,20 @@ def build_optimizer_and_scheduler(
 def build_loss(
     onset_prior: float, type_prior: np.ndarray, args,
 ) -> StepChartLoss:
-    # pos_weight = (1 - p) / p gives unit-mean BCE; clamp to avoid extremes
+    # Default to sqrt((1-p)/p) instead of (1-p)/p. The unit-mean formula
+    # crushes precision (BCE rewards "predict positive everywhere" given how
+    # rare positives are at frame level); the sqrt variant balances P/R far
+    # better in practice. CLI override available via --pos-weight.
     p = max(onset_prior, 1e-5)
-    pos_weight = min(max((1.0 - p) / p, 1.0), 200.0)
-    logger.info(f"BCE pos_weight = {pos_weight:.2f} (from onset_prior={p:.4f})")
+    if args.pos_weight is not None:
+        pos_weight = float(args.pos_weight)
+        logger.info(f"BCE pos_weight = {pos_weight:.2f} (override)")
+    else:
+        pos_weight = min(max(((1.0 - p) / p) ** 0.5, 1.0), 50.0)
+        logger.info(
+            f"BCE pos_weight = {pos_weight:.2f} (sqrt((1-p)/p) "
+            f"from onset_prior={p:.4f})"
+        )
     type_class_weights = class_weights_from_prior(
         type_prior,
         smoothing=args.type_weight_smoothing,
@@ -239,6 +252,7 @@ def build_loss(
         type_weight=args.type_weight,
         duration_weight=args.duration_weight,
         type_class_weights=type_class_weights,
+        focal_gamma=args.focal_gamma,
     )
 
 
@@ -472,7 +486,18 @@ def validate(
 
     pred_concat = np.concatenate(all_pred, axis=0).reshape(-1, 1)
     true_concat = np.concatenate(all_true, axis=0).reshape(-1, 1)
-    prec, rec, f1 = tolerance_f1(pred_concat, true_concat, tol_frames=tol_frames)
+    # Sweep decision thresholds and report F1 at the best operating point.
+    # A fixed 0.5 threshold is meaningless once the model's calibration
+    # shifts; the headline metric should be peak F1.
+    best_f1, best_thr, best_p, best_r = -1.0, 0.5, 0.0, 0.0
+    for thr in np.arange(0.30, 0.86, 0.05):
+        p_, r_, f_ = tolerance_f1(
+            pred_concat, true_concat,
+            tol_frames=tol_frames, threshold=float(thr),
+        )
+        if f_ > best_f1:
+            best_f1, best_thr, best_p, best_r = f_, float(thr), p_, r_
+    prec, rec, f1 = best_p, best_r, best_f1
 
     dur_mae = float(np.concatenate(dur_abs_errors).mean()) if dur_abs_errors else 0.0
 
@@ -495,6 +520,7 @@ def validate(
         'tol_precision': prec,
         'tol_recall': rec,
         'tol_f1': f1,
+        'best_thr': float(best_thr),
         'type_acc': type_correct / max(type_total, 1),
         'tap_f1': tap_f1, 'tap_p': tap_p, 'tap_r': tap_r,
         'jump_f1': jump_f1, 'jump_p': jump_p, 'jump_r': jump_r,
@@ -533,6 +559,10 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
         'metrics': metrics,
+        # Persist the best onset decision threshold from the validation
+        # sweep so inference can use the calibrated value instead of a
+        # hardcoded 0.5/0.3. Falls back to 0.5 if the metric was missing.
+        'best_threshold': float(metrics.get('best_thr', 0.5)),
         'default_density_by_id': default_density_by_id.tolist(),
         # Mel whitening stats live alongside the weights so inference can
         # apply the exact same input normalization the model was trained on.
@@ -567,13 +597,30 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--warmup-epochs', type=float, default=2.0)
-    parser.add_argument('--type-weight', type=float, default=1.0)
+    parser.add_argument('--type-weight', type=float, default=2.0,
+                        help='Multiplier on type-head CE loss; raised from 1.0 '
+                             'because the type head is gradient-starved relative '
+                             'to onset BCE')
     parser.add_argument('--duration-weight', type=float, default=1.0)
-    parser.add_argument('--type-weight-smoothing', type=float, default=0.5,
+    parser.add_argument('--type-weight-smoothing', type=float, default=0.7,
                         help='Exponent for inverse-frequency type-class weights '
                              '(0=uniform, 1=raw inverse-frequency)')
     parser.add_argument('--type-weight-cap', type=float, default=12.0,
                         help='Max per-class CE weight after smoothing')
+    parser.add_argument('--pos-weight', type=float, default=None,
+                        help='Override BCE pos_weight on the onset head. '
+                             'Default = sqrt((1-p)/p) capped at 50.')
+    parser.add_argument('--focal-gamma', type=float, default=2.0,
+                        help='Focal-loss gamma on the onset head BCE. '
+                             '0 disables focal weighting; 2.0 is standard.')
+    parser.add_argument('--tcn-dilations', type=str, default='1,2,4,8,16,32',
+                        help='Comma-separated dilations for the TCN stack')
+    parser.add_argument('--onset-head-layers', type=int, default=3,
+                        help='Number of hidden Linear→GELU blocks in the onset head')
+    parser.add_argument('--plateau-patience', type=int, default=4,
+                        help='Patience (epochs) for ReduceLROnPlateau on tol_f1')
+    parser.add_argument('--plateau-factor', type=float, default=0.5,
+                        help='LR multiplier when ReduceLROnPlateau triggers')
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--num-workers', type=int, default=2)
     parser.add_argument('--ema-decay', type=float, default=0.999)
@@ -600,6 +647,14 @@ def main():
     criterion = build_loss(built.onset_prior, built.type_prior, args).to(device)
     steps_per_epoch = max(1, len(built.train_loader))
     optimizer, scheduler = build_optimizer_and_scheduler(model, args, steps_per_epoch)
+    # Plateau scheduler runs in addition to the per-step cosine: if tol_f1
+    # stalls for `plateau-patience` epochs, multiply LR by `plateau-factor`.
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max',
+        factor=args.plateau_factor,
+        patience=args.plateau_patience,
+        min_lr=1e-6,
+    )
     scaler = GradScaler('cuda')
 
     # EMA over raw parameters (not buffers)
@@ -635,6 +690,7 @@ def main():
             ema_model.module, built.val_loader, criterion, device,
             tol_frames=args.tol_frames,
         )
+        plateau_scheduler.step(val_metrics['tol_f1'])
 
         lr = optimizer.param_groups[0]['lr']
         elapsed = time.time() - t0
@@ -647,7 +703,8 @@ def main():
             f"| val_loss={val_metrics['loss']:.4f} "
             f"tol_f1={val_metrics['tol_f1']:.3f} "
             f"(P={val_metrics['tol_precision']:.3f} "
-            f"R={val_metrics['tol_recall']:.3f}) "
+            f"R={val_metrics['tol_recall']:.3f} "
+            f"thr={val_metrics['best_thr']:.2f}) "
             f"type_acc={val_metrics['type_acc']:.3f} "
             f"type_F1[tap/jump/hold]="
             f"{val_metrics['tap_f1']:.3f}/"
@@ -675,9 +732,13 @@ def main():
                 optimizer, scheduler, scaler, val_metrics,
                 built.default_density_by_id,
                 built.full_dataset.mel_mean, built.full_dataset.mel_std,
+                built.type_prior,
                 args,
             )
-            logger.info(f"  -> New best (tol_f1={best_f1:.3f})")
+            logger.info(
+                f"  -> New best (tol_f1={best_f1:.3f} "
+                f"thr={val_metrics['best_thr']:.2f})"
+            )
 
     logger.info(f"Training complete. Best tol_f1: {best_f1:.3f}")
 

@@ -268,7 +268,8 @@ class StepChartModel(nn.Module):
         n_transformer_layers: int = 4,
         n_difficulties: int = 5,
         dropout: float = 0.1,
-        tcn_dilations: Tuple[int, ...] = (1, 2, 4, 8),
+        tcn_dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+        onset_head_layers: int = 3,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -283,12 +284,18 @@ class StepChartModel(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_dim)
 
-        self.onset_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        # Deeper onset head: onset is the harder of the two heads, so give it
+        # extra capacity. `onset_head_layers` counts hidden Linear→GELU blocks
+        # before the final 1-unit projection (default 3 → was 1).
+        onset_layers: list = []
+        for _ in range(max(1, onset_head_layers)):
+            onset_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+        onset_layers.append(nn.Linear(hidden_dim, 1))
+        self.onset_head = nn.Sequential(*onset_layers)
         self.type_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -389,11 +396,13 @@ class StepChartLoss(nn.Module):
         type_weight: float = 1.0,
         duration_weight: float = 1.0,
         type_class_weights: Optional[torch.Tensor] = None,
+        focal_gamma: float = 0.0,
     ):
         super().__init__()
         self.register_buffer('pos_weight', torch.tensor(float(pos_weight)))
         self.type_weight = type_weight
         self.duration_weight = duration_weight
+        self.focal_gamma = float(focal_gamma)
         # Per-class CE weights for the type head ({tap, jump, hold_start}).
         # Without these, the head collapses to "always predict tap" because
         # taps dominate the imbalanced supervision. Registered as a buffer
@@ -416,9 +425,23 @@ class StepChartLoss(nn.Module):
         type_target: torch.Tensor,     # [B, T] long, -100 where no note
         duration_target: torch.Tensor, # [B, T] float, seconds at hold_start, 0 elsewhere
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        onset_loss = F.binary_cross_entropy_with_logits(
-            onset_logits, onset_soft, pos_weight=self.pos_weight
-        )
+        if self.focal_gamma > 0.0:
+            # Focal BCE: down-weight easy examples (mostly negatives) by
+            # (1 - p_t)^gamma. Combined with pos_weight, this fights the
+            # precision collapse caused by too many low-confidence positives.
+            bce = F.binary_cross_entropy_with_logits(
+                onset_logits, onset_soft, pos_weight=self.pos_weight,
+                reduction='none',
+            )
+            with torch.no_grad():
+                p = torch.sigmoid(onset_logits)
+                p_t = onset_soft * p + (1.0 - onset_soft) * (1.0 - p)
+                focal_w = (1.0 - p_t).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
+            onset_loss = (focal_w * bce).mean()
+        else:
+            onset_loss = F.binary_cross_entropy_with_logits(
+                onset_logits, onset_soft, pos_weight=self.pos_weight
+            )
 
         B, T, C = type_logits.shape
         type_flat = type_logits.reshape(-1, C)
