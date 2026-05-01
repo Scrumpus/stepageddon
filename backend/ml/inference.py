@@ -314,6 +314,11 @@ class MLChartGenerator:
         self.min_note_gap = min_note_gap
         self.snap_to_beats = snap_to_beats
         self.type_logit_adjust = float(type_logit_adjust)
+        # Track whether the caller pinned the biases explicitly. Only
+        # caller-provided values take precedence over the per-class
+        # calibration written into the checkpoint by training.
+        self._jump_bias_override = jump_bias != 0.0
+        self._hold_bias_override = hold_bias != 0.0
         self.jump_bias = float(jump_bias)
         self.hold_bias = float(hold_bias)
 
@@ -333,6 +338,10 @@ class MLChartGenerator:
         # from the checkpoint if it was saved with one, else falls back to the
         # hardcoded preset midpoints.
         self.default_density_by_id = DEFAULT_DENSITY_BY_ID.clone()
+        # Unit of the duration head's output. 'beats' for new checkpoints
+        # (BPM-factored target); 'seconds' for legacy checkpoints. Affects
+        # the post-decode conversion in generate_from_audio.
+        self.duration_unit: str = 'seconds'
         # Mel whitening stats. Populated from the checkpoint if present (new
         # training runs); when absent, mel_mean/mel_std stay None and we fall
         # back to the legacy per-file min-max normalization so legacy
@@ -400,6 +409,19 @@ class MLChartGenerator:
             f"jump={tp[1]:.3f} hold_start={tp[2]:.3f}"
         )
 
+        # Pull per-class calibration biases from the checkpoint (saved by
+        # training's post-hoc bias sweep that maximizes macro-F1 on val).
+        # Caller-supplied biases override these — that's what the explicit-
+        # override flags are for.
+        ckpt_jump = checkpoint.get('best_jump_bias')
+        ckpt_hold = checkpoint.get('best_hold_bias')
+        if not self._jump_bias_override and ckpt_jump is not None:
+            self.jump_bias = float(ckpt_jump)
+            logger.info(f"Jump bias = {self.jump_bias:+.3f} (from checkpoint)")
+        if not self._hold_bias_override and ckpt_hold is not None:
+            self.hold_bias = float(ckpt_hold)
+            logger.info(f"Hold bias = {self.hold_bias:+.3f} (from checkpoint)")
+
         # Pull the calibrated decision threshold if the checkpoint stored
         # one. Caller-supplied confidence_threshold always wins.
         ckpt_thr = checkpoint.get('best_threshold')
@@ -418,6 +440,16 @@ class MLChartGenerator:
                 f"Checkpoint has no best_threshold; using default "
                 f"{self.confidence_threshold:.3f}. Retrain to calibrate."
             )
+
+        # Duration unit marker. New checkpoints train on beats; legacy on
+        # seconds. Inference converts beats → seconds using the song tempo.
+        self.duration_unit = str(checkpoint.get('duration_unit', 'seconds'))
+        if self.duration_unit not in ('beats', 'seconds'):
+            logger.warning(
+                f"Unknown duration_unit={self.duration_unit!r}; assuming 'seconds'."
+            )
+            self.duration_unit = 'seconds'
+        logger.info(f"Duration head unit: {self.duration_unit}")
 
         # Pull mel whitening stats if present. Their presence is also the
         # signal that this checkpoint was trained on the v2 fixed-dB pipeline,
@@ -524,6 +556,11 @@ class MLChartGenerator:
             mel_frames, difficulty_id, target_density
         )
 
+        # Convert beats → seconds for new (BPM-factored) checkpoints. Legacy
+        # checkpoints already emit seconds, so this is a no-op for them.
+        if self.duration_unit == 'beats':
+            duration_pred = duration_pred * (60.0 / max(tempo, 1.0))
+
         # Post-process into steps using difficulty preset
         diff_config = get_difficulty_config(difficulty)
         logger.info("Post-processing predictions...")
@@ -560,6 +597,8 @@ class MLChartGenerator:
             onset_probs:   [T] float32 sigmoid("note present")
             type_probs:    [T, 3] float32 softmax over {tap, jump, hold_start}
             duration_pred: [T] float32 predicted hold duration in seconds
+                (decoded from the model's log-space output via
+                StepChartModel.decode_duration)
         """
         T = mel_frames.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
@@ -604,7 +643,11 @@ class MLChartGenerator:
                 [density_norm], dtype=torch.float32, device=self.device
             )
 
-            onset_logits, type_logits, dur_pred = self.model(mel_tensor, diff_tensor, density_tensor)
+            model_out = self.model(mel_tensor, diff_tensor, density_tensor)
+            # New checkpoints return 4 tensors (incl. auxiliary beat head);
+            # legacy 3-tensor checkpoints still work because we only use the
+            # first three values downstream.
+            onset_logits, type_logits, dur_pred = model_out[0], model_out[1], model_out[2]
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]   # [T_chunk]
             # Apply prior-correction + explicit biases in logit space, then softmax.
             # This recovers a near-balanced posterior over {tap, jump, hold_start}
@@ -625,7 +668,14 @@ class MLChartGenerator:
         counts = np.maximum(counts, 1.0)
         onset_probs = onset_sum / counts
         type_probs = type_sum / counts[:, None]
-        duration_pred = dur_sum / counts
+        # Average is performed in log-space (geometric mean of overlapping
+        # chunk predictions). Decode to seconds *after* the average so the
+        # downstream postprocess reads a real-seconds tensor.
+        duration_log_mean = dur_sum / counts
+        duration_pred = StepChartModel.decode_duration(duration_log_mean)
+        # Tiny negative values can appear if log_mean < log(offset);
+        # clip to keep the contract that durations are non-negative seconds.
+        np.clip(duration_pred, 0.0, None, out=duration_pred)
         return onset_probs, type_probs, duration_pred
 
     def _postprocess(

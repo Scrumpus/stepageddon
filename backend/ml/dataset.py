@@ -91,6 +91,9 @@ class StepChartDataset(Dataset):
         spec_freq_masks: int = 2,
         spec_freq_width: int = 10,
         gain_jitter_db: float = 3.0,
+        type_target_dilate: int = 1,
+        density_swap_prob: float = 0.0,
+        default_density_by_id: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -111,6 +114,24 @@ class StepChartDataset(Dataset):
         self.spec_freq_masks = spec_freq_masks
         self.spec_freq_width = spec_freq_width
         self.gain_jitter_db = gain_jitter_db
+        # Frames to dilate the type-target window around each note. The onset
+        # head is supervised on a Gaussian-smoothed window (~5 frames) but the
+        # type head defaults to a single frame, which means adjacent frames
+        # see "onset positive but type ignore". Dilating the type label fills
+        # those frames with the same class — only into ignore (-100) slots,
+        # never overwriting another note's class.
+        self.type_target_dilate = int(type_target_dilate)
+
+        # Density input swap: at training time, with this probability, the
+        # density conditioning is replaced by the per-difficulty default
+        # (the same constant inference uses) instead of the per-chunk value
+        # computed from labels. Closes the train/inference gap on density —
+        # without this the model can over-rely on a leaky per-chunk signal.
+        self.density_swap_prob = float(density_swap_prob)
+        self._default_density_by_id = (
+            default_density_by_id.float()
+            if default_density_by_id is not None else None
+        )
 
         # Precomputed Gaussian kernel for onset label smoothing.
         if self.onset_smooth_sigma > 0:
@@ -156,36 +177,79 @@ class StepChartDataset(Dataset):
         return len(self._val_chunks)
 
     def __getitem__(self, idx):
+        # Indices may be either:
+        #   - int                     → random-chunk training path or val
+        #   - (entry_idx, start) tuple → fixed-chunk training path used by the
+        #     rare-class sampler to *guarantee* a chunk contains a jump/hold
         if self.is_train:
-            entry = self.entries[idx]
-            n_frames = entry['n_frames']
-            # Random start position
-            max_start = n_frames - self.chunk_frames
-            start = np.random.randint(0, max_start + 1)
+            if isinstance(idx, tuple):
+                entry_idx, fixed_start = idx
+                entry = self.entries[entry_idx]
+                n_frames = entry['n_frames']
+                # Jitter the fixed start so the rare event isn't always
+                # centered in the chunk — keeps spatial diversity across
+                # epochs even though the chunk is anchored to the rare frame.
+                jitter = self.chunk_frames // 8
+                low = max(0, fixed_start - jitter)
+                high = min(n_frames - self.chunk_frames, fixed_start + jitter)
+                start = int(np.random.randint(low, high + 1)) if high > low else int(fixed_start)
+            else:
+                entry = self.entries[idx]
+                n_frames = entry['n_frames']
+                # Random start position
+                max_start = n_frames - self.chunk_frames
+                start = np.random.randint(0, max_start + 1)
         else:
             entry_idx, start = self._val_chunks[idx]
             entry = self.entries[entry_idx]
 
-        # Load data. v3 npz files contain mel, labels_<diff>, and durations_<diff>
-        # per chart inside the same song-level archive; only the requested keys
-        # are decompressed by NpzFile on access.
+        # Load data. v4 npz files contain mel, beats (song-level), and one
+        # labels_<diff> + durations_<diff> per chart inside the same archive;
+        # only the requested keys are decompressed by NpzFile on access.
         data = np.load(self.data_dir / entry['filename'])
         mel = data['mel']                          # [T, n_mels] float16, [0,1] scaled-dB
         labels = data[entry['labels_key']]         # [T] uint8 (0=none,1=tap,2=jump,3=hold_start)
         durations = data[entry['durations_key']]   # [T] float32, seconds at hold_start frames
+        if 'beats' in data.files:
+            beats = data['beats']                  # [T] uint8 (1 at beat frames)
+        else:
+            # Pre-v4 archive: no beat track. Fall back to all-zero target so
+            # the auxiliary head sees a no-op signal instead of crashing.
+            beats = np.zeros(mel.shape[0], dtype=np.uint8)
 
         # Extract chunk
         end = start + self.chunk_frames
         mel_chunk = mel[start:end].astype(np.float32)
         labels_chunk = labels[start:end].astype(np.int64)
         durations_chunk = durations[start:end].astype(np.float32)
+        beats_chunk = beats[start:end].astype(np.float32)
         difficulty = entry['difficulty_id']
+
+        # Convert hold durations from seconds to *beats* using the song's
+        # tempo. Beats factor BPM out of the regression target so the duration
+        # head sees a much narrower distribution (DDR holds quantize to 1/4,
+        # 1/2, 1, 2 beats regardless of tempo). Inference reverses this with
+        # `beats * 60 / tempo` to recover seconds.
+        tempo = float(entry.get('tempo', 120.0)) or 120.0
+        durations_chunk = (durations_chunk * (tempo / 60.0)).astype(np.float32)
 
         # Per-chunk step density (steps/sec): a "step" is any frame with a
         # note event (tap, jump, or hold_start).
         step_frames = int((labels_chunk >= 1).sum())
         chunk_seconds = self.chunk_frames / FRAMES_PER_SECOND
         density = step_frames / chunk_seconds
+
+        # Density swap: at training time, sometimes substitute the
+        # per-difficulty default (the inference-time constant) so the model
+        # is comfortable with both signals. Eliminates the leaky per-chunk
+        # input that's only available with labels.
+        if (
+            self.is_train
+            and self._default_density_by_id is not None
+            and self.density_swap_prob > 0.0
+            and np.random.random() < self.density_swap_prob
+        ):
+            density = float(self._default_density_by_id[difficulty].item())
         density_norm = (density - DENSITY_MEAN) / DENSITY_STD
 
         # Build onset target: [T, 1] (soft during training, hard during val)
@@ -195,10 +259,23 @@ class StepChartDataset(Dataset):
         else:
             onset_soft = onset_hard
 
+        # Beat target uses the same smoothing kernel as onsets so the auxiliary
+        # BCE sees a comparable distribution. Hard beats (val) are kept tight.
+        beat_hard = beats_chunk[:, None]
+        if self.is_train and self._onset_kernel is not None:
+            beat_soft = self._smooth_onset(beat_hard)
+        else:
+            beat_soft = beat_hard
+
         # Type target: [T] long with classes {0=tap, 1=jump, 2=hold_start}
         # labels_chunk - 1 maps {1,2,3} -> {0,1,2}; {0} -> -1, then to -100
         type_target = labels_chunk - 1
         type_target[type_target < 0] = -100
+        if self.is_train and self.type_target_dilate > 0:
+            type_target, durations_chunk = self._dilate_type_and_duration(
+                labels_chunk, type_target, durations_chunk,
+                self.type_target_dilate,
+            )
 
         # ---- Mel augmentation + whitening ----
         if self.augment and self.gain_jitter_db > 0:
@@ -218,6 +295,7 @@ class StepChartDataset(Dataset):
             torch.from_numpy(onset_soft),
             torch.from_numpy(type_target),
             torch.from_numpy(durations_chunk),
+            torch.from_numpy(beat_soft),
         )
 
     # ------------------------------------------------------------------
@@ -230,6 +308,43 @@ class StepChartDataset(Dataset):
         out = np.zeros_like(onset_hard)
         out[:, 0] = np.convolve(onset_hard[:, 0], k, mode='same')
         return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _dilate_type_and_duration(
+        labels_chunk: np.ndarray,
+        type_target: np.ndarray,
+        durations_chunk: np.ndarray,
+        width: int,
+    ):
+        """Spread each note's type class (and hold duration) into a ±width
+        window of ignore frames.
+
+        Original-frame labels are never overwritten, so when two notes are
+        within 2*width of each other, both keep their own class — only the
+        ignore frames between/around them get filled in. For hold_start
+        notes, the corresponding duration value is also propagated into the
+        same dilated frames so the duration loss sees the correct target
+        everywhere it now sees `type==hold_start`.
+        """
+        n = type_target.shape[0]
+        note_frames = np.where(labels_chunk > 0)[0]
+        if note_frames.size == 0:
+            return type_target, durations_chunk
+        note_classes = (labels_chunk[note_frames] - 1).astype(np.int64)
+        out_type = type_target.copy()
+        out_dur = durations_chunk.copy()
+        for f, c in zip(note_frames, note_classes):
+            lo = max(0, int(f) - width)
+            hi = min(n, int(f) + width + 1)
+            type_window = out_type[lo:hi]
+            ignore_mask = type_window == -100
+            type_window[ignore_mask] = int(c)
+            out_type[lo:hi] = type_window
+            if c == 2:  # hold_start: propagate duration too
+                dur_window = out_dur[lo:hi]
+                dur_window[ignore_mask] = float(durations_chunk[f])
+                out_dur[lo:hi] = dur_window
+        return out_type, out_dur
 
     def _spec_augment(self, mel: np.ndarray) -> np.ndarray:
         """SpecAugment time + freq masks. Operates on whitened mel.
@@ -399,6 +514,31 @@ def compute_note_counts(
     return counts
 
 
+def compute_note_type_counts(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+) -> np.ndarray:
+    """Per-entry counts of (tap, jump, hold_start) frames.
+
+    Returns an int64 array of shape [n_entries, 3]. Entries not in `indices`
+    are left at zero — callers should index by the same indices used here.
+
+    Reads each entry's labels archive once, so this is O(n_entries) I/O.
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    counts = np.zeros((len(manifest), 3), dtype=np.int64)
+    for i in idxs:
+        entry = manifest[i]
+        labels = np.load(data_dir / entry['filename'])[entry['labels_key']]
+        # labels: 0=none, 1=tap, 2=jump, 3=hold_start
+        counts[i, 0] = int((labels == 1).sum())
+        counts[i, 1] = int((labels == 2).sum())
+        counts[i, 2] = int((labels == 3).sum())
+    return counts
+
+
 def make_note_weighted_sampler(
     entry_indices: List[int],
     note_counts: np.ndarray,
@@ -420,6 +560,88 @@ def make_note_weighted_sampler(
         num_samples=num_samples,
         replacement=True,
     )
+
+
+def make_class_stratified_sampler(
+    entry_indices: List[int],
+    type_counts: np.ndarray,
+    jump_boost: float = 8.0,
+    hold_boost: float = 16.0,
+    num_samples: Optional[int] = None,
+) -> WeightedRandomSampler:
+    """Weight entries by (taps + jump_boost*jumps + hold_boost*hold_starts).
+
+    Boosts entries containing rare class events so each batch is more likely
+    to contain at least one chunk with a jump or a hold. The boost values
+    were chosen so a song with one hold contributes roughly the same expected
+    sampling weight as a song with `hold_boost` taps (compensates for the
+    ~22× hold rarity vs taps).
+
+    Indexes into the Subset, so weights are returned in `entry_indices` order.
+    """
+    boosts = np.array([1.0, float(jump_boost), float(hold_boost)], dtype=np.float64)
+    weights = np.array(
+        [
+            max(float((type_counts[i].astype(np.float64) * boosts).sum()), 1.0)
+            for i in entry_indices
+        ],
+        dtype=np.float64,
+    )
+    weights = weights / weights.sum() * len(weights)
+    if num_samples is None:
+        num_samples = len(entry_indices)
+    logger.info(
+        f"Class-stratified sampler: jump_boost={jump_boost} hold_boost={hold_boost} "
+        f"weight_min={weights.min():.3f} weight_max={weights.max():.3f} "
+        f"weight_mean={weights.mean():.3f}"
+    )
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(weights).double(),
+        num_samples=num_samples,
+        replacement=True,
+    )
+
+
+def compute_rare_chunk_index(
+    manifest: List[dict],
+    data_dir: str,
+    indices: List[int],
+    chunk_frames: int,
+) -> List[Tuple[int, int]]:
+    """Per-rare-frame (entry_idx, chunk_start) anchors covering jump/hold events.
+
+    For each frame labeled jump (2) or hold_start (3) in the train split,
+    emit a chunk start that is guaranteed to contain that frame — the
+    sampler can then draw uniformly over rare events instead of over songs,
+    which is what fixes the per-batch rare-class coverage problem.
+
+    Cost: O(n_train_entries) full label reads, ~the same as compute_note_counts.
+    """
+    data_dir = Path(data_dir)
+    out: List[Tuple[int, int]] = []
+    for i in indices:
+        entry = manifest[i]
+        n_frames = int(entry['n_frames'])
+        if n_frames < chunk_frames:
+            continue
+        labels = np.load(data_dir / entry['filename'])[entry['labels_key']]
+        rare = np.where((labels == 2) | (labels == 3))[0]
+        if rare.size == 0:
+            continue
+        max_start = n_frames - chunk_frames
+        half = chunk_frames // 2
+        for f in rare:
+            start = int(f) - half
+            if start < 0:
+                start = 0
+            elif start > max_start:
+                start = max_start
+            out.append((i, start))
+    logger.info(
+        f"Rare-chunk index: {len(out)} (entry, start) pairs over "
+        f"{len(indices)} train entries (chunk_frames={chunk_frames})"
+    )
+    return out
 
 
 def compute_onset_prior(
@@ -447,6 +669,52 @@ def compute_onset_prior(
         total += int(labels.shape[0])  # [T] — one value per frame
     p = pos / max(total, 1)
     logger.info(f"Empirical per-frame onset rate: {p:.6f}")
+    return float(p)
+
+
+def compute_beat_prior(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+    sample_limit: int = 200,
+) -> float:
+    """Empirical per-frame beat rate (fraction of frames marked as a beat).
+
+    Used to bias-init the beat head. Returns the corpus fallback (0.02) when
+    no `beats` arrays are present (legacy npz files), so the head still
+    starts at a reasonable rate even on stale data.
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    if len(idxs) > sample_limit:
+        step = max(1, len(idxs) // sample_limit)
+        idxs = idxs[::step][:sample_limit]
+    pos = 0
+    total = 0
+    seen_any_beats = False
+    seen_song_files = set()
+    for i in idxs:
+        entry = manifest[i]
+        # Beats live at song level; only count each file once even if multiple
+        # difficulties of the same song appear in `idxs`.
+        if entry['filename'] in seen_song_files:
+            continue
+        seen_song_files.add(entry['filename'])
+        archive = np.load(data_dir / entry['filename'])
+        if 'beats' not in archive.files:
+            continue
+        seen_any_beats = True
+        beats = archive['beats']
+        pos += int((beats > 0).sum())
+        total += int(beats.shape[0])
+    if not seen_any_beats:
+        logger.warning(
+            "No `beats` arrays found in sampled archives; using 0.02 fallback. "
+            "Re-run prepare_data.py to enable the auxiliary beat head."
+        )
+        return 0.02
+    p = pos / max(total, 1)
+    logger.info(f"Empirical per-frame beat rate: {p:.6f}")
     return float(p)
 
 
@@ -491,6 +759,48 @@ def compute_type_class_distribution(
         f"(counts={counts.tolist()})"
     )
     return prior.astype(np.float32)
+
+
+def compute_hold_duration_median(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+    sample_limit: int = 400,
+) -> float:
+    """Empirical median hold duration in *beats* (across all hold_start frames).
+
+    Used to bias-init the duration head's final layer to log(median+offset).
+    Reported in beats because that's the unit the model is trained on
+    (see `StepChartDataset.__getitem__` — the per-chunk duration target is
+    converted with `seconds * tempo / 60`). A median of ~1.0 beat for DDR
+    holds is the expected ballpark.
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    if len(idxs) > sample_limit:
+        step = max(1, len(idxs) // sample_limit)
+        idxs = idxs[::step][:sample_limit]
+    durations_beats: List[float] = []
+    for i in idxs:
+        entry = manifest[i]
+        tempo = float(entry.get('tempo', 120.0)) or 120.0
+        archive = np.load(data_dir / entry['filename'])
+        labels = archive[entry['labels_key']]
+        dur = archive[entry['durations_key']]
+        # hold_start label = 3 in the v3 raw label encoding
+        mask = labels == 3
+        if mask.any():
+            scale = tempo / 60.0
+            durations_beats.extend(float(x) * scale for x in dur[mask] if x > 0)
+    if not durations_beats:
+        logger.warning("No holds found while computing duration median; using 2.0 beats.")
+        return 2.0
+    median = float(np.median(durations_beats))
+    logger.info(
+        f"Hold duration median: {median:.3f} beats "
+        f"(min={min(durations_beats):.3f}, max={max(durations_beats):.3f}, n={len(durations_beats)})"
+    )
+    return median
 
 
 def class_weights_from_prior(

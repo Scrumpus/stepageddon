@@ -6,10 +6,17 @@ Three-head onset-style architecture (Dance Dance Convolution formulation):
         -> RoPE Transformer -> LayerNorm
         -> onset head     (sigmoid, "is there a note here?")
         -> type  head     (3-way: tap / jump / hold_start)
-        -> duration head  (softplus scalar, hold duration in seconds)
+        -> duration head  (linear scalar in log-space; decode_duration() to seconds)
 
 The type head is only supervised where onset target is positive.
-The duration head is only supervised where the type target is hold_start.
+The duration head is only supervised where the type target is hold_start
+(plus a small ±2-frame window for extra gradient signal).
+
+The duration head emits a raw scalar interpreted as log(seconds + DURATION_OFFSET).
+This converts the wide raw-seconds dynamic range (~0.2–5s) into a much
+better-conditioned ~[-1.6, 1.6] target range and lets the loss treat
+relative error symmetrically. Inference must call `decode_duration` to
+get back to seconds.
 
 Conditioning uses a single early FiLM layer. Difficulty is an embedding,
 density is encoded with random Fourier features and concatenated before
@@ -260,6 +267,12 @@ class StepChartModel(nn.Module):
     TYPE_JUMP = 1
     TYPE_HOLD_START = 2
 
+    # Offset added inside log() to keep the duration target away from -inf
+    # while preserving relative ordering at the small end of the range.
+    # Used by both `encode_duration` (training target) and `decode_duration`
+    # (inference). Must stay in lockstep across model + dataset + inference.
+    DURATION_OFFSET: float = 0.05
+
     def __init__(
         self,
         n_mels: int = 80,
@@ -287,28 +300,42 @@ class StepChartModel(nn.Module):
         # Deeper onset head: onset is the harder of the two heads, so give it
         # extra capacity. `onset_head_layers` counts hidden Linear→GELU blocks
         # before the final 1-unit projection (default 3 → was 1).
-        onset_layers: list = []
-        for _ in range(max(1, onset_head_layers)):
-            onset_layers.extend([
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-        onset_layers.append(nn.Linear(hidden_dim, 1))
-        self.onset_head = nn.Sequential(*onset_layers)
+        def _build_mlp_head(out_dim: int, n_hidden: int) -> nn.Sequential:
+            layers: list = []
+            for _ in range(max(1, n_hidden)):
+                layers.extend([
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ])
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            return nn.Sequential(*layers)
+
+        self.onset_head = _build_mlp_head(1, onset_head_layers)
         self.type_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, self.N_NOTE_TYPES),
         )
+        # Duration head emits a raw scalar interpreted as
+        # log(duration_seconds + DURATION_OFFSET). No Softplus — the log
+        # transform itself maps the natural [0.05, ~5]s range into roughly
+        # [-3, 1.6], which is a well-conditioned regression target.
+        # Inference must apply `decode_duration` to recover seconds.
         self.duration_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
-            nn.Softplus(),  # ensures positive output (seconds)
         )
+        # Auxiliary beat head: predicts per-frame "is this a beat?" from the
+        # same backbone features. Same depth/shape as the onset head — beats
+        # and onsets share the rhythmic structure the backbone is learning,
+        # so reusing the same capacity is a safe default. Loss-weighted at
+        # ~0.3 so beat learning helps the backbone without crowding out the
+        # primary onset task.
+        self.beat_head = _build_mlp_head(1, onset_head_layers)
 
     def set_onset_prior(self, p: float) -> None:
         """Initialize the onset head's final bias to logit(p).
@@ -319,6 +346,46 @@ class StepChartModel(nn.Module):
         p = float(max(min(p, 0.999), 1e-4))
         bias = math.log(p / (1.0 - p))
         final = self.onset_head[-1]
+        assert isinstance(final, nn.Linear)
+        nn.init.constant_(final.bias, bias)
+
+    def set_beat_prior(self, p: float) -> None:
+        """Initialize the beat head's final bias to logit(p).
+
+        Beats are denser than onsets (~120-180 BPM × songs) — typically 1-3%
+        of frames at 100 fps depending on tempo. Anchoring the head at the
+        empirical rate gives the auxiliary task a sane starting point.
+        """
+        p = float(max(min(p, 0.999), 1e-4))
+        bias = math.log(p / (1.0 - p))
+        final = self.beat_head[-1]
+        assert isinstance(final, nn.Linear)
+        nn.init.constant_(final.bias, bias)
+
+    @classmethod
+    def encode_duration(cls, seconds: torch.Tensor) -> torch.Tensor:
+        """Convert a (batch of) duration in seconds to the log-space target."""
+        return torch.log(seconds.clamp_min(0.0) + cls.DURATION_OFFSET)
+
+    @classmethod
+    def decode_duration(cls, log_value):
+        """Inverse of `encode_duration`. Accepts torch tensor or numpy array."""
+        if isinstance(log_value, torch.Tensor):
+            return torch.exp(log_value) - cls.DURATION_OFFSET
+        import numpy as _np
+        return _np.exp(log_value) - cls.DURATION_OFFSET
+
+    def set_duration_prior(self, median_seconds: float) -> None:
+        """Initialize the duration head's final bias to log(median+offset).
+
+        Call once after construction with the empirical median hold duration.
+        Without this, the freshly-built model emits ~0 (= 1s after decode),
+        which is a fine starting guess but converges slowly. Anchoring to
+        the corpus median saves several epochs of "find the right scale".
+        """
+        median_seconds = float(max(median_seconds, 0.0))
+        bias = math.log(median_seconds + self.DURATION_OFFSET)
+        final = self.duration_head[-1]
         assert isinstance(final, nn.Linear)
         nn.init.constant_(final.bias, bias)
 
@@ -348,7 +415,7 @@ class StepChartModel(nn.Module):
         mel: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             mel: [B, T, n_mels]
@@ -358,7 +425,8 @@ class StepChartModel(nn.Module):
         Returns:
             onset_logits:  [B, T, 1]
             type_logits:   [B, T, 3]  {tap, jump, hold_start}
-            duration_pred: [B, T, 1]  hold duration in seconds (always positive)
+            duration_pred: [B, T, 1]  log-space scalar; decode via `decode_duration`
+            beat_logits:   [B, T, 1]  auxiliary beat-frame prediction (pre-sigmoid)
         """
         x = self.audio_encoder(mel)                 # [B, T, H]
         x = self.tcn(x)                              # [B, T, H]
@@ -370,7 +438,8 @@ class StepChartModel(nn.Module):
         onset_logits = self.onset_head(x)            # [B, T, 1]
         type_logits = self.type_head(x)              # [B, T, 3]
         duration_pred = self.duration_head(x)        # [B, T, 1]
-        return onset_logits, type_logits, duration_pred
+        beat_logits = self.beat_head(x)              # [B, T, 1]
+        return onset_logits, type_logits, duration_pred, beat_logits
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +458,10 @@ class StepChartLoss(nn.Module):
     """
 
     HOLD_START_CLASS = 2  # type target class index for hold_start
+    # Duration loss is supervised on hold_start frames AND a small ±N-frame
+    # window around them (using the same target). This 5×s the gradient
+    # signal on a head that otherwise sees ~0.09% of frames per batch.
+    DURATION_WINDOW = 2  # frames either side of hold_start
 
     def __init__(
         self,
@@ -397,12 +470,23 @@ class StepChartLoss(nn.Module):
         duration_weight: float = 1.0,
         type_class_weights: Optional[torch.Tensor] = None,
         focal_gamma: float = 0.0,
+        type_focal_gamma: float = 0.0,
+        beat_weight: float = 0.0,
+        beat_pos_weight: float = 10.0,
     ):
         super().__init__()
         self.register_buffer('pos_weight', torch.tensor(float(pos_weight)))
+        self.register_buffer('beat_pos_weight', torch.tensor(float(beat_pos_weight)))
         self.type_weight = type_weight
         self.duration_weight = duration_weight
+        self.beat_weight = float(beat_weight)
         self.focal_gamma = float(focal_gamma)
+        # Focal modulation on the type CE: down-weights confidently-correct
+        # frames so the rare jump/hold classes contribute relatively more
+        # gradient. With type_class_weights alone, easy taps still dominate
+        # the loss because there are 90× more of them than rare classes;
+        # focal weighting fixes that without changing the static weights.
+        self.type_focal_gamma = float(type_focal_gamma)
         # Per-class CE weights for the type head ({tap, jump, hold_start}).
         # Without these, the head collapses to "always predict tap" because
         # taps dominate the imbalanced supervision. Registered as a buffer
@@ -424,7 +508,9 @@ class StepChartLoss(nn.Module):
         onset_soft: torch.Tensor,      # [B, T, 1] float in [0,1]
         type_target: torch.Tensor,     # [B, T] long, -100 where no note
         duration_target: torch.Tensor, # [B, T] float, seconds at hold_start, 0 elsewhere
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        beat_logits: Optional[torch.Tensor] = None,  # [B, T, 1] pre-sigmoid
+        beat_soft: Optional[torch.Tensor] = None,    # [B, T, 1] float in [0,1]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.focal_gamma > 0.0:
             # Focal BCE: down-weight easy examples (mostly negatives) by
             # (1 - p_t)^gamma. Combined with pos_weight, this fights the
@@ -446,22 +532,102 @@ class StepChartLoss(nn.Module):
         B, T, C = type_logits.shape
         type_flat = type_logits.reshape(-1, C)
         target_flat = type_target.reshape(-1)
-        type_loss = F.cross_entropy(
-            type_flat, target_flat,
-            weight=self.type_class_weights,
-            ignore_index=-100,
-        )
+        if self.type_focal_gamma > 0.0:
+            # Per-frame CE so we can reweight by (1 - p_t)^gamma. The
+            # static class weights are already baked into ce_per_frame.
+            ce_per_frame = F.cross_entropy(
+                type_flat, target_flat,
+                weight=self.type_class_weights,
+                ignore_index=-100,
+                reduction='none',
+            )
+            valid = target_flat != -100
+            if valid.any():
+                with torch.no_grad():
+                    log_p = F.log_softmax(type_flat[valid], dim=-1)
+                    p_t = log_p.gather(
+                        1, target_flat[valid].unsqueeze(-1)
+                    ).squeeze(-1).exp()
+                    focal_w = (1.0 - p_t).clamp_(min=0.0, max=1.0).pow(
+                        self.type_focal_gamma
+                    )
+                # `cross_entropy(reduction='none', ignore_index=-100)` returns 0
+                # at ignored positions, so the unmasked mean is correct.
+                ce_valid = ce_per_frame[valid]
+                type_loss = (focal_w * ce_valid).mean()
+            else:
+                type_loss = ce_per_frame.sum() * 0.0
+        else:
+            type_loss = F.cross_entropy(
+                type_flat, target_flat,
+                weight=self.type_class_weights,
+                ignore_index=-100,
+            )
 
-        # Duration loss: only at hold_start frames (type_target == HOLD_START_CLASS)
-        hold_mask = (type_target == self.HOLD_START_CLASS)  # [B, T]
-        if hold_mask.any():
-            pred_dur = duration_pred[:, :, 0][hold_mask]     # [N_holds]
-            true_dur = duration_target[hold_mask]             # [N_holds]
-            dur_loss = F.smooth_l1_loss(pred_dur, true_dur)
+        # Duration loss: log-space smooth-L1 on a ±DURATION_WINDOW window
+        # around each hold_start. Inflating the window from a single frame
+        # to (2W+1) frames keeps targets accurate (the duration is constant
+        # within a hold) while giving the head 5× more gradient per batch.
+        # Targets are converted with `encode_duration` so the head learns
+        # in log-seconds (well-conditioned dynamic range).
+        hold_start_mask = (type_target == self.HOLD_START_CLASS)  # [B, T]
+        if hold_start_mask.any():
+            # Dilate the mask in time and propagate the duration target so
+            # each window-frame gets the duration of the nearest hold_start.
+            # We do this via a 1-D max-style dispatch implemented with
+            # cumulative directional fills, keeping the op fully vectorized.
+            B, T = hold_start_mask.shape
+            window = self.DURATION_WINDOW
+            # Build a dense [B, T] target tensor that is 0 outside windows
+            # and equal to the hold_start's duration inside its ±W window.
+            base = duration_target * hold_start_mask.float()
+            window_mask = hold_start_mask.clone()
+            window_target = base.clone()
+            for offset in range(1, window + 1):
+                # Right shift: copy hold_start contributions to t+offset
+                window_mask[:, offset:] |= hold_start_mask[:, :-offset]
+                window_target[:, offset:] = torch.where(
+                    hold_start_mask[:, :-offset],
+                    base[:, :-offset],
+                    window_target[:, offset:],
+                )
+                # Left shift: copy to t-offset
+                window_mask[:, :-offset] |= hold_start_mask[:, offset:]
+                window_target[:, :-offset] = torch.where(
+                    hold_start_mask[:, offset:],
+                    base[:, offset:],
+                    window_target[:, :-offset],
+                )
+
+            pred_log = duration_pred[:, :, 0][window_mask]                     # [N]
+            true_log = StepChartModel.encode_duration(window_target[window_mask])
+            dur_loss = F.smooth_l1_loss(pred_log, true_log)
         else:
             dur_loss = torch.tensor(0.0, device=onset_logits.device)
 
+        # Auxiliary beat-frame BCE. The beat target is dense and structured
+        # (1-3% of frames depending on tempo), so a moderate pos_weight is
+        # sufficient — no focal needed. Skipped if beat targets weren't
+        # supplied (e.g., legacy datasets without `beats`).
+        if (
+            self.beat_weight > 0.0
+            and beat_logits is not None
+            and beat_soft is not None
+        ):
+            beat_loss = F.binary_cross_entropy_with_logits(
+                beat_logits, beat_soft, pos_weight=self.beat_pos_weight,
+            )
+        else:
+            beat_loss = torch.zeros((), device=onset_logits.device)
+
         total = (onset_loss
                  + self.type_weight * type_loss
-                 + self.duration_weight * dur_loss)
-        return total, onset_loss.detach(), type_loss.detach(), dur_loss.detach()
+                 + self.duration_weight * dur_loss
+                 + self.beat_weight * beat_loss)
+        return (
+            total,
+            onset_loss.detach(),
+            type_loss.detach(),
+            dur_loss.detach(),
+            beat_loss.detach(),
+        )
