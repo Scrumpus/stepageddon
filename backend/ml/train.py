@@ -59,11 +59,6 @@ from ml.dataset import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Seeding / repro
-# ---------------------------------------------------------------------------
-
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -80,11 +75,6 @@ def _git_sha() -> str:
         ).decode().strip()
     except Exception:
         return 'unknown'
-
-
-# ---------------------------------------------------------------------------
-# Builders (importable from notebook)
-# ---------------------------------------------------------------------------
 
 @dataclass
 class BuildOutputs:
@@ -228,10 +218,6 @@ def build_optimizer_and_scheduler(
 def build_loss(
     onset_prior: float, type_prior: np.ndarray, args,
 ) -> StepChartLoss:
-    # Default to sqrt((1-p)/p) instead of (1-p)/p. The unit-mean formula
-    # crushes precision (BCE rewards "predict positive everywhere" given how
-    # rare positives are at frame level); the sqrt variant balances P/R far
-    # better in practice. CLI override available via --pos-weight.
     p = max(onset_prior, 1e-5)
     if args.pos_weight is not None:
         pos_weight = float(args.pos_weight)
@@ -254,11 +240,6 @@ def build_loss(
         type_class_weights=type_class_weights,
         focal_gamma=args.focal_gamma,
     )
-
-
-# ---------------------------------------------------------------------------
-# Train / validate loops
-# ---------------------------------------------------------------------------
 
 def train_one_epoch(
     model, loader, criterion, optimizer, scheduler, scaler, device,
@@ -426,9 +407,6 @@ def validate(
     type_total = 0
 
     # Per-class confusion for {tap=0, jump=1, hold_start=2}.
-    # tp[c] = correctly predicted as c; fp[c] = predicted c but actually
-    # other; fn[c] = actually c but predicted other. Computed only on
-    # frames with a true onset (mask = type_target >= 0).
     type_tp = np.zeros(3, dtype=np.int64)
     type_fp = np.zeros(3, dtype=np.int64)
     type_fn = np.zeros(3, dtype=np.int64)
@@ -486,11 +464,8 @@ def validate(
 
     pred_concat = np.concatenate(all_pred, axis=0).reshape(-1, 1)
     true_concat = np.concatenate(all_true, axis=0).reshape(-1, 1)
-    # Sweep decision thresholds and report F1 at the best operating point.
-    # A fixed 0.5 threshold is meaningless once the model's calibration
-    # shifts; the headline metric should be peak F1.
     best_f1, best_thr, best_p, best_r = -1.0, 0.5, 0.0, 0.0
-    for thr in np.arange(0.30, 0.86, 0.05):
+    for thr in np.arange(0.05, 0.86, 0.05):
         p_, r_, f_ = tolerance_f1(
             pred_concat, true_concat,
             tol_frames=tol_frames, threshold=float(thr),
@@ -498,6 +473,24 @@ def validate(
         if f_ > best_f1:
             best_f1, best_thr, best_p, best_r = f_, float(thr), p_, r_
     prec, rec, f1 = best_p, best_r, best_f1
+
+    pred_flat = pred_concat.reshape(-1)
+    true_flat = true_concat.reshape(-1)
+    pos_mask = true_flat > 0.5
+    pred_max = float(pred_flat.max()) if pred_flat.size else 0.0
+    pred_p99 = float(np.quantile(pred_flat, 0.99)) if pred_flat.size else 0.0
+    pred_p999 = float(np.quantile(pred_flat, 0.999)) if pred_flat.size else 0.0
+    if pos_mask.any():
+        pos_probs = pred_flat[pos_mask]
+        pos_max = float(pos_probs.max())
+        pos_mean = float(pos_probs.mean())
+        pos_p50 = float(np.quantile(pos_probs, 0.5))
+    else:
+        pos_max = pos_mean = pos_p50 = 0.0
+    if (~pos_mask).any():
+        neg_mean = float(pred_flat[~pos_mask].mean())
+    else:
+        neg_mean = 0.0
 
     dur_mae = float(np.concatenate(dur_abs_errors).mean()) if dur_abs_errors else 0.0
 
@@ -527,12 +520,14 @@ def validate(
         'hold_f1': hold_f1, 'hold_p': hold_p, 'hold_r': hold_r,
         'type_macro_f1': type_macro_f1,
         'dur_mae': dur_mae,
+        'prob_max': pred_max,
+        'prob_p99': pred_p99,
+        'prob_p999': pred_p999,
+        'prob_pos_max': pos_max,
+        'prob_pos_mean': pos_mean,
+        'prob_pos_p50': pos_p50,
+        'prob_neg_mean': neg_mean,
     }
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint I/O
-# ---------------------------------------------------------------------------
 
 def save_checkpoint(
     path: Path,
@@ -559,28 +554,15 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
         'metrics': metrics,
-        # Persist the best onset decision threshold from the validation
-        # sweep so inference can use the calibrated value instead of a
-        # hardcoded 0.5/0.3. Falls back to 0.5 if the metric was missing.
         'best_threshold': float(metrics.get('best_thr', 0.5)),
         'default_density_by_id': default_density_by_id.tolist(),
-        # Mel whitening stats live alongside the weights so inference can
-        # apply the exact same input normalization the model was trained on.
         'mel_mean': float(mel_mean),
         'mel_std': float(mel_std),
-        # Empirical P(class | onset) over {tap, jump, hold_start} on the
-        # train split. Inference uses this for logit adjustment to undo
-        # the prior bias learned by the type head.
         'type_prior': [float(x) for x in type_prior],
         'args': vars(args) if not isinstance(args, dict) else args,
         'git_sha': _git_sha(),
     }
     torch.save(ckpt, path)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Train step chart model')
@@ -649,8 +631,6 @@ def main():
     criterion = build_loss(built.onset_prior, built.type_prior, args).to(device)
     steps_per_epoch = max(1, len(built.train_loader))
     optimizer, scheduler = build_optimizer_and_scheduler(model, args, steps_per_epoch)
-    # Plateau scheduler runs in addition to the per-step cosine: if tol_f1
-    # stalls for `plateau-patience` epochs, multiply LR by `plateau-factor`.
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max',
         factor=args.plateau_factor,
@@ -659,7 +639,6 @@ def main():
     )
     scaler = GradScaler('cuda')
 
-    # EMA over raw parameters (not buffers)
     ema_model = AveragedModel(
         model, multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay)
     )
@@ -687,7 +666,6 @@ def main():
             scaler, device, ema_model=ema_model,
             log_interval=args.log_interval,
         )
-        # Validate with EMA weights
         val_metrics = validate(
             ema_model.module, built.val_loader, criterion, device,
             tol_frames=args.tol_frames,
@@ -714,6 +692,13 @@ def main():
             f"{val_metrics['hold_f1']:.3f} "
             f"(macro={val_metrics['type_macro_f1']:.3f}) "
             f"dur_mae={val_metrics['dur_mae']:.3f}s "
+            f"| probs[max={val_metrics['prob_max']:.3f} "
+            f"p99={val_metrics['prob_p99']:.3f} "
+            f"p999={val_metrics['prob_p999']:.3f}] "
+            f"pos[max={val_metrics['prob_pos_max']:.3f} "
+            f"mean={val_metrics['prob_pos_mean']:.3f} "
+            f"p50={val_metrics['prob_pos_p50']:.3f}] "
+            f"neg_mean={val_metrics['prob_neg_mean']:.3f} "
             f"| lr={lr:.2e} | {elapsed:.1f}s"
         )
 
