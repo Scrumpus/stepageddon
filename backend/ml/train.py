@@ -597,15 +597,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--warmup-epochs', type=float, default=2.0)
-    parser.add_argument('--type-weight', type=float, default=2.0,
-                        help='Multiplier on type-head CE loss; raised from 1.0 '
-                             'because the type head is gradient-starved relative '
-                             'to onset BCE')
+    parser.add_argument('--type-weight', type=float, default=4.0,
+                        help='Multiplier on type-head CE loss; raised because '
+                             'the type head is gradient-starved relative to onset '
+                             'BCE — empirically the head collapses to all-tap '
+                             'unless this is >=4 with aggressive class balancing')
     parser.add_argument('--duration-weight', type=float, default=1.0)
-    parser.add_argument('--type-weight-smoothing', type=float, default=0.7,
+    parser.add_argument('--type-weight-smoothing', type=float, default=0.3,
                         help='Exponent for inverse-frequency type-class weights '
-                             '(0=uniform, 1=raw inverse-frequency)')
-    parser.add_argument('--type-weight-cap', type=float, default=12.0,
+                             '(0=uniform, 1=raw inverse-frequency). Low values '
+                             'are needed because tap dominates ~92%% of onsets.')
+    parser.add_argument('--type-weight-cap', type=float, default=15.0,
                         help='Max per-class CE weight after smoothing')
     parser.add_argument('--pos-weight', type=float, default=None,
                         help='Override BCE pos_weight on the onset head. '
