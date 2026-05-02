@@ -943,6 +943,13 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Tolerance window (in frames) for F1; ~30 ms at 100 fps')
     parser.add_argument('--log-interval', type=int, default=50,
                         help='Log training metrics every N batches within an epoch')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable Weights & Biases logging. Requires WANDB_API_KEY '
+                             'in the environment (or `wandb login` already run).')
+    parser.add_argument('--wandb-project', type=str, default='stepageddon',
+                        help='W&B project name (used only if --wandb)')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='Optional W&B run name (defaults to W&B auto-name)')
     return parser
 
 
@@ -955,6 +962,21 @@ def main():
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=vars(args),
+            )
+            wandb_run.config.update({'git_sha': _git_sha()}, allow_val_change=True)
+            logger.info(f"W&B logging enabled: {wandb_run.url}")
+        except Exception as e:
+            logger.warning(f"W&B init failed ({e}); continuing without it")
+            wandb_run = None
 
     built = build_dataloaders(args)
     model = build_model(
@@ -1020,6 +1042,18 @@ def main():
 
         lr = optimizer.param_groups[0]['lr']
         elapsed = time.time() - t0
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    'epoch': epoch + 1,
+                    'lr': lr,
+                    'epoch_time_s': elapsed,
+                    **{f'train/{k}': v for k, v in train_metrics.items()},
+                    **{f'val/{k}': v for k, v in val_metrics.items()},
+                },
+                step=epoch + 1,
+            )
         logger.info(
             f"Epoch {epoch+1:3d}/{args.epochs} "
             f"| train_loss={train_metrics['loss']:.4f} "
@@ -1111,6 +1145,20 @@ def main():
         f"Training complete. Best composite: {best_composite:.3f} "
         f"| macro_f1: {best_macro_f1:.3f} | dur_mae: {best_dur_mae:.3f}b"
     )
+
+    if wandb_run is not None:
+        wandb_run.summary['best_composite'] = best_composite
+        wandb_run.summary['best_macro_f1'] = best_macro_f1
+        wandb_run.summary['best_dur_mae_beats'] = best_dur_mae
+        best_path = checkpoint_dir / 'best_model.pt'
+        if best_path.exists():
+            try:
+                artifact = wandb.Artifact('best_model', type='model')
+                artifact.add_file(str(best_path))
+                wandb_run.log_artifact(artifact)
+            except Exception as e:
+                logger.warning(f"W&B artifact upload failed: {e}")
+        wandb_run.finish()
 
 
 if __name__ == '__main__':
