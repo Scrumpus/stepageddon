@@ -432,6 +432,7 @@ def train_one_epoch(
     log_interval: int = 50,
 ) -> Dict[str, float]:
     model.train()
+    print("  [train_one_epoch] model.train() done; about to iterate loader", flush=True)
     total_loss = 0.0
     total_onset = 0.0
     total_type = 0.0
@@ -439,6 +440,7 @@ def train_one_epoch(
     total_beat = 0.0
     total_samples = 0
     n_batches = len(loader)
+    print(f"  [train_one_epoch] n_batches={n_batches}", flush=True)
 
     # Running averages for intra-epoch logging
     interval_loss = 0.0
@@ -449,8 +451,17 @@ def train_one_epoch(
     interval_samples = 0
     t_start = time.time()
 
+    _t_fetch = time.time()
     for step, batch in enumerate(loader):
+        if step < 3:
+            print(
+                f"  [train_one_epoch] got batch {step} "
+                f"(fetch={time.time()-_t_fetch:.2f}s)",
+                flush=True,
+            )
         mel, difficulty, density, onset_soft, type_target, duration_target, beat_soft = batch
+        if step < 3:
+            print(f"  [train_one_epoch] batch {step} unpacked, mel={tuple(mel.shape)}", flush=True)
         mel = mel.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
         density = density.to(device, non_blocking=True)
@@ -460,6 +471,8 @@ def train_one_epoch(
         beat_soft = beat_soft.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
+        if step < 3:
+            print(f"  [train_one_epoch] batch {step} forward...", flush=True)
         with autocast('cuda'):
             onset_logits, type_logits, duration_pred, beat_logits = model(
                 mel, difficulty, density,
@@ -469,6 +482,8 @@ def train_one_epoch(
                 onset_soft, type_target, duration_target,
                 beat_logits=beat_logits, beat_soft=beat_soft,
             )
+        if step < 3:
+            print(f"  [train_one_epoch] batch {step} loss={loss.item():.4f} backward...", flush=True)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -480,6 +495,9 @@ def train_one_epoch(
             scheduler.step()
         if ema_model is not None:
             ema_model.update_parameters(model)
+        if step < 3:
+            print(f"  [train_one_epoch] batch {step} step done", flush=True)
+        _t_fetch = time.time()
 
         bs = mel.size(0)
         total_loss += loss.item() * bs
@@ -504,11 +522,12 @@ def train_one_epoch(
             avg_b = interval_beat / max(interval_samples, 1)
             lr = optimizer.param_groups[0]['lr']
             elapsed = time.time() - t_start
-            logger.info(
+            print(
                 f"  step {step+1:4d}/{n_batches} "
                 f"| loss={avg_l:.4f} (onset={avg_o:.4f} type={avg_t:.4f} "
                 f"dur={avg_d:.4f} beat={avg_b:.4f}) "
-                f"| lr={lr:.2e} | {elapsed:.1f}s"
+                f"| lr={lr:.2e} | {elapsed:.1f}s",
+                flush=True,
             )
             interval_loss = 0.0
             interval_onset = 0.0
@@ -978,7 +997,9 @@ def main():
             logger.warning(f"W&B init failed ({e}); continuing without it")
             wandb_run = None
 
+    print("Building dataloaders...", flush=True)
     built = build_dataloaders(args)
+    print("Dataloaders built. Building model...", flush=True)
     model = build_model(
         args, built.onset_prior, built.type_prior, device,
         hold_duration_median=built.hold_duration_median,
@@ -1026,8 +1047,16 @@ def main():
         start_epoch = ckpt['epoch'] + 1
         best_composite = _composite(ckpt.get('metrics', {}))
 
-    logger.info("Starting training...")
+    print("Starting training...", flush=True)
+    print(
+        f"  steps_per_epoch={steps_per_epoch} "
+        f"batch_size={args.batch_size} "
+        f"num_workers={args.num_workers} "
+        f"chunk_frames={args.chunk_frames}",
+        flush=True,
+    )
     for epoch in range(start_epoch, args.epochs):
+        print(f"[epoch {epoch+1}] entering train_one_epoch", flush=True)
         t0 = time.time()
         train_metrics = train_one_epoch(
             model, built.train_loader, criterion, optimizer, scheduler,
@@ -1054,7 +1083,7 @@ def main():
                 },
                 step=epoch + 1,
             )
-        logger.info(
+        print(
             f"Epoch {epoch+1:3d}/{args.epochs} "
             f"| train_loss={train_metrics['loss']:.4f} "
             f"(onset={train_metrics['onset_loss']:.4f} "
@@ -1082,7 +1111,8 @@ def main():
             f"mean={val_metrics['prob_pos_mean']:.3f} "
             f"p50={val_metrics['prob_pos_p50']:.3f}] "
             f"neg_mean={val_metrics['prob_neg_mean']:.3f} "
-            f"| lr={lr:.2e} | {elapsed:.1f}s"
+            f"| lr={lr:.2e} | {elapsed:.1f}s",
+            flush=True,
         )
 
         # Always overwrite 'last'
@@ -1106,11 +1136,12 @@ def main():
                 built.type_prior,
                 args,
             )
-            logger.info(
+            print(
                 f"  -> New best composite={best_composite:.3f} "
                 f"(tol_f1={val_metrics['tol_f1']:.3f} "
                 f"cal_macro_f1={val_metrics.get('cal_macro_f1', val_metrics['type_macro_f1']):.3f} "
-                f"thr={val_metrics['best_thr']:.2f})"
+                f"thr={val_metrics['best_thr']:.2f})",
+                flush=True,
             )
 
         # Track separate "best by macro F1" and "best by duration MAE"
@@ -1128,7 +1159,7 @@ def main():
                 built.type_prior,
                 args,
             )
-            logger.info(f"  -> New best macro F1 = {best_macro_f1:.3f}")
+            print(f"  -> New best macro F1 = {best_macro_f1:.3f}", flush=True)
         if val_metrics['dur_mae_beats'] > 0 and val_metrics['dur_mae_beats'] < best_dur_mae:
             best_dur_mae = val_metrics['dur_mae_beats']
             save_checkpoint(
@@ -1139,11 +1170,12 @@ def main():
                 built.type_prior,
                 args,
             )
-            logger.info(f"  -> New best dur MAE = {best_dur_mae:.3f}b")
+            print(f"  -> New best dur MAE = {best_dur_mae:.3f}b", flush=True)
 
-    logger.info(
+    print(
         f"Training complete. Best composite: {best_composite:.3f} "
-        f"| macro_f1: {best_macro_f1:.3f} | dur_mae: {best_dur_mae:.3f}b"
+        f"| macro_f1: {best_macro_f1:.3f} | dur_mae: {best_dur_mae:.3f}b",
+        flush=True,
     )
 
     if wandb_run is not None:
