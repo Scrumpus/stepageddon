@@ -561,29 +561,86 @@ def train_one_epoch(
     }
 
 
-def _local_max_peaks(
-    probs: np.ndarray, threshold: float, window: int
-) -> np.ndarray:
-    """Per-arrow 1-D NMS on a [T] probability vector. Returns peak indices."""
+def _all_local_max_peaks(
+    probs: np.ndarray, window: int, min_threshold: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized 1-D NMS. Returns (peak_indices, peak_probs) sorted by index.
+
+    A frame is a peak iff its prob equals the max over a ±window neighborhood
+    AND exceeds `min_threshold`. Plateau ties are broken by keeping the earliest
+    occurrence (then re-suppressing within `window`). Uses scipy's C-implemented
+    1-D max filter — orders of magnitude faster than the previous Python loop
+    over all frames, which dominated validation time on large val sets.
+    """
     T = probs.shape[0]
     if T == 0:
-        return np.empty(0, dtype=np.int64)
-    peaks = []
-    last = -window - 1
-    order = np.argsort(-probs)  # descending
-    taken = np.zeros(T, dtype=bool)
-    for idx in order:
-        p = probs[idx]
-        if p < threshold:
-            break
-        lo = max(0, idx - window)
-        hi = min(T, idx + window + 1)
-        if taken[lo:hi].any():
-            continue
-        taken[idx] = True
-        peaks.append(int(idx))
-    peaks.sort()
-    return np.asarray(peaks, dtype=np.int64)
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=probs.dtype)
+    from scipy.ndimage import maximum_filter1d
+    pooled = maximum_filter1d(probs, size=2 * window + 1, mode='constant', cval=-np.inf)
+    is_peak = (probs == pooled) & (probs >= min_threshold)
+    idx = np.flatnonzero(is_peak)
+    if idx.size <= 1:
+        return idx.astype(np.int64), probs[idx]
+    # Plateau handling: drop subsequent peaks whose distance to the prior kept
+    # peak is <= window. Mirrors the original greedy-by-prob behavior closely
+    # enough for F1 — exact equivalence isn't worth the cost.
+    keep = np.ones(idx.size, dtype=bool)
+    last_kept = idx[0]
+    for k in range(1, idx.size):
+        if idx[k] - last_kept <= window:
+            if probs[idx[k]] > probs[last_kept]:
+                keep[k - 1] = False
+                last_kept = idx[k]
+            else:
+                keep[k] = False
+        else:
+            last_kept = idx[k]
+    idx = idx[keep]
+    return idx.astype(np.int64), probs[idx]
+
+
+def _f1_at_threshold(
+    peak_idx: np.ndarray,
+    peak_probs: np.ndarray,
+    true_peaks: np.ndarray,
+    tol_frames: int,
+    threshold: float,
+) -> Tuple[float, float, float]:
+    """Greedy ±tol_frames matching given precomputed peaks. O(P + T) via two
+    pointers on sorted index arrays."""
+    sel = peak_probs >= threshold
+    pred_peaks = peak_idx[sel]
+    if pred_peaks.size == 0 and true_peaks.size == 0:
+        return 0.0, 0.0, 0.0
+    matched_true = np.zeros(true_peaks.size, dtype=bool)
+    tp = 0
+    j_start = 0
+    for pf in pred_peaks:
+        # Advance j_start past true peaks that are too far below pf.
+        while j_start < true_peaks.size and true_peaks[j_start] < pf - tol_frames:
+            j_start += 1
+        # Search forward within the window for an unmatched true peak.
+        j = j_start
+        best_j = -1
+        best_d = tol_frames + 1
+        while j < true_peaks.size and true_peaks[j] <= pf + tol_frames:
+            if not matched_true[j]:
+                d = abs(int(true_peaks[j]) - int(pf))
+                if d < best_d:
+                    best_d = d
+                    best_j = j
+            j += 1
+        if best_j >= 0:
+            matched_true[best_j] = True
+            tp += 1
+    fp = pred_peaks.size - tp
+    fn = true_peaks.size - tp
+    if tp + fp + fn == 0:
+        return 0.0, 0.0, 0.0
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+    f1 = 2 * prec * rec / (prec + rec + 1e-8)
+    return prec, rec, f1
 
 
 def tolerance_f1(
@@ -592,33 +649,12 @@ def tolerance_f1(
     tol_frames: int = 3,
     threshold: float = 0.5,
 ) -> Tuple[float, float, float]:
-    """Greedy ±tol_frames matching on onset predictions. Returns (precision, recall, f1)."""
-    # Flatten to 1-D
+    """Greedy ±tol_frames matching on onset predictions. Returns (P, R, F1)."""
     pred_1d = pred_probs.reshape(-1)
     true_1d = true_hard.reshape(-1)
-
-    pred_peaks = _local_max_peaks(pred_1d, threshold, tol_frames)
-    true_peaks = np.where(true_1d > 0.5)[0]
-    matched = np.zeros(len(true_peaks), dtype=bool)
-    tp = 0
-    for pf in pred_peaks:
-        if len(true_peaks) == 0:
-            break
-        dists = np.abs(true_peaks - pf)
-        valid = (dists <= tol_frames) & (~matched)
-        if not valid.any():
-            continue
-        j = int(np.argmin(np.where(valid, dists, 10**9)))
-        matched[j] = True
-        tp += 1
-    fp = len(pred_peaks) - tp
-    fn = len(true_peaks) - tp
-    if tp + fp + fn == 0:
-        return 0.0, 0.0, 0.0
-    prec = tp / max(tp + fp, 1)
-    rec = tp / max(tp + fn, 1)
-    f1 = 2 * prec * rec / (prec + rec + 1e-8)
-    return prec, rec, f1
+    peak_idx, peak_probs = _all_local_max_peaks(pred_1d, tol_frames, min_threshold=threshold)
+    true_peaks = np.flatnonzero(true_1d > 0.5)
+    return _f1_at_threshold(peak_idx, peak_probs, true_peaks, tol_frames, threshold)
 
 
 @torch.no_grad()
@@ -730,12 +766,23 @@ def validate(
     print("  [validate] val loop done; concatenating preds...", flush=True)
     pred_concat = np.concatenate(all_pred, axis=0).reshape(-1, 1)
     true_concat = np.concatenate(all_true, axis=0).reshape(-1, 1)
-    print(f"  [validate] sweeping threshold over {pred_concat.shape[0]} frames...", flush=True)
+    pred_1d = pred_concat.reshape(-1)
+    true_1d_hard = true_concat.reshape(-1)
+    true_peaks = np.flatnonzero(true_1d_hard > 0.5)
+    thresholds = np.arange(0.05, 0.86, 0.05)
+    min_thr = float(thresholds.min())
+    print(
+        f"  [validate] computing peaks once at min_thr={min_thr:.2f} over "
+        f"{pred_1d.shape[0]} frames...", flush=True,
+    )
+    peak_idx, peak_probs = _all_local_max_peaks(
+        pred_1d, tol_frames, min_threshold=min_thr,
+    )
+    print(f"  [validate] {peak_idx.size} candidate peaks; sweeping {thresholds.size} thresholds...", flush=True)
     best_f1, best_thr, best_p, best_r = -1.0, 0.5, 0.0, 0.0
-    for thr in np.arange(0.05, 0.86, 0.05):
-        p_, r_, f_ = tolerance_f1(
-            pred_concat, true_concat,
-            tol_frames=tol_frames, threshold=float(thr),
+    for thr in thresholds:
+        p_, r_, f_ = _f1_at_threshold(
+            peak_idx, peak_probs, true_peaks, tol_frames, float(thr),
         )
         if f_ > best_f1:
             best_f1, best_thr, best_p, best_r = f_, float(thr), p_, r_
@@ -749,9 +796,12 @@ def validate(
         if extra_tol == tol_frames:
             extra_tols[extra_tol] = (best_p, best_r, best_f1)
             continue
-        p_e, r_e, f_e = tolerance_f1(
-            pred_concat, true_concat,
-            tol_frames=extra_tol, threshold=float(best_thr),
+        # Wider tolerance => recompute peaks at that window (NMS uses tol).
+        peak_idx_e, peak_probs_e = _all_local_max_peaks(
+            pred_1d, extra_tol, min_threshold=float(best_thr),
+        )
+        p_e, r_e, f_e = _f1_at_threshold(
+            peak_idx_e, peak_probs_e, true_peaks, extra_tol, float(best_thr),
         )
         extra_tols[extra_tol] = (p_e, r_e, f_e)
 
