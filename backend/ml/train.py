@@ -625,7 +625,10 @@ def tolerance_f1(
 def validate(
     model, loader, criterion, device, tol_frames: int = 3,
 ) -> Dict[str, float]:
+    print("  [validate] model.eval()...", flush=True)
     model.eval()
+    n_val_batches = len(loader)
+    print(f"  [validate] n_val_batches={n_val_batches}", flush=True)
     total_loss = 0.0
     total_onset = 0.0
     total_type = 0.0
@@ -652,7 +655,14 @@ def validate(
 
     dur_abs_errors = []
 
-    for batch in loader:
+    _t_val = time.time()
+    for v_step, batch in enumerate(loader):
+        if v_step < 3 or (v_step + 1) % 25 == 0 or (v_step + 1) == n_val_batches:
+            print(
+                f"  [validate] batch {v_step+1}/{n_val_batches} "
+                f"({time.time()-_t_val:.1f}s elapsed)",
+                flush=True,
+            )
         mel, difficulty, density, onset_soft, type_target, duration_target, beat_soft = batch
         mel = mel.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -717,8 +727,10 @@ def validate(
             true_d = duration_target[hold_mask].float().cpu().numpy()
             dur_abs_errors.append(np.abs(pred_d - true_d))
 
+    print("  [validate] val loop done; concatenating preds...", flush=True)
     pred_concat = np.concatenate(all_pred, axis=0).reshape(-1, 1)
     true_concat = np.concatenate(all_true, axis=0).reshape(-1, 1)
+    print(f"  [validate] sweeping threshold over {pred_concat.shape[0]} frames...", flush=True)
     best_f1, best_thr, best_p, best_r = -1.0, 0.5, 0.0, 0.0
     for thr in np.arange(0.05, 0.86, 0.05):
         p_, r_, f_ = tolerance_f1(
@@ -785,9 +797,11 @@ def validate(
     cal_tap_f1 = tap_f1
     cal_jump_f1 = jump_f1
     cal_hold_f1 = hold_f1
+    print("  [validate] threshold sweep done; running calibration sweep...", flush=True)
     if all_type_logits:
         logits_cat = np.concatenate(all_type_logits, axis=0)   # [N, 3]
         targets_cat = np.concatenate(all_type_targets, axis=0)  # [N]
+        print(f"  [validate] calibration: {logits_cat.shape[0]} supervised frames, 17x17 grid", flush=True)
         bias_grid = np.arange(-2.0, 2.001, 0.25)
         best = (cal_macro_f1, 0.0, 0.0)
         for jb in bias_grid:
@@ -812,6 +826,7 @@ def validate(
                     best = (macro, float(jb), float(hb))
                     cal_tap_f1, cal_jump_f1, cal_hold_f1 = per_class
         cal_macro_f1, cal_jump_bias, cal_hold_bias = best
+    print("  [validate] done", flush=True)
 
     return {
         'loss': total_loss / max(total_samples, 1),
