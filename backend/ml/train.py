@@ -198,14 +198,15 @@ class BuildOutputs:
 def build_dataloaders(args) -> BuildOutputs:
     data_dir = Path(args.data_dir)
     manifest_path = data_dir / 'manifest.json'
+    print(f"[build_dataloaders] data_dir={data_dir} manifest={manifest_path}", flush=True)
 
-    # Compute the per-difficulty default density first so the dataset can
-    # use it for the density-swap regularization (and we still save it on
-    # the checkpoint for inference defaults).
+    print("[build_dataloaders] compute_default_density_per_difficulty...", flush=True)
     default_density_by_id = compute_default_density_per_difficulty(
         str(manifest_path), str(data_dir)
     )
+    print("[build_dataloaders] default_density done", flush=True)
 
+    print("[build_dataloaders] constructing StepChartDataset (train)...", flush=True)
     full_dataset = StepChartDataset(
         data_dir=str(data_dir),
         manifest_path=str(manifest_path),
@@ -215,27 +216,35 @@ def build_dataloaders(args) -> BuildOutputs:
         density_swap_prob=float(getattr(args, 'p_density_swap', 0.5)),
         default_density_by_id=default_density_by_id,
     )
+    print(f"[build_dataloaders] dataset built, n_entries={len(full_dataset.entries)}", flush=True)
 
-    # By-song split (non-leaky)
+    print("[build_dataloaders] split_entries_by_song...", flush=True)
     train_idx, val_idx = split_entries_by_song(
         full_dataset.entries, val_fraction=args.val_split, seed=args.seed,
     )
+    print(f"[build_dataloaders] split: train={len(train_idx)} val={len(val_idx)}", flush=True)
 
-    # Per-entry note counts (for weighted sampler + onset prior)
+    print("[build_dataloaders] compute_note_counts...", flush=True)
     note_counts = compute_note_counts(full_dataset.entries, str(data_dir))
+    print("[build_dataloaders] compute_note_type_counts...", flush=True)
     note_type_counts = compute_note_type_counts(
         full_dataset.entries, str(data_dir), train_idx,
     )
+    print("[build_dataloaders] compute_onset_prior...", flush=True)
     onset_prior = compute_onset_prior(full_dataset.entries, str(data_dir), train_idx)
+    print("[build_dataloaders] compute_type_class_distribution...", flush=True)
     type_prior = compute_type_class_distribution(
         full_dataset.entries, str(data_dir), train_idx,
     )
+    print("[build_dataloaders] compute_hold_duration_median...", flush=True)
     hold_duration_median = compute_hold_duration_median(
         full_dataset.entries, str(data_dir), train_idx,
     )
+    print("[build_dataloaders] compute_beat_prior...", flush=True)
     beat_prior = compute_beat_prior(
         full_dataset.entries, str(data_dir), train_idx,
     )
+    print("[build_dataloaders] all priors done", flush=True)
 
     # Training sampler: chunk-level mixed rare sampler.
     # The song-level stratified sampler still runs as the backstop stream
@@ -248,9 +257,11 @@ def build_dataloaders(args) -> BuildOutputs:
         jump_boost=getattr(args, 'jump_sample_boost', 8.0),
         hold_boost=getattr(args, 'hold_sample_boost', 16.0),
     )
+    print("[build_dataloaders] compute_rare_chunk_index...", flush=True)
     rare_chunks = compute_rare_chunk_index(
         full_dataset.entries, str(data_dir), train_idx, args.chunk_frames,
     )
+    print(f"[build_dataloaders] rare_chunks={len(rare_chunks)}", flush=True)
     p_rare = float(getattr(args, 'p_rare', 0.5))
     if not rare_chunks:
         logger.warning("No rare-class chunks found in train split; falling back to song sampler only.")
@@ -264,7 +275,7 @@ def build_dataloaders(args) -> BuildOutputs:
         seed=args.seed,
     )
 
-    # Validation: non-overlapping chunks, no augmentation
+    print("[build_dataloaders] constructing StepChartDataset (val)...", flush=True)
     val_base = StepChartDataset(
         data_dir=str(data_dir),
         manifest_path=str(manifest_path),
@@ -276,6 +287,7 @@ def build_dataloaders(args) -> BuildOutputs:
     val_base._val_chunks = [
         (i, s) for (i, s) in val_base._val_chunks if i in val_entry_set
     ]
+    print(f"[build_dataloaders] val dataset built, val_chunks={len(val_base._val_chunks)}", flush=True)
 
     loader_kwargs = dict(
         num_workers=args.num_workers,
@@ -289,6 +301,7 @@ def build_dataloaders(args) -> BuildOutputs:
     # output to train indices.
     mixup_p = float(getattr(args, 'mixup_p', 0.0))
     mixup_alpha = float(getattr(args, 'mixup_alpha', 0.4))
+    print("[build_dataloaders] constructing train DataLoader...", flush=True)
     train_loader = DataLoader(
         full_dataset,
         batch_size=args.batch_size,
@@ -297,12 +310,14 @@ def build_dataloaders(args) -> BuildOutputs:
         collate_fn=make_mixup_collate(mixup_p, mixup_alpha),
         **loader_kwargs,
     )
+    print("[build_dataloaders] constructing val DataLoader...", flush=True)
     val_loader = DataLoader(
         val_base,
         batch_size=args.batch_size,
         shuffle=False,
         **loader_kwargs,
     )
+    print("[build_dataloaders] done", flush=True)
 
     logger.info(
         f"Train entries: {len(train_idx)}, val entries: {len(val_idx)}, "
@@ -431,8 +446,8 @@ def train_one_epoch(
     ema_model: Optional[AveragedModel] = None,
     log_interval: int = 50,
 ) -> Dict[str, float]:
-    model.train()
     print("  [train_one_epoch] model.train() done; about to iterate loader", flush=True)
+    model.train()
     total_loss = 0.0
     total_onset = 0.0
     total_type = 0.0
@@ -973,9 +988,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main():
+    print("[main] parsing args...", flush=True)
     args = build_argparser().parse_args()
+    print("[main] args parsed; seeding...", flush=True)
     seed_everything(args.seed)
 
+    print("[main] selecting device...", flush=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device} | git_sha={_git_sha()} | seed={args.seed}")
 
@@ -1005,9 +1023,13 @@ def main():
         hold_duration_median=built.hold_duration_median,
         beat_prior=built.beat_prior,
     )
+    print("[main] model built; building loss...", flush=True)
     criterion = build_loss(built.onset_prior, built.type_prior, args).to(device)
+    print("[main] loss built; computing steps_per_epoch (calls len(train_loader))...", flush=True)
     steps_per_epoch = max(1, len(built.train_loader))
+    print(f"[main] steps_per_epoch={steps_per_epoch}; building optimizer...", flush=True)
     optimizer, scheduler = build_optimizer_and_scheduler(model, args, steps_per_epoch)
+    print("[main] optimizer built", flush=True)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max',
         factor=args.plateau_factor,
