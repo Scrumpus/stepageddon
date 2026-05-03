@@ -277,6 +277,8 @@ class MLChartGenerator:
         jump_bias: float = 0.0,
         hold_bias: float = 0.0,
         type_prior_override: Optional[List[float]] = None,
+        min_first_step_time: float = 0.5,
+        min_last_step_buffer: float = 0.0,
     ):
         """
         Args (the new ones for type rebalancing):
@@ -297,6 +299,13 @@ class MLChartGenerator:
                 precedence over the checkpoint's stored prior. When neither
                 is provided, falls back to DEFAULT_TYPE_PRIOR_FALLBACK so
                 the rebalancing still works on legacy checkpoints.
+            min_first_step_time: Hard guardrail (seconds) — peaks before
+                this timestamp are dropped. Belt-and-suspenders alongside
+                the model's learned position conditioning so the very
+                first step never lands at t≈0 even if the model fires.
+            min_last_step_buffer: Hard guardrail (seconds) — peaks within
+                this many seconds of the song's end are dropped. 0.0
+                disables (the default; opt-in for callers who want it).
         """
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -313,6 +322,8 @@ class MLChartGenerator:
         )
         self.min_note_gap = min_note_gap
         self.snap_to_beats = snap_to_beats
+        self.min_first_step_time = float(min_first_step_time)
+        self.min_last_step_buffer = float(min_last_step_buffer)
         self.type_logit_adjust = float(type_logit_adjust)
         # Track whether the caller pinned the biases explicitly. Only
         # caller-provided values take precedence over the per-class
@@ -664,8 +675,21 @@ class MLChartGenerator:
             density_tensor = torch.tensor(
                 [density_norm], dtype=torch.float32, device=self.device
             )
+            # Per-chunk song-position scalars matching what the dataset
+            # produced at training time (start_seconds and remaining_seconds).
+            start_seconds = float(start) / FRAMES_PER_SECOND
+            remaining_seconds = max(0.0, float(T - end) / FRAMES_PER_SECOND)
+            start_seconds_tensor = torch.tensor(
+                [start_seconds], dtype=torch.float32, device=self.device,
+            )
+            remaining_seconds_tensor = torch.tensor(
+                [remaining_seconds], dtype=torch.float32, device=self.device,
+            )
 
-            features = self.model.encode(mel_tensor, diff_tensor, density_tensor)
+            features = self.model.encode(
+                mel_tensor, diff_tensor, density_tensor,
+                start_seconds_tensor, remaining_seconds_tensor,
+            )
             arrow_logits = self.model.apply_arrow_head(features, prev_arrow=None)
             type_logits = self.model.apply_type_head(features)
             dur_pred = self.model.apply_duration_head(features)
@@ -762,6 +786,12 @@ class MLChartGenerator:
         # ================================================================
 
         # NMS peak picking on the per-frame "any-arrow" probability.
+        # Edge guardrails: drop peaks before `min_first_step_time` and within
+        # `min_last_step_buffer` seconds of the end. Backstop alongside the
+        # model's learned position conditioning so even a rogue early-frame
+        # spike can't produce an arrow at t≈0.
+        first_allowed = max(0.0, self.min_first_step_time)
+        last_allowed = duration - max(0.0, self.min_last_step_buffer)
         peaks = []
         for frame in range(T):
             p = float(any_probs[frame])
@@ -772,7 +802,7 @@ class MLChartGenerator:
             if p < any_probs[lo:hi].max():
                 continue
             t = frame / FRAMES_PER_SECOND
-            if t < 0 or t > duration:
+            if t < first_allowed or t > last_allowed:
                 continue
             peaks.append((frame, t, p))
 

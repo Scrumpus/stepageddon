@@ -67,14 +67,15 @@ def make_mixup_collate(p_mixup: float, alpha: float):
     """Per-batch MixUp on mel + per-arrow onset targets, with type/duration masked.
 
     The dataset yields (mel, diff, density, arrow_soft, type_target, durations,
-    beat_soft, prev_arrow). With probability `p_mixup`, draw lambda ~
-    Beta(alpha, alpha), permute the batch, and replace mel/arrow_soft/beat_soft
-    with the convex combination. Type and duration supervision is dropped on
-    mixed batches (set to -100 / 0): teaching the type head on mixed targets
-    is ill-defined, but per-arrow BCE handles soft targets natively. prev_arrow
-    is also linearly interpolated — it's a binary 4-vector representing
-    "previous arrow," and a soft mix is a reasonable proxy for "previous arrow
-    of the mixed audio."
+    beat_soft, prev_arrow, start_seconds, remaining_seconds). With probability
+    `p_mixup`, draw lambda ~ Beta(alpha, alpha), permute the batch, and replace
+    mel/arrow_soft/beat_soft with the convex combination. Type and duration
+    supervision is dropped on mixed batches (set to -100 / 0): teaching the
+    type head on mixed targets is ill-defined, but per-arrow BCE handles soft
+    targets natively. prev_arrow is also linearly interpolated — it's a
+    binary 4-vector representing "previous arrow," and a soft mix is a
+    reasonable proxy for "previous arrow of the mixed audio." The two
+    song-position scalars are linearly mixed too — same conditioning logic.
 
     p_mixup=0.0 returns a default collate (no-op).
     """
@@ -87,7 +88,10 @@ def make_mixup_collate(p_mixup: float, alpha: float):
         out = default_collate(batch)
         if p_mixup <= 0.0 or torch.rand(()).item() >= p_mixup:
             return out
-        mel, diff, dens, arrow_soft, type_t, dur_t, beat_soft, prev_arrow = out
+        (
+            mel, diff, dens, arrow_soft, type_t, dur_t,
+            beat_soft, prev_arrow, start_s, remain_s,
+        ) = out
         B = mel.size(0)
         if B < 2:
             return out
@@ -98,11 +102,13 @@ def make_mixup_collate(p_mixup: float, alpha: float):
         arrow_mixed = lam * arrow_soft + (1.0 - lam) * arrow_soft[perm]
         beat_mixed = lam * beat_soft + (1.0 - lam) * beat_soft[perm]
         prev_mixed = lam * prev_arrow + (1.0 - lam) * prev_arrow[perm]
+        start_mixed = lam * start_s + (1.0 - lam) * start_s[perm]
+        remain_mixed = lam * remain_s + (1.0 - lam) * remain_s[perm]
         type_masked = torch.full_like(type_t, -100)
         dur_zeroed = torch.zeros_like(dur_t)
         return (
             mel_mixed, diff, dens, arrow_mixed, type_masked, dur_zeroed,
-            beat_mixed, prev_mixed,
+            beat_mixed, prev_mixed, start_mixed, remain_mixed,
         )
 
     return collate
@@ -221,6 +227,9 @@ def build_dataloaders(args) -> BuildOutputs:
         augment=True,
         density_swap_prob=float(getattr(args, 'p_density_swap', 0.5)),
         default_density_by_id=default_density_by_id,
+        intro_outro_oversample_prob=float(
+            getattr(args, 'intro_outro_oversample_prob', 0.15)
+        ),
     )
     print(f"[build_dataloaders] dataset built, n_entries={len(full_dataset.entries)}", flush=True)
 
@@ -505,7 +514,10 @@ def train_one_epoch(
                 f"(fetch={time.time()-_t_fetch:.2f}s)",
                 flush=True,
             )
-        mel, difficulty, density, arrow_soft, type_target, duration_target, beat_soft, prev_arrow = batch
+        (
+            mel, difficulty, density, arrow_soft, type_target, duration_target,
+            beat_soft, prev_arrow, start_seconds, remaining_seconds,
+        ) = batch
         if step < 3:
             print(f"  [train_one_epoch] batch {step} unpacked, mel={tuple(mel.shape)}", flush=True)
         mel = mel.to(device, non_blocking=True)
@@ -516,6 +528,8 @@ def train_one_epoch(
         duration_target = duration_target.to(device, non_blocking=True)
         beat_soft = beat_soft.to(device, non_blocking=True)
         prev_arrow = prev_arrow.to(device, non_blocking=True)
+        start_seconds = start_seconds.to(device, non_blocking=True)
+        remaining_seconds = remaining_seconds.to(device, non_blocking=True)
 
         # Per-frame prev-arrow dropout: zero the conditioning vector with
         # probability `prev_arrow_dropout`. Forces the head to remain useful
@@ -531,7 +545,8 @@ def train_one_epoch(
             print(f"  [train_one_epoch] batch {step} forward...", flush=True)
         with autocast('cuda'):
             arrow_logits, type_logits, duration_pred, beat_logits = model(
-                mel, difficulty, density, prev_arrow,
+                mel, difficulty, density,
+                start_seconds, remaining_seconds, prev_arrow,
             )
             loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
                 arrow_logits, type_logits, duration_pred,
@@ -747,7 +762,10 @@ def validate(
                 f"({time.time()-_t_val:.1f}s elapsed)",
                 flush=True,
             )
-        mel, difficulty, density, arrow_soft, type_target, duration_target, beat_soft, prev_arrow = batch
+        (
+            mel, difficulty, density, arrow_soft, type_target, duration_target,
+            beat_soft, prev_arrow, start_seconds, remaining_seconds,
+        ) = batch
         mel = mel.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
         density = density.to(device, non_blocking=True)
@@ -756,10 +774,13 @@ def validate(
         duration_target = duration_target.to(device, non_blocking=True)
         beat_soft = beat_soft.to(device, non_blocking=True)
         prev_arrow = prev_arrow.to(device, non_blocking=True)
+        start_seconds = start_seconds.to(device, non_blocking=True)
+        remaining_seconds = remaining_seconds.to(device, non_blocking=True)
 
         with autocast('cuda'):
             arrow_logits, type_logits, duration_pred, beat_logits = model(
-                mel, difficulty, density, prev_arrow,
+                mel, difficulty, density,
+                start_seconds, remaining_seconds, prev_arrow,
             )
             loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
                 arrow_logits, type_logits, duration_pred,
@@ -1107,10 +1128,11 @@ def save_checkpoint(
 ) -> None:
     ckpt = {
         'epoch': epoch,
-        # arch_version=2 marks the arrow-head architecture so inference can
-        # branch between the legacy single-onset head (=1, missing key) and
-        # the per-arrow head with prev-arrow conditioning (=2).
-        'arch_version': 2,
+        # arch_version history:
+        #   1 = legacy single-onset head (missing key)
+        #   2 = per-arrow head with prev_arrow conditioning
+        #   3 = +(start_seconds, remaining_seconds) FiLM conditioning
+        'arch_version': 3,
         'model_state_dict': model.state_dict(),
         'ema_state_dict': (
             ema_model.module.state_dict() if ema_model is not None else None
@@ -1193,6 +1215,12 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Probability that the density input is swapped at '
                              'training time for the per-difficulty default '
                              '(the constant inference uses). 0.0 disables.')
+    parser.add_argument('--intro-outro-oversample-prob', type=float, default=0.15,
+                        help='Per-sample probability of forcing a training '
+                             'chunk to start at song frame 0 (intro), with the '
+                             'same probability of anchoring to song end. '
+                             'Without this, edge chunks are far too rare for '
+                             'the model to learn intro-silence patterns.')
     parser.add_argument('--mixup-p', type=float, default=0.3,
                         help='Per-batch probability of applying MixUp to mel + '
                              'onset target. Type/duration supervision is dropped '

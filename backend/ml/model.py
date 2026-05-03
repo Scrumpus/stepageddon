@@ -131,10 +131,18 @@ class FourierFeatures(nn.Module):
 
 class FiLMConditioner(nn.Module):
     """
-    Single FiLM conditioner for (difficulty, density).
+    Single FiLM conditioner for (difficulty, density, song-position).
 
     Builds (gamma, beta) from a difficulty embedding concatenated with random
-    Fourier features of density, and applies `gamma * x + beta` to features.
+    Fourier features of density and song-position scalars (start_seconds,
+    remaining_seconds), and applies `gamma * x + beta` to features.
+
+    The position scalars let the model learn empirical edge-of-song patterns
+    (e.g., charts typically have several seconds of silence before the first
+    arrow, and often taper near the end). Per-chunk conditioning is
+    sufficient because the transformer's RoPE positions resolve intra-chunk
+    location; the FiLM signal only has to disambiguate "this chunk is at
+    song start" from "this chunk is mid-song".
 
     Proj is init so that at step 0 the layer is an identity (gamma=1, beta=0)
     regardless of input, so training isn't destabilized.
@@ -145,12 +153,20 @@ class FiLMConditioner(nn.Module):
         n_difficulties: int,
         hidden_dim: int,
         n_fourier: int = 16,
+        n_fourier_position: int = 16,
+        position_sigma: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.diff_emb = nn.Embedding(n_difficulties, hidden_dim)
         self.fourier = FourierFeatures(n_fourier)
-        cond_dim = hidden_dim + 2 * n_fourier
+        # Separate Fourier modules for the two position scalars. Sigma is
+        # tuned for the seconds scale: with sigma=0.1, the random frequencies
+        # have periods ranging from ~10s up to a few hundred seconds, which
+        # spans both intro silence (sub-10s) and song-section structure.
+        self.fourier_start = FourierFeatures(n_fourier_position, sigma=position_sigma)
+        self.fourier_remaining = FourierFeatures(n_fourier_position, sigma=position_sigma)
+        cond_dim = hidden_dim + 2 * n_fourier + 2 * (2 * n_fourier_position)
         self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
 
         nn.init.normal_(self.diff_emb.weight, mean=0.0, std=0.02)
@@ -165,12 +181,16 @@ class FiLMConditioner(nn.Module):
         x: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
+        start_seconds: torch.Tensor,
+        remaining_seconds: torch.Tensor,
     ) -> torch.Tensor:
-        # x: [B, T, H], difficulty: [B], density: [B]
-        d = self.diff_emb(difficulty)           # [B, H]
-        f = self.fourier(density)                # [B, 2*n_fourier]
-        cond = torch.cat([d, f], dim=-1)         # [B, H + 2*n_fourier]
-        params = self.proj(cond)                 # [B, 2H]
+        # x: [B, T, H]; difficulty: [B]; density/start_seconds/remaining_seconds: [B]
+        d = self.diff_emb(difficulty)                      # [B, H]
+        f = self.fourier(density)                          # [B, 2*n_fourier]
+        fs = self.fourier_start(start_seconds)             # [B, 2*n_fourier_position]
+        fr = self.fourier_remaining(remaining_seconds)     # [B, 2*n_fourier_position]
+        cond = torch.cat([d, f, fs, fr], dim=-1)
+        params = self.proj(cond)                            # [B, 2H]
         gamma, beta = params.chunk(2, dim=-1)
         return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
 
@@ -456,6 +476,8 @@ class StepChartModel(nn.Module):
         mel: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
+        start_seconds: torch.Tensor,
+        remaining_seconds: torch.Tensor,
     ) -> torch.Tensor:
         """Backbone-only forward. Returns per-frame features [B, T, H].
 
@@ -465,7 +487,7 @@ class StepChartModel(nn.Module):
         """
         x = self.audio_encoder(mel)
         x = self.tcn(x)
-        x = self.film(x, difficulty, density)
+        x = self.film(x, difficulty, density, start_seconds, remaining_seconds)
         for blk in self.blocks:
             x = blk(x)
         return self.norm(x)
@@ -495,6 +517,8 @@ class StepChartModel(nn.Module):
         mel: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
+        start_seconds: torch.Tensor,
+        remaining_seconds: torch.Tensor,
         prev_arrow: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -502,6 +526,8 @@ class StepChartModel(nn.Module):
             mel: [B, T, n_mels]
             difficulty: [B] long
             density: [B] float (normalized)
+            start_seconds: [B] float — chunk's start time from song start (seconds)
+            remaining_seconds: [B] float — song length minus chunk end time (seconds)
             prev_arrow: [B, T, 4] float — per-frame "previous emitted arrow"
                 vector for the arrow head's transition conditioning. If None
                 (legacy callers / one-shot inference), zeros are used —
@@ -513,7 +539,9 @@ class StepChartModel(nn.Module):
             duration_pred: [B, T, 1]  log-space scalar; decode via `decode_duration`
             beat_logits:   [B, T, 1]  auxiliary beat-frame prediction (pre-sigmoid)
         """
-        features = self.encode(mel, difficulty, density)        # [B, T, H]
+        features = self.encode(
+            mel, difficulty, density, start_seconds, remaining_seconds,
+        )                                                       # [B, T, H]
         arrow_logits = self.apply_arrow_head(features, prev_arrow)
         type_logits = self.apply_type_head(features)
         duration_pred = self.apply_duration_head(features)

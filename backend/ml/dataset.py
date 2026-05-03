@@ -125,6 +125,7 @@ class StepChartDataset(Dataset):
         type_target_dilate: int = 1,
         density_swap_prob: float = 0.0,
         default_density_by_id: Optional[torch.Tensor] = None,
+        intro_outro_oversample_prob: float = 0.15,
     ):
         """
         Args:
@@ -163,6 +164,14 @@ class StepChartDataset(Dataset):
             default_density_by_id.float()
             if default_density_by_id is not None else None
         )
+
+        # Intro/outro oversampling: at training time, force a chunk to start
+        # at song frame 0 with this probability (and force a chunk anchored
+        # to the song's last frame with the same probability). Without this,
+        # song-edge chunks are sampled uniformly — about 1/(n_frames - chunk)
+        # — which is far too rare for the model to learn the intro-silence
+        # pattern. Only used in the random-chunk training path.
+        self.intro_outro_oversample_prob = float(intro_outro_oversample_prob)
 
         # Precomputed Gaussian kernel for onset label smoothing.
         if self.onset_smooth_sigma > 0:
@@ -227,9 +236,20 @@ class StepChartDataset(Dataset):
             else:
                 entry = self.entries[idx]
                 n_frames = entry['n_frames']
-                # Random start position
                 max_start = n_frames - self.chunk_frames
-                start = np.random.randint(0, max_start + 1)
+                # Intro/outro oversampling: with two independent
+                # `intro_outro_oversample_prob` chances, anchor the chunk at
+                # song start or song end so the model sees enough edge cases
+                # to learn the empirical "silence at start/end" pattern.
+                # Otherwise sample uniformly across the song.
+                p_edge = self.intro_outro_oversample_prob
+                r = np.random.random() if p_edge > 0.0 else 1.0
+                if r < p_edge:
+                    start = 0
+                elif r < 2 * p_edge:
+                    start = max_start
+                else:
+                    start = np.random.randint(0, max_start + 1)
         else:
             entry_idx, start = self._val_chunks[idx]
             entry = self.entries[entry_idx]
@@ -287,6 +307,15 @@ class StepChartDataset(Dataset):
         step_frames = int((labels_chunk >= 1).sum())
         chunk_seconds = self.chunk_frames / FRAMES_PER_SECOND
         density = step_frames / chunk_seconds
+
+        # Per-chunk song-position scalars used as FiLM conditioning so the
+        # model can learn empirical edge-of-song behavior (silence at the
+        # start, taper at the end). Both are clipped to >= 0 to guard
+        # against the corner case where end > n_frames (padded chunk).
+        start_seconds = float(start) / FRAMES_PER_SECOND
+        remaining_seconds = max(
+            0.0, float(n_frames - end) / FRAMES_PER_SECOND
+        )
 
         # Density swap: at training time, sometimes substitute the
         # per-difficulty default (the inference-time constant) so the model
@@ -348,6 +377,8 @@ class StepChartDataset(Dataset):
             torch.from_numpy(durations_chunk),
             torch.from_numpy(beat_soft),
             torch.from_numpy(prev_arrow_chunk),
+            torch.tensor(start_seconds, dtype=torch.float32),
+            torch.tensor(remaining_seconds, dtype=torch.float32),
         )
 
     # ------------------------------------------------------------------
