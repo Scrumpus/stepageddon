@@ -852,7 +852,11 @@ def validate(
         logits_cat = np.concatenate(all_type_logits, axis=0)   # [N, 3]
         targets_cat = np.concatenate(all_type_targets, axis=0)  # [N]
         print(f"  [validate] calibration: {logits_cat.shape[0]} supervised frames, 17x17 grid", flush=True)
-        bias_grid = np.arange(-2.0, 2.001, 0.25)
+        # Widened from ±2.0 → ±3.0: at the previous range, the optimal
+        # (jump_bias, hold_bias) saturated at the lower edge, meaning the
+        # sweep wanted to push further. ±3.0 gives more headroom while
+        # still being a reasonable shift in logit space.
+        bias_grid = np.arange(-3.0, 3.001, 0.25)
         best = (cal_macro_f1, 0.0, 0.0)
         for jb in bias_grid:
             for hb in bias_grid:
@@ -1190,6 +1194,8 @@ def main():
             f"{val_metrics['jump_f1']:.3f}/"
             f"{val_metrics['hold_f1']:.3f} "
             f"(macro={val_metrics['type_macro_f1']:.3f}) "
+            f"jump[P={val_metrics['jump_p']:.3f} R={val_metrics['jump_r']:.3f}] "
+            f"hold[P={val_metrics['hold_p']:.3f} R={val_metrics['hold_r']:.3f}] "
             f"dur_mae={val_metrics['dur_mae_beats']:.3f}b "
             f"| probs[max={val_metrics['prob_max']:.3f} "
             f"p99={val_metrics['prob_p99']:.3f} "

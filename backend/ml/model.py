@@ -558,11 +558,22 @@ class StepChartLoss(nn.Module):
             else:
                 type_loss = ce_per_frame.sum() * 0.0
         else:
-            type_loss = F.cross_entropy(
-                type_flat, target_flat,
-                weight=self.type_class_weights,
-                ignore_index=-100,
-            )
+            # Guard against fully-masked batches. MixUp sets every frame's
+            # type target to -100, and `F.cross_entropy(reduction='mean',
+            # ignore_index=-100)` returns NaN when zero frames are valid
+            # (sum / count = 0 / 0). The focal branch above handles this
+            # explicitly; we need the same guard here. Without it, the
+            # mean-over-epoch type loss reports NaN and GradScaler silently
+            # skips the affected batches.
+            valid = target_flat != -100
+            if valid.any():
+                type_loss = F.cross_entropy(
+                    type_flat, target_flat,
+                    weight=self.type_class_weights,
+                    ignore_index=-100,
+                )
+            else:
+                type_loss = type_flat.sum() * 0.0
 
         # Duration loss: log-space smooth-L1 on a ±DURATION_WINDOW window
         # around each hold_start. Inflating the window from a single frame
