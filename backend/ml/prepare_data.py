@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 # schema. Dataset loaders error loudly on mismatch.
 # v4: adds song-level `beats` array (shape [T] uint8) for the auxiliary
 # beat-prediction head.
-FORMAT_VERSION = 4
+# v5: adds per-chart `arrow_labels_<diff>` array (shape [T, 4] uint8) for the
+# arrow-aware onset head. labels_<diff> stays for the type head and back-compat.
+FORMAT_VERSION = 5
 
 # Audio processing constants
 SAMPLE_RATE = 22050
@@ -155,16 +157,23 @@ def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
 
 def notes_to_frame_labels(notes, n_frames: int):
     """
-    Convert note list to frame-aligned label and duration arrays (arrow-agnostic).
+    Convert note list to frame-aligned label, duration, and per-arrow arrays.
 
-    Collapses per-arrow information into a single note-type label per frame.
-    Counts simultaneous events to distinguish singles from jumps:
-        - 1 tap → tap, 2+ taps → jump
-        - 1 hold_head → hold_start, 2+ hold_heads → hold_start
+    Returns three aligned tensors:
+      - `labels` (arrow-agnostic note type) for the type head
+      - `durations` for the duration head
+      - `arrow_labels` (per-arrow binary) for the arrow head
 
-    Hold durations are computed by pairing hold_head → hold_tail on the same
-    arrow column, then stored at the hold_start frame. The model predicts
-    duration directly instead of detecting a separate hold_end event.
+    The labels collapse: 1 tap → tap, 2+ taps → jump, 1 hold_head → hold_start,
+    2+ hold_heads → hold_start.
+
+    Hold durations come from greedy hold_head → hold_tail pairing on the same
+    column. Stored at the hold_start frame. The model predicts duration
+    directly instead of detecting a separate hold_end event.
+
+    `arrow_labels[t, a] = 1` iff a tap or hold_head landed on arrow `a` at
+    frame `t`. arrow indices are 0=L, 1=D, 2=U, 3=R (matches sm_parser's
+    Note.arrow column ids and inference's ARROW_DIRECTIONS).
 
     Args:
         notes: List of Note objects from sm_parser
@@ -174,10 +183,12 @@ def notes_to_frame_labels(notes, n_frames: int):
         labels: [n_frames] uint8 array with values 0-3
         durations: [n_frames] float32 array, hold duration in seconds at
             hold_start frames, 0.0 elsewhere
+        arrow_labels: [n_frames, 4] uint8 array, per-arrow onset indicator
     """
     labels = np.zeros(n_frames, dtype=np.uint8)
     durations = np.zeros(n_frames, dtype=np.float32)
     tap_counts = np.zeros(n_frames, dtype=np.uint8)
+    arrow_labels = np.zeros((n_frames, 4), dtype=np.uint8)
 
     # First pass: pair hold_head → hold_tail per arrow to get durations.
     # Collect hold_heads per column, then match with tails in time order.
@@ -211,7 +222,7 @@ def notes_to_frame_labels(notes, n_frames: int):
                     )
                     ti += 1
 
-    # Second pass: assign labels
+    # Second pass: assign labels and per-arrow indicators
     for note in notes:
         frame = int(round(note.time * FRAMES_PER_SECOND))
         if frame < 0 or frame >= n_frames:
@@ -221,16 +232,20 @@ def notes_to_frame_labels(notes, n_frames: int):
             tap_counts[frame] += 1
             if labels[frame] == LABEL_NONE:
                 labels[frame] = LABEL_TAP
+            if 0 <= note.arrow < 4:
+                arrow_labels[frame, note.arrow] = 1
         elif note.note_type == 'hold_head':
             labels[frame] = LABEL_HOLD_START
             if frame in hold_durations_at_frame:
                 durations[frame] = hold_durations_at_frame[frame]
+            if 0 <= note.arrow < 4:
+                arrow_labels[frame, note.arrow] = 1
 
     # Upgrade tap → jump where 2+ arrows fired simultaneously
     jump_mask = tap_counts >= 2
     labels[jump_mask & (labels == LABEL_TAP)] = LABEL_JUMP
 
-    return labels, durations
+    return labels, durations, arrow_labels
 
 
 def find_audio_file(chart_dir: Path) -> Optional[Path]:
@@ -294,7 +309,7 @@ def process_chart_directory(
         if not chart.notes:
             continue
 
-        labels, durations = notes_to_frame_labels(chart.notes, n_frames)
+        labels, durations, arrow_labels = notes_to_frame_labels(chart.notes, n_frames)
 
         # Skip charts with very few notes
         note_frames = (labels > 0).sum()
@@ -309,13 +324,16 @@ def process_chart_directory(
             suffix += 1
         labels_key = f'labels_{diff_name}'
         durations_key = f'durations_{diff_name}'
+        arrows_key = f'arrow_labels_{diff_name}'
         arrays[labels_key] = labels
         arrays[durations_key] = durations
+        arrays[arrows_key] = arrow_labels
 
         entries.append({
             'filename': song_filename,
             'labels_key': labels_key,
             'durations_key': durations_key,
+            'arrow_labels_key': arrows_key,
             'song_title': sm.title,
             'artist': sm.artist,
             'difficulty': chart.difficulty,

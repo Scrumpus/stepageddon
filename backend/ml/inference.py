@@ -334,6 +334,10 @@ class MLChartGenerator:
         )
 
         self.model = None
+        # Per-arrow decision thresholds for the arrow head. Populated from the
+        # checkpoint if it was saved with one (arch_version=2). When None,
+        # `_choose_arrows` falls back to the scalar `confidence_threshold`.
+        self.arrow_thresholds: Optional[np.ndarray] = None
         # Per-difficulty inference-time default density (steps/sec). Populated
         # from the checkpoint if it was saved with one, else falls back to the
         # hardcoded preset midpoints.
@@ -439,6 +443,25 @@ class MLChartGenerator:
             logger.warning(
                 f"Checkpoint has no best_threshold; using default "
                 f"{self.confidence_threshold:.3f}. Retrain to calibrate."
+            )
+
+        # Per-arrow thresholds. arch_version=2 checkpoints save these from the
+        # validation per-arrow F1 sweep. Caller-supplied confidence_threshold
+        # disables the per-arrow path (uniform threshold across arrows).
+        ckpt_arrow_thr = checkpoint.get('best_arrow_thresholds')
+        if (
+            ckpt_arrow_thr is not None
+            and self._confidence_threshold_override is None
+        ):
+            self.arrow_thresholds = np.asarray(ckpt_arrow_thr, dtype=np.float32)
+            logger.info(
+                f"Per-arrow thresholds [L,D,U,R] = {self.arrow_thresholds.tolist()} "
+                f"(from checkpoint)"
+            )
+        else:
+            logger.info(
+                "Per-arrow thresholds: using uniform confidence_threshold "
+                f"({self.confidence_threshold:.3f}) for all 4 arrows."
             )
 
         # Duration unit marker. New checkpoints train on beats; legacy on
@@ -552,7 +575,7 @@ class MLChartGenerator:
 
         # Run model inference in chunks
         logger.info(f"Running inference (difficulty={difficulty}, id={difficulty_id})...")
-        onset_probs, type_probs, duration_pred = self._predict_chunked(
+        features, arrow_probs0, type_probs, duration_pred = self._predict_chunked(
             mel_frames, difficulty_id, target_density
         )
 
@@ -565,7 +588,7 @@ class MLChartGenerator:
         diff_config = get_difficulty_config(difficulty)
         logger.info("Post-processing predictions...")
         steps = self._postprocess(
-            onset_probs, type_probs, duration_pred,
+            features, arrow_probs0, type_probs, duration_pred,
             tempo, beat_times, duration, diff_config,
             energy_curve=rms_norm, brightness_curve=centroid_norm,
             audio_seed=audio_seed,
@@ -594,14 +617,18 @@ class MLChartGenerator:
         Run model on overlapping chunks and merge predictions.
 
         Returns:
-            onset_probs:   [T] float32 sigmoid("note present")
+            features:      [T, H] float32 backbone features (kept for the
+                arrow head's autoregressive second pass).
+            arrow_probs0:  [T, 4] float32 per-arrow sigmoid under prev_arrow=0.
+                Used for NMS peak picking (which frames are onsets).
             type_probs:    [T, 3] float32 softmax over {tap, jump, hold_start}
             duration_pred: [T] float32 predicted hold duration in seconds
-                (decoded from the model's log-space output via
-                StepChartModel.decode_duration)
+                (decoded from log-space via StepChartModel.decode_duration)
         """
         T = mel_frames.shape[0]
-        onset_sum = np.zeros(T, dtype=np.float32)
+        H = self.model.hidden_dim
+        feat_sum = np.zeros((T, H), dtype=np.float32)
+        arrow_sum = np.zeros((T, 4), dtype=np.float32)
         type_sum = np.zeros((T, 3), dtype=np.float32)
         dur_sum = np.zeros(T, dtype=np.float32)
         counts = np.zeros(T, dtype=np.float32)
@@ -609,13 +636,8 @@ class MLChartGenerator:
         stride = self.chunk_frames - self.overlap_frames
         density_norm = (target_density - DENSITY_MEAN) / DENSITY_STD
 
-        # Build the per-class additive logit bias once. Combines:
-        #   - prior-based logit adjustment (Menon et al. 2020): subtract
-        #     type_logit_adjust * log(prior) from each class so that with
-        #     adjust=1.0 the posterior is uniform over {tap, jump, hold}.
-        #   - explicit jump_bias / hold_bias for fine-tuning at inference.
-        # When type_prior is unavailable (legacy ckpt), only the explicit
-        # biases take effect, which is the desired graceful fallback.
+        # Build per-class additive logit bias for the type head. Same logic as
+        # before — prior correction + explicit jump/hold bias in logit space.
         type_logit_bias = np.zeros(3, dtype=np.float32)
         if self.type_prior is not None and self.type_logit_adjust != 0.0:
             log_prior = np.log(np.clip(self.type_prior, 1e-6, 1.0))
@@ -643,128 +665,141 @@ class MLChartGenerator:
                 [density_norm], dtype=torch.float32, device=self.device
             )
 
-            model_out = self.model(mel_tensor, diff_tensor, density_tensor)
-            # New checkpoints return 4 tensors (incl. auxiliary beat head);
-            # legacy 3-tensor checkpoints still work because we only use the
-            # first three values downstream.
-            onset_logits, type_logits, dur_pred = model_out[0], model_out[1], model_out[2]
-            onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]   # [T_chunk]
-            # Apply prior-correction + explicit biases in logit space, then softmax.
-            # This recovers a near-balanced posterior over {tap, jump, hold_start}
-            # so argmax in postprocess actually picks holds/jumps when warranted.
-            type_logits_adj = type_logits.float().cpu().numpy()[0]                 # [T_chunk, 3]
-            type_logits_adj = type_logits_adj + type_logit_bias[None, :]
+            features = self.model.encode(mel_tensor, diff_tensor, density_tensor)
+            arrow_logits = self.model.apply_arrow_head(features, prev_arrow=None)
+            type_logits = self.model.apply_type_head(features)
+            dur_pred = self.model.apply_duration_head(features)
+
+            features_np = features.float().cpu().numpy()[0]                      # [T_chunk, H]
+            arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0]       # [T_chunk, 4]
+            type_logits_adj = type_logits.float().cpu().numpy()[0] + type_logit_bias[None, :]
             type_logits_adj -= type_logits_adj.max(axis=-1, keepdims=True)
             exp = np.exp(type_logits_adj)
-            type_p = exp / exp.sum(axis=-1, keepdims=True)                          # [T_chunk, 3]
-            dur_p = dur_pred.float().cpu().numpy()[0, :, 0]                         # [T_chunk]
+            type_p = exp / exp.sum(axis=-1, keepdims=True)                       # [T_chunk, 3]
+            dur_p = dur_pred.float().cpu().numpy()[0, :, 0]                      # [T_chunk]
 
             valid_len = min(end - start, self.chunk_frames)
-            onset_sum[start:start + valid_len] += onset_p[:valid_len]
+            feat_sum[start:start + valid_len] += features_np[:valid_len]
+            arrow_sum[start:start + valid_len] += arrow_p[:valid_len]
             type_sum[start:start + valid_len] += type_p[:valid_len]
             dur_sum[start:start + valid_len] += dur_p[:valid_len]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)
-        onset_probs = onset_sum / counts
+        features_avg = feat_sum / counts[:, None]
+        arrow_probs0 = arrow_sum / counts[:, None]
         type_probs = type_sum / counts[:, None]
-        # Average is performed in log-space (geometric mean of overlapping
-        # chunk predictions). Decode to seconds *after* the average so the
-        # downstream postprocess reads a real-seconds tensor.
         duration_log_mean = dur_sum / counts
         duration_pred = StepChartModel.decode_duration(duration_log_mean)
-        # Tiny negative values can appear if log_mean < log(offset);
-        # clip to keep the contract that durations are non-negative seconds.
         np.clip(duration_pred, 0.0, None, out=duration_pred)
-        return onset_probs, type_probs, duration_pred
+        return features_avg, arrow_probs0, type_probs, duration_pred
+
+    @torch.no_grad()
+    def _arrow_logits_at_frame(
+        self, features_t: np.ndarray, prev_arrow_vec: np.ndarray,
+    ) -> np.ndarray:
+        """Run the arrow head at a single frame with explicit prev_arrow.
+
+        features_t: [H] backbone features at this frame.
+        prev_arrow_vec: [4] binary vector of "previous arrow set."
+        Returns [4] arrow logits.
+        """
+        feat_t = torch.from_numpy(features_t).to(self.device).view(1, 1, -1)
+        prev = torch.from_numpy(prev_arrow_vec.astype(np.float32)).to(
+            self.device
+        ).view(1, 1, -1)
+        logits = self.model.apply_arrow_head(feat_t, prev_arrow=prev)
+        return logits.float().cpu().numpy()[0, 0]
 
     def _postprocess(
         self,
-        onset_probs: np.ndarray,    # [T] — single onset probability per frame
-        type_probs: np.ndarray,     # [T, 3]  (0=tap, 1=jump, 2=hold_start)
-        duration_pred: np.ndarray,  # [T] predicted hold duration in seconds
+        features: np.ndarray,        # [T, H] backbone features
+        arrow_probs0: np.ndarray,    # [T, 4] per-arrow probs under prev_arrow=0
+        type_probs: np.ndarray,      # [T, 3]  (0=tap, 1=jump, 2=hold_start)
+        duration_pred: np.ndarray,   # [T] predicted hold duration in seconds
         tempo: float,
         beat_times: np.ndarray,
         duration: float,
         diff_config,
-        energy_curve: Optional[np.ndarray] = None,     # [T_audio] normalized RMS
-        brightness_curve: Optional[np.ndarray] = None,  # [T_audio] normalized centroid
+        energy_curve: Optional[np.ndarray] = None,
+        brightness_curve: Optional[np.ndarray] = None,
         audio_seed: int = 0,
     ) -> List[Step]:
         """
-        Convert (onset, type, duration) predictions into Step objects.
+        Convert (per-arrow onset, type, duration) predictions into Step objects.
 
         Two-phase pipeline:
-            Phase 1 (from model): Detect WHEN notes occur, WHAT type, and HOW LONG
-                1. NMS peak picking on onset signal
-                2. Classify each peak: tap, jump, hold_start
-                3. For hold_start peaks, read predicted duration directly
+            Phase 1: Detect WHEN, WHAT type, HOW LONG (arrow-aware NMS)
+                1. NMS peak picking on `arrow_probs0.max(-1)` to find onsets
+                   (using the no-context arrow probs — autoregressive
+                   re-scoring happens per-onset in phase 2)
+                2. Classify each peak via type head: tap / jump / hold_start
+                3. For hold_start, read duration from duration head
                 4. Density cap, beat-snap, min-gap enforcement
 
-            Phase 2 (audio-driven, deterministic): Determine WHICH arrows
-                5. FootStateArrowAssigner uses seeded PRNG + audio features
-                   (energy, brightness) to select from expanded pattern vocab
-                6. Build Step objects
+            Phase 2: Determine WHICH arrows (autoregressive arrow head)
+                5. Walk onsets in time order, conditioning the arrow head on
+                   the previously emitted arrow vector. Per-arrow thresholds.
+                6. FootStateArrowAssigner only as a fallback when the arrow
+                   head fires on no arrows / wrong cardinality for the type.
         """
-        T = onset_probs.shape[0]
+        T = arrow_probs0.shape[0]
+        any_probs = arrow_probs0.max(axis=-1)
 
         logger.info(
-            f"[postprocess debug] onset_probs.shape={onset_probs.shape} "
-            f"max={onset_probs.max():.4f} mean={onset_probs.mean():.4f} "
-            f"p95={np.percentile(onset_probs, 95):.4f} "
-            f"p99={np.percentile(onset_probs, 99):.4f}"
+            f"[postprocess debug] arrow_probs.shape={arrow_probs0.shape} "
+            f"any_max={any_probs.max():.4f} any_mean={any_probs.mean():.4f} "
+            f"p95={np.percentile(any_probs, 95):.4f} "
+            f"p99={np.percentile(any_probs, 99):.4f}"
         )
 
         min_gap = max(diff_config.min_gap, self.min_note_gap)
         nms_window_frames = max(1, int(round(min_gap * FRAMES_PER_SECOND)))
-
-        # Per-difficulty jump allowance
         jumps_allowed = 'jump' in diff_config.allowed_patterns
 
         # ================================================================
-        # Phase 1: Detect WHEN, WHAT, and HOW LONG (arrow-agnostic)
+        # Phase 1: Detect WHEN / WHAT type / HOW LONG
         # ================================================================
 
-        # Step 1: NMS peak picking on onset curve
-        peaks = []  # list of (frame, time, confidence)
+        # NMS peak picking on the per-frame "any-arrow" probability.
+        peaks = []
         for frame in range(T):
-            p = float(onset_probs[frame])
+            p = float(any_probs[frame])
             if p < max(self.confidence_threshold, 1e-4):
                 continue
             lo = max(0, frame - nms_window_frames)
             hi = min(T, frame + nms_window_frames + 1)
-            if p < onset_probs[lo:hi].max():
+            if p < any_probs[lo:hi].max():
                 continue
             t = frame / FRAMES_PER_SECOND
             if t < 0 or t > duration:
                 continue
             peaks.append((frame, t, p))
 
-        # Step 2: Classify each peak and read duration for holds
+        # Classify each peak and read duration for holds.
         note_events = []
         for frame, t, confidence in peaks:
-            # type_probs[frame]: [3] = {tap, jump, hold_start}
             note_type = int(np.argmax(type_probs[frame]))
-
-            if note_type == 0:  # tap
+            if note_type == 0:
                 note_events.append({
-                    'time': t, 'type': 'tap', 'confidence': confidence,
-                    'num_arrows': 1,
+                    'frame': frame, 'time': t, 'type': 'tap',
+                    'confidence': confidence, 'num_arrows': 1,
                 })
-            elif note_type == 1:  # jump
+            elif note_type == 1:
                 num_arrows = 2 if jumps_allowed else 1
                 note_events.append({
-                    'time': t, 'type': 'tap', 'confidence': confidence,
-                    'num_arrows': num_arrows,
+                    'frame': frame, 'time': t, 'type': 'tap',
+                    'confidence': confidence, 'num_arrows': num_arrows,
                 })
-            else:  # hold_start — read duration from the duration head
+            else:
                 hold_dur = float(np.clip(duration_pred[frame], 0.2, 5.0))
                 note_events.append({
-                    'time': t, 'type': 'hold', 'confidence': confidence,
-                    'hold_duration': hold_dur, 'num_arrows': 1,
+                    'frame': frame, 'time': t, 'type': 'hold',
+                    'confidence': confidence, 'hold_duration': hold_dur,
+                    'num_arrows': 1,
                 })
 
-        # Step 3: Density cap — keep top-N events by confidence
+        # Density cap — keep top-N by confidence (holds are protected).
         avg_density = (diff_config.min_density + diff_config.max_density) / 2.0
         target_notes = max(1, int(round(avg_density * duration)))
         logger.info(
@@ -772,34 +807,27 @@ class MLChartGenerator:
             f"target_notes={target_notes} (density={avg_density:.2f}/s, dur={duration:.1f}s)"
         )
         if len(note_events) > target_notes:
-            # Keep holds unconditionally, cap taps
             holds = [e for e in note_events if e['type'] == 'hold']
             taps = [e for e in note_events if e['type'] == 'tap']
             taps.sort(key=lambda e: e['confidence'], reverse=True)
             remaining = max(0, target_notes - len(holds))
             note_events = holds + taps[:remaining]
 
-        # Step 4: Beat-snap
-        # Snap each event to a 16th-note grid anchored at beat_times[0] and
-        # remember which grid slot it landed in. The slot index drives the
-        # subdivision color downstream — using the integer index avoids the
-        # float / tempo-estimation drift that breaks modular-arithmetic
-        # subdivision derivation.
+        # Beat-snap (and remember the grid slot for subdivision color).
         if self.snap_to_beats and len(beat_times) > 1:
             beat_interval = 60.0 / tempo
             grid = []
             gt = beat_times[0] if len(beat_times) > 0 else 0.0
             while gt <= duration:
                 grid.append(gt)
-                gt += beat_interval / 4  # 16th note grid
+                gt += beat_interval / 4
             grid = np.array(grid)
-
             for event in note_events:
                 nearest_idx = int(np.argmin(np.abs(grid - event['time'])))
                 event['time'] = float(grid[nearest_idx])
                 event['grid_idx'] = nearest_idx
 
-        # Step 5: Sort and enforce minimum gap
+        # Sort and enforce min-gap.
         note_events.sort(key=lambda e: e['time'])
         filtered = []
         last_time = -1.0
@@ -810,7 +838,7 @@ class MLChartGenerator:
         note_events = filtered
 
         # ================================================================
-        # Phase 2: Determine WHICH arrows (audio-driven foot-state machine)
+        # Phase 2: Determine WHICH arrows (autoregressive)
         # ================================================================
 
         assigner = FootStateArrowAssigner(
@@ -818,15 +846,17 @@ class MLChartGenerator:
             allowed_patterns=diff_config.allowed_patterns,
         )
         steps = []
+        prev_arrow_vec = np.zeros(4, dtype=np.float32)
 
         for i, event in enumerate(note_events):
             t = round(event['time'], 3)
             subdivision = self._subdivision_from_grid(
                 event.get('grid_idx'), t, tempo, beat_times,
             )
-
-            # Look up per-event audio features from the precomputed curves
             frame_idx = int(round(t * FRAMES_PER_SECOND))
+            frame_idx = max(0, min(frame_idx, T - 1))
+
+            # Look up audio features for the fallback assigner.
             if energy_curve is not None and len(energy_curve) > 0:
                 energy = float(energy_curve[min(frame_idx, len(energy_curve) - 1)])
             else:
@@ -838,42 +868,98 @@ class MLChartGenerator:
             else:
                 brightness = 0.5
 
-            # Try to start a stream on high-energy taps
-            remaining = len(note_events) - i
-            if event['type'] == 'tap' and event.get('num_arrows', 1) == 1:
-                assigner.maybe_start_stream(
-                    energy, remaining, diff_config.max_stream_length,
-                )
+            # Re-score arrows with the autoregressive prev_arrow context.
+            arrow_logits_t = self._arrow_logits_at_frame(
+                features[frame_idx], prev_arrow_vec,
+            )
+            arrow_p = 1.0 / (1.0 + np.exp(-arrow_logits_t))   # sigmoid
+            target_arity = 2 if event.get('num_arrows', 1) >= 2 else 1
+            chosen_arrows = self._choose_arrows(arrow_p, target_arity)
 
             if event['type'] == 'hold':
-                arrow = assigner.start_hold(
-                    t, event['hold_duration'], energy, brightness,
-                )
+                if not chosen_arrows:
+                    # Fallback: arrow head fired on nothing → defer to assigner.
+                    arrow = assigner.start_hold(
+                        t, event['hold_duration'], energy, brightness,
+                    )
+                    chosen_arrows = [arrow]
+                else:
+                    # Keep just one arrow for the hold and inform the assigner
+                    # so its hold tracking stays consistent if used later.
+                    arrow = ARROW_DIRECTIONS[chosen_arrows[0]]
+                    assigner.start_hold(
+                        t, event['hold_duration'], energy, brightness,
+                    )
+                    chosen_arrows = [arrow]
                 steps.append(Step(
                     time=t,
-                    arrows=[arrow],
+                    arrows=chosen_arrows,
                     step_type=StepType.HOLD,
                     hold_duration=round(event['hold_duration'], 3),
                     beat_subdivision=subdivision,
                 ))
-            elif event.get('num_arrows', 1) >= 2:
-                arrows = assigner.assign_jump(t, energy, brightness)
-                steps.append(Step(
-                    time=t,
-                    arrows=arrows,
-                    step_type=StepType.TAP,
-                    beat_subdivision=subdivision,
-                ))
             else:
-                arrow = assigner.assign_single(t, energy, brightness)
+                if not chosen_arrows:
+                    # Fallback for empty arrow set.
+                    if target_arity >= 2:
+                        chosen_arrows = assigner.assign_jump(t, energy, brightness)
+                    else:
+                        chosen_arrows = [
+                            assigner.assign_single(t, energy, brightness)
+                        ]
+                else:
+                    chosen_arrows = [ARROW_DIRECTIONS[a] for a in chosen_arrows]
                 steps.append(Step(
                     time=t,
-                    arrows=[arrow],
+                    arrows=chosen_arrows,
                     step_type=StepType.TAP,
                     beat_subdivision=subdivision,
                 ))
 
+            # Update prev_arrow_vec for the next frame.
+            new_prev = np.zeros(4, dtype=np.float32)
+            for arr in steps[-1].arrows:
+                idx = ARROW_DIRECTIONS.index(arr)
+                new_prev[idx] = 1.0
+            prev_arrow_vec = new_prev
+
         return steps
+
+    def _choose_arrows(
+        self, arrow_p: np.ndarray, target_arity: int,
+    ) -> List[int]:
+        """Pick arrow indices from per-arrow sigmoid probs.
+
+        target_arity = 1 (tap/hold) or 2 (jump). When per-arrow thresholds are
+        configured (newer checkpoints), arrows must clear their per-channel
+        threshold; otherwise we fall back to argmax of the requested arity.
+        Returns column indices in [0,3] (L=0, D=1, U=2, R=3).
+        """
+        thresholds = getattr(self, 'arrow_thresholds', None)
+        if thresholds is not None:
+            passing = [a for a in range(4) if arrow_p[a] >= thresholds[a]]
+        else:
+            passing = [a for a in range(4) if arrow_p[a] >= self.confidence_threshold]
+
+        if target_arity == 1:
+            if not passing:
+                return []
+            best = max(passing, key=lambda a: arrow_p[a])
+            return [best]
+        # target_arity >= 2 (jump)
+        if len(passing) >= 2:
+            top2 = sorted(passing, key=lambda a: -arrow_p[a])[:2]
+            return sorted(top2)
+        if len(passing) == 1:
+            # Only one arrow crossed threshold — promote runner-up if it has
+            # any reasonable signal (>= 0.5 of the top arrow's prob).
+            top = passing[0]
+            others = [a for a in range(4) if a != top]
+            runner = max(others, key=lambda a: arrow_p[a])
+            if arrow_p[runner] >= 0.5 * arrow_p[top]:
+                return sorted([top, runner])
+            return [top]
+        return []
 
     # 16th-grid index → DDR-style subdivision color, mirroring the
     # rational-beat logic in services/sm_parser._beat_subdivision:

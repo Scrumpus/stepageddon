@@ -44,6 +44,37 @@ DIFFICULTY_ID_TO_NAME = {
 }
 
 
+def _build_prev_arrow_stream(arrow_labels: np.ndarray) -> np.ndarray:
+    """Per-frame "previous emitted arrow vector" for transition conditioning.
+
+    Args:
+        arrow_labels: [T, 4] uint8 — per-arrow onset indicator at each frame.
+
+    Returns:
+        prev_arrow: [T, 4] float32. prev_arrow[t] is the binary arrow vector
+            at the most recent frame s < t with any onset (any column == 1),
+            or zeros if no such s exists. Frames at the very start of a song
+            (before any note) get a zero conditioning vector.
+
+    The vector form (vs a single 5-class index) handles jumps naturally —
+    both arrows of a jump appear in the conditioning vector. For chunks that
+    don't start at frame 0, callers must feed the *song-level* stream so the
+    chunk's first frames inherit conditioning from the prior song context.
+    """
+    T = arrow_labels.shape[0]
+    out = np.zeros((T, 4), dtype=np.float32)
+    if T == 0:
+        return out
+    last = np.zeros(4, dtype=np.float32)
+    onset_mask = arrow_labels.any(axis=1)
+    al = arrow_labels.astype(np.float32)
+    for t in range(T):
+        out[t] = last
+        if onset_mask[t]:
+            last = al[t]
+    return out
+
+
 def load_manifest(manifest_path: str) -> dict:
     """Load a v2 manifest, validating the format version.
 
@@ -203,13 +234,22 @@ class StepChartDataset(Dataset):
             entry_idx, start = self._val_chunks[idx]
             entry = self.entries[entry_idx]
 
-        # Load data. v4 npz files contain mel, beats (song-level), and one
-        # labels_<diff> + durations_<diff> per chart inside the same archive;
-        # only the requested keys are decompressed by NpzFile on access.
+        # Load data. v5 npz files contain mel, beats (song-level), and per-chart
+        # labels_<diff>, durations_<diff>, arrow_labels_<diff>. Only requested
+        # keys are decompressed by NpzFile on access.
         data = np.load(self.data_dir / entry['filename'])
         mel = data['mel']                          # [T, n_mels] float16, [0,1] scaled-dB
         labels = data[entry['labels_key']]         # [T] uint8 (0=none,1=tap,2=jump,3=hold_start)
         durations = data[entry['durations_key']]   # [T] float32, seconds at hold_start frames
+        arrow_labels_key = entry.get('arrow_labels_key', f'arrow_{entry["labels_key"]}')
+        if arrow_labels_key in data.files:
+            arrow_labels_full = data[arrow_labels_key]  # [T, 4] uint8
+        else:
+            # Pre-v5 archive: synthesize a single-arrow indicator on column 0
+            # so legacy data still loads. Per-arrow learning won't work with
+            # this — re-run prepare_data.py for real arrow supervision.
+            arrow_labels_full = np.zeros((mel.shape[0], 4), dtype=np.uint8)
+            arrow_labels_full[:, 0] = (labels > 0).astype(np.uint8)
         if 'beats' in data.files:
             beats = data['beats']                  # [T] uint8 (1 at beat frames)
         else:
@@ -217,12 +257,21 @@ class StepChartDataset(Dataset):
             # the auxiliary head sees a no-op signal instead of crashing.
             beats = np.zeros(mel.shape[0], dtype=np.uint8)
 
+        # Build the prev-arrow stream over the *full song* before chunking so
+        # the chunk's first frames have correct conditioning even for chunks
+        # that don't start at the beginning of the song. prev_arrow[t] is the
+        # binary arrow vector at the most recent onset frame strictly before t,
+        # or zeros if t precedes any onset.
+        prev_arrow_full = _build_prev_arrow_stream(arrow_labels_full)
+
         # Extract chunk
         end = start + self.chunk_frames
         mel_chunk = mel[start:end].astype(np.float32)
         labels_chunk = labels[start:end].astype(np.int64)
         durations_chunk = durations[start:end].astype(np.float32)
         beats_chunk = beats[start:end].astype(np.float32)
+        arrow_labels_chunk = arrow_labels_full[start:end].astype(np.float32)  # [T, 4]
+        prev_arrow_chunk = prev_arrow_full[start:end].astype(np.float32)      # [T, 4]
         difficulty = entry['difficulty_id']
 
         # Convert hold durations from seconds to *beats* using the song's
@@ -252,12 +301,14 @@ class StepChartDataset(Dataset):
             density = float(self._default_density_by_id[difficulty].item())
         density_norm = (density - DENSITY_MEAN) / DENSITY_STD
 
-        # Build onset target: [T, 1] (soft during training, hard during val)
-        onset_hard = (labels_chunk > 0).astype(np.float32)[:, None]  # [T, 1]
+        # Per-arrow onset target: [T, 4] (soft during training, hard during val).
+        # Smoothing is applied per channel — the same Gaussian kernel on each
+        # arrow column independently. The "any onset" signal is the row-wise
+        # max of arrow_labels and is no longer materialized as a separate head.
         if self.is_train and self._onset_kernel is not None:
-            onset_soft = self._smooth_onset(onset_hard)
+            arrow_soft = self._smooth_arrows(arrow_labels_chunk)
         else:
-            onset_soft = onset_hard
+            arrow_soft = arrow_labels_chunk
 
         # Beat target uses the same smoothing kernel as onsets so the auxiliary
         # BCE sees a comparable distribution. Hard beats (val) are kept tight.
@@ -292,10 +343,11 @@ class StepChartDataset(Dataset):
             torch.from_numpy(mel_chunk),
             torch.tensor(difficulty, dtype=torch.long),
             torch.tensor(density_norm, dtype=torch.float32),
-            torch.from_numpy(onset_soft),
+            torch.from_numpy(arrow_soft),
             torch.from_numpy(type_target),
             torch.from_numpy(durations_chunk),
             torch.from_numpy(beat_soft),
+            torch.from_numpy(prev_arrow_chunk),
         )
 
     # ------------------------------------------------------------------
@@ -307,6 +359,20 @@ class StepChartDataset(Dataset):
         k = self._onset_kernel
         out = np.zeros_like(onset_hard)
         out[:, 0] = np.convolve(onset_hard[:, 0], k, mode='same')
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    def _smooth_arrows(self, arrow_hard: np.ndarray) -> np.ndarray:
+        """Per-channel Gaussian smoothing of a [T, 4] hard arrow map.
+
+        Each arrow channel is convolved independently along time with the same
+        kernel used for onset smoothing. This keeps per-arrow BCE targets in
+        the same numeric range the loss expects (peak ~1.0 at the true onset
+        frame, decaying to 0 a few frames away).
+        """
+        k = self._onset_kernel
+        out = np.zeros_like(arrow_hard)
+        for c in range(arrow_hard.shape[1]):
+            out[:, c] = np.convolve(arrow_hard[:, c], k, mode='same')
         return np.clip(out, 0.0, 1.0).astype(np.float32)
 
     @staticmethod
@@ -670,6 +736,52 @@ def compute_onset_prior(
     p = pos / max(total, 1)
     logger.info(f"Empirical per-frame onset rate: {p:.6f}")
     return float(p)
+
+
+def compute_arrow_priors(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+    sample_limit: int = 200,
+) -> np.ndarray:
+    """Empirical per-frame fire rate for each of the 4 arrows.
+
+    Returns a length-4 float64 array P(arrow_a fires at any frame). Used to
+    bias-init the arrow head with per-arrow logit(p) and to derive per-arrow
+    BCE pos_weight (otherwise the model collapses to "predict no arrow" or
+    leans on the most common arrow). Falls back to a uniform 0.01 if no
+    arrow_labels are found (legacy data).
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    if len(idxs) > sample_limit:
+        step = max(1, len(idxs) // sample_limit)
+        idxs = idxs[::step][:sample_limit]
+    pos = np.zeros(4, dtype=np.int64)
+    total = 0
+    seen_any = False
+    for i in idxs:
+        entry = manifest[i]
+        archive = np.load(data_dir / entry['filename'])
+        key = entry.get('arrow_labels_key')
+        if not key or key not in archive.files:
+            continue
+        seen_any = True
+        arr = archive[key]                     # [T, 4] uint8
+        pos += arr.sum(axis=0).astype(np.int64)
+        total += int(arr.shape[0])
+    if not seen_any or total == 0:
+        logger.warning(
+            "No arrow_labels found while computing arrow priors; using 0.01 "
+            "uniform fallback. Re-run prepare_data.py."
+        )
+        return np.full(4, 0.01, dtype=np.float64)
+    priors = pos.astype(np.float64) / float(total)
+    logger.info(
+        f"Per-arrow positive rate: L={priors[0]:.5f} D={priors[1]:.5f} "
+        f"U={priors[2]:.5f} R={priors[3]:.5f}"
+    )
+    return priors
 
 
 def compute_beat_prior(
