@@ -470,6 +470,7 @@ def build_loss(
         type_focal_gamma=getattr(args, 'type_focal_gamma', 0.0),
         beat_weight=getattr(args, 'beat_weight', 0.0),
         diversity_weight=getattr(args, 'diversity_weight', 0.2),
+        commit_weight=getattr(args, 'arrow_commit_weight', 0.5),
     )
 
 def train_one_epoch(
@@ -1235,10 +1236,20 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Loss weight on the auxiliary beat-prediction '
                              'head. 0.0 disables — head still emits logits but '
                              'gets no gradient.')
-    parser.add_argument('--diversity-weight', type=float, default=0.2,
+    parser.add_argument('--diversity-weight', type=float, default=0.05,
                         help='Loss weight on the per-chunk arrow-distribution '
-                             'KL regularizer. Punishes mode collapse to one '
-                             'arrow. 0.0 disables.')
+                             'KL regularizer. Rewards predicted marginals '
+                             'matching the target marginals — useful against '
+                             'mode collapse, but actively counterproductive '
+                             'once a per-frame commit loss is present, since '
+                             'it pulls predictions back toward marginal '
+                             'matching at every onset. 0.0 disables.')
+    parser.add_argument('--arrow-commit-weight', type=float, default=0.5,
+                        help='Loss weight on the per-frame softmax-CE applied '
+                             'to single-arrow frames. Forces the arrow head '
+                             'to commit to a specific arrow per onset rather '
+                             'than predicting the per-arrow marginal — fixes '
+                             'low stream coherence. 0.0 disables.')
     parser.add_argument('--prev-arrow-dropout', type=float, default=0.1,
                         help='Per-frame probability of zeroing the prev_arrow '
                              'conditioning vector during training. Forces the '

@@ -357,14 +357,16 @@ class StepChartModel(nn.Module):
             ])
         cond_layers.append(nn.Linear(hidden_dim, self.N_ARROWS))
         self.arrow_head = nn.Sequential(*cond_layers)
-        # Initialize the prev-arrow weights of the first Linear to zero so
-        # at step 0 the head behaves as if uncoditioned (no spurious bias from
-        # a random init on the conditioning channels). The audio→hidden_dim
-        # weights stay at default init.
+        # Small uniform init on the prev-arrow conditioning columns of the
+        # first Linear. Zero-init starves the conditioning of gradient signal
+        # in early epochs and the head settles into a marginal-matching local
+        # minimum that ignores prev_arrow; a small non-zero init kicks the
+        # gradients alive from step 1 while still being small enough not to
+        # dominate the audio features.
         with torch.no_grad():
             first_lin = self.arrow_head[0]
             assert isinstance(first_lin, nn.Linear)
-            first_lin.weight[:, hidden_dim:].zero_()
+            first_lin.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
 
         self.type_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -584,6 +586,7 @@ class StepChartLoss(nn.Module):
         beat_weight: float = 0.0,
         beat_pos_weight: float = 10.0,
         diversity_weight: float = 0.2,
+        commit_weight: float = 0.5,
     ):
         super().__init__()
         # Per-arrow pos_weight: scalar broadcasts across the 4 arrows; a
@@ -600,6 +603,7 @@ class StepChartLoss(nn.Module):
         self.duration_weight = duration_weight
         self.beat_weight = float(beat_weight)
         self.diversity_weight = float(diversity_weight)
+        self.commit_weight = float(commit_weight)
         self.focal_gamma = float(focal_gamma)
         # Focal modulation on the type CE: down-weights confidently-correct
         # frames so the rare jump/hold classes contribute relatively more
@@ -647,6 +651,27 @@ class StepChartLoss(nn.Module):
             arrow_loss = F.binary_cross_entropy_with_logits(
                 arrow_logits, arrow_soft, pos_weight=self.pos_weight,
             )
+
+        # Per-frame commit CE: on frames where exactly one arrow fires, treat
+        # the 4 arrow logits as a 4-way softmax and CE against the firing
+        # arrow index. Per-arrow BCE alone is satisfied by predicting the
+        # marginal at every onset (no per-frame commitment required), which
+        # is the local minimum that pins stream coherence. Softmax CE forces
+        # the head to *pick* an arrow per onset frame.
+        if self.commit_weight > 0.0:
+            with torch.no_grad():
+                arrow_hard = (arrow_soft >= 0.5).float()
+                n_fire = arrow_hard.sum(dim=-1)
+                single_mask = (n_fire == 1.0)
+            if single_mask.any():
+                target_idx = arrow_hard.argmax(dim=-1)
+                commit_ce = F.cross_entropy(
+                    arrow_logits[single_mask],
+                    target_idx[single_mask],
+                )
+            else:
+                commit_ce = arrow_logits.sum() * 0.0
+            arrow_loss = arrow_loss + self.commit_weight * commit_ce
 
         # Diversity regularizer: KL(target_dist || pred_dist) on per-chunk
         # average arrow probabilities. Punishes "always L/R" collapse —

@@ -221,38 +221,46 @@ class StepChartDataset(Dataset):
         #   - int                     → random-chunk training path or val
         #   - (entry_idx, start) tuple → fixed-chunk training path used by the
         #     rare-class sampler to *guarantee* a chunk contains a jump/hold
-        if self.is_train:
-            if isinstance(idx, tuple):
-                entry_idx, fixed_start = idx
-                entry = self.entries[entry_idx]
-                n_frames = entry['n_frames']
-                # Jitter the fixed start so the rare event isn't always
-                # centered in the chunk — keeps spatial diversity across
-                # epochs even though the chunk is anchored to the rare frame.
-                jitter = self.chunk_frames // 8
-                low = max(0, fixed_start - jitter)
-                high = min(n_frames - self.chunk_frames, fixed_start + jitter)
-                start = int(np.random.randint(low, high + 1)) if high > low else int(fixed_start)
-            else:
-                entry = self.entries[idx]
-                n_frames = entry['n_frames']
-                max_start = n_frames - self.chunk_frames
-                # Intro/outro oversampling: with two independent
-                # `intro_outro_oversample_prob` chances, anchor the chunk at
-                # song start or song end so the model sees enough edge cases
-                # to learn the empirical "silence at start/end" pattern.
-                # Otherwise sample uniformly across the song.
-                p_edge = self.intro_outro_oversample_prob
-                r = np.random.random() if p_edge > 0.0 else 1.0
-                if r < p_edge:
-                    start = 0
-                elif r < 2 * p_edge:
-                    start = max_start
-                else:
-                    start = np.random.randint(0, max_start + 1)
-        else:
-            entry_idx, start = self._val_chunks[idx]
+        # Resolve `entry` first so `n_frames` is always available regardless
+        # of which branch picks `start` below. Keeping the resolution above
+        # the branches avoids the UnboundLocalError that bit us when one
+        # branch forgot to populate n_frames.
+        if self.is_train and isinstance(idx, tuple):
+            entry_idx, fixed_start = idx
             entry = self.entries[entry_idx]
+        elif self.is_train:
+            entry = self.entries[idx]
+            fixed_start = None
+        else:
+            entry_idx, val_start = self._val_chunks[idx]
+            entry = self.entries[entry_idx]
+        n_frames = entry['n_frames']
+        max_start = n_frames - self.chunk_frames
+
+        if self.is_train and isinstance(idx, tuple):
+            # Jitter the fixed start so the rare event isn't always
+            # centered in the chunk — keeps spatial diversity across
+            # epochs even though the chunk is anchored to the rare frame.
+            jitter = self.chunk_frames // 8
+            low = max(0, fixed_start - jitter)
+            high = min(max_start, fixed_start + jitter)
+            start = int(np.random.randint(low, high + 1)) if high > low else int(fixed_start)
+        elif self.is_train:
+            # Intro/outro oversampling: with two independent
+            # `intro_outro_oversample_prob` chances, anchor the chunk at
+            # song start or song end so the model sees enough edge cases
+            # to learn the empirical "silence at start/end" pattern.
+            # Otherwise sample uniformly across the song.
+            p_edge = self.intro_outro_oversample_prob
+            r = np.random.random() if p_edge > 0.0 else 1.0
+            if r < p_edge:
+                start = 0
+            elif r < 2 * p_edge:
+                start = max_start
+            else:
+                start = np.random.randint(0, max_start + 1)
+        else:
+            start = val_start
 
         # Load data. v5 npz files contain mel, beats (song-level), and per-chart
         # labels_<diff>, durations_<diff>, arrow_labels_<diff>. Only requested
