@@ -740,8 +740,14 @@ def validate(
     all_true = []
 
     # Per-arrow predictions/targets for per-arrow F1 calibration.
-    all_arrow_probs = []   # list of [B, T, 4]
-    all_arrow_true = []    # list of [B, T, 4]
+    # `all_arrow_probs` is zero prev_arrow context — matches inference Phase 1
+    # (NMS peak picking). `all_arrow_probs_tf` is teacher-forced — matches
+    # inference Phase 2 (per-onset arrow re-scoring with the previous emitted
+    # arrow as context). The per-arrow threshold sweep below uses TF, the
+    # any-onset threshold sweep uses zero-context.
+    all_arrow_probs = []      # list of [B, T, 4] (prev_arrow=0)
+    all_arrow_probs_tf = []   # list of [B, T, 4] (teacher-forced prev_arrow)
+    all_arrow_true = []       # list of [B, T, 4]
 
     type_correct = 0
     type_total = 0
@@ -811,11 +817,16 @@ def validate(
         total_div += div_l.item() * bs
         total_samples += bs
 
-        # Threshold sweep / per-arrow F1 must use the inference-time
-        # (zero prev_arrow) distribution.
+        # Any-onset threshold sweep / KL / stream_coh use the zero-context
+        # distribution (matches inference Phase 1 peak picking).
         arrow_probs = torch.sigmoid(arrow_logits_zero.float()).cpu().numpy()  # [B, T, 4]
+        # Per-arrow threshold sweep uses the teacher-forced distribution
+        # (matches inference Phase 2, where prev_arrow tracks the previously
+        # emitted arrow per-onset).
+        arrow_probs_tf = torch.sigmoid(arrow_logits.float()).cpu().numpy()    # [B, T, 4]
         arrow_true = (arrow_soft.cpu().numpy() > 0.5).astype(np.float32)   # [B, T, 4]
         all_arrow_probs.append(arrow_probs)
+        all_arrow_probs_tf.append(arrow_probs_tf)
         all_arrow_true.append(arrow_true)
         # Aggregate "any-onset" probability is the max over the 4 arrows.
         any_probs = arrow_probs.max(axis=-1, keepdims=True)                # [B, T, 1]
@@ -858,7 +869,8 @@ def validate(
     print("  [validate] val loop done; concatenating preds...", flush=True)
     pred_concat = np.concatenate(all_pred, axis=0).reshape(-1, 1)
     true_concat = np.concatenate(all_true, axis=0).reshape(-1, 1)
-    arrow_probs_concat = np.concatenate(all_arrow_probs, axis=0).reshape(-1, 4)  # [N, 4]
+    arrow_probs_concat = np.concatenate(all_arrow_probs, axis=0).reshape(-1, 4)  # [N, 4] zero-context
+    arrow_probs_tf_concat = np.concatenate(all_arrow_probs_tf, axis=0).reshape(-1, 4)  # [N, 4] teacher-forced
     arrow_true_concat = np.concatenate(all_arrow_true, axis=0).reshape(-1, 4)    # [N, 4]
     pred_1d = pred_concat.reshape(-1)
     true_1d_hard = true_concat.reshape(-1)
@@ -885,11 +897,15 @@ def validate(
     # Per-arrow threshold sweep + F1. Each arrow is treated as an independent
     # frame-level binary problem so the model can be calibrated separately
     # per channel (outer arrows fire ~2× as often as D/U; one shared
-    # threshold under-fits the rarer ones).
+    # threshold under-fits the rarer ones). Uses the teacher-forced probs
+    # because inference Phase 2 (per-onset arrow re-scoring in
+    # `_choose_arrows`) sees the real previously-emitted arrow as context;
+    # calibrating against the zero-context distribution would make these
+    # thresholds far too conservative for that path.
     per_arrow_best_thr = np.zeros(4, dtype=np.float32)
     per_arrow_f1 = np.zeros(4, dtype=np.float32)
     for a in range(4):
-        ap = arrow_probs_concat[:, a]
+        ap = arrow_probs_tf_concat[:, a]
         at = arrow_true_concat[:, a]
         true_a_peaks = np.flatnonzero(at > 0.5)
         peak_a_idx, peak_a_probs = _all_local_max_peaks(
