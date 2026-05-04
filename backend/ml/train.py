@@ -779,10 +779,23 @@ def validate(
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
 
         with autocast('cuda'):
-            arrow_logits, type_logits, duration_pred, beat_logits = model(
-                mel, difficulty, density,
-                start_seconds, remaining_seconds, prev_arrow,
+            # Share the backbone encode across the two arrow-head calls below.
+            features = model.encode(
+                mel, difficulty, density, start_seconds, remaining_seconds,
             )
+            # Teacher-forced arrow logits: used for the loss (matches training)
+            # and per-frame loss reporting.
+            arrow_logits = model.apply_arrow_head(features, prev_arrow)
+            type_logits = model.apply_type_head(features)
+            duration_pred = model.apply_duration_head(features)
+            beat_logits = model.apply_beat_head(features)
+            # Zero-context arrow logits: matches the inference peak-picking
+            # distribution (`_predict_chunked` calls apply_arrow_head with
+            # prev_arrow=None, i.e. zeros). The threshold sweep below uses
+            # these so saved best_threshold / best_arrow_thresholds are
+            # calibrated against the distribution inference actually sees.
+            zero_prev = torch.zeros_like(prev_arrow)
+            arrow_logits_zero = model.apply_arrow_head(features, zero_prev)
             loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
                 arrow_logits, type_logits, duration_pred,
                 arrow_soft, type_target, duration_target,
@@ -798,7 +811,9 @@ def validate(
         total_div += div_l.item() * bs
         total_samples += bs
 
-        arrow_probs = torch.sigmoid(arrow_logits.float()).cpu().numpy()    # [B, T, 4]
+        # Threshold sweep / per-arrow F1 must use the inference-time
+        # (zero prev_arrow) distribution.
+        arrow_probs = torch.sigmoid(arrow_logits_zero.float()).cpu().numpy()  # [B, T, 4]
         arrow_true = (arrow_soft.cpu().numpy() > 0.5).astype(np.float32)   # [B, T, 4]
         all_arrow_probs.append(arrow_probs)
         all_arrow_true.append(arrow_true)

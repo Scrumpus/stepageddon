@@ -29,18 +29,10 @@ from modules.step_generator.difficulty import get_difficulty_config
 
 logger = logging.getLogger(__name__)
 
-# Arrow index to Direction mapping
 ARROW_DIRECTIONS = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
 
-# Fallback empirical type prior over {tap, jump, hold_start} from typical DDR
-# corpora. Used for logit adjustment when the loaded checkpoint predates the
-# `type_prior` save (i.e. wasn't trained with the rebalancing changes). It's
-# a coarse approximation — a checkpoint-stored prior is preferred — but it's
-# close enough that adjustment still meaningfully shifts argmax toward the
-# rare classes on legacy checkpoints.
 DEFAULT_TYPE_PRIOR_FALLBACK = np.array([0.88, 0.08, 0.04], dtype=np.float32)
 
-# Difficulty name mapping (app difficulty → model difficulty_id)
 APP_DIFFICULTY_MAP = {
     'beginner': 0,
     'easy': 1,
@@ -48,29 +40,17 @@ APP_DIFFICULTY_MAP = {
     'hard': 3,
     'challenge': 4,
 }
-
-
 class FootStateArrowAssigner:
     """
     Assigns arrows to note events using foot-state tracking, a seeded PRNG,
     expanded pattern vocabulary, and audio-feature-driven selection.
-
-    Separates arrow selection from onset detection so the model only needs
-    to predict WHEN/WHAT (timing + note type) and this class handles WHICH
-    arrows deterministically — but with musical variation.
-
-    Determinism guarantee: same seed + same event sequence + same audio
-    features = identical arrow assignments.
     """
 
-    # Natural panel assignments per foot
     LEFT_FOOT_PANELS = [Direction.LEFT, Direction.DOWN]
     RIGHT_FOOT_PANELS = [Direction.UP, Direction.RIGHT]
 
-    # All four panels for crossover moves
     ALL_PANELS = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
 
-    # --- Stream patterns (sequences of arrow indices 0-3: L D U R) ---
     STREAM_PATTERNS = [
         [0, 2, 1, 3],  # L U D R — standard weave
         [3, 1, 2, 0],  # R D U L — reverse weave
@@ -80,7 +60,6 @@ class FootStateArrowAssigner:
         [1, 2, 0, 3],  # D U L R — inside-out
     ]
 
-    # --- Jump patterns: (left_foot_arrow, right_foot_arrow) ---
     JUMP_PATTERNS = [
         (Direction.LEFT, Direction.RIGHT),   # wide
         (Direction.DOWN, Direction.UP),       # center
@@ -88,8 +67,6 @@ class FootStateArrowAssigner:
         (Direction.DOWN, Direction.RIGHT),    # right-leaning
     ]
 
-    # --- Candle patterns: one foot planted, other foot hits 3 panels ---
-    # (planted_arrow, [moving_foot_sequence])
     CANDLE_PATTERNS = [
         (Direction.LEFT,  [Direction.DOWN, Direction.UP, Direction.RIGHT]),
         (Direction.RIGHT, [Direction.UP, Direction.DOWN, Direction.LEFT]),
