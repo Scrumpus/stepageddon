@@ -41,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 # On-disk format version. Bump on any breaking change to npz layout / manifest
 # schema. Dataset loaders error loudly on mismatch.
-FORMAT_VERSION = 3
+# v4: adds song-level `beats` array (shape [T] uint8) for the auxiliary
+# beat-prediction head.
+FORMAT_VERSION = 4
 
 # Audio processing constants
 SAMPLE_RATE = 22050
@@ -94,16 +96,18 @@ class MelStatsAccumulator:
         return mean, math.sqrt(var)
 
 
-def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
+def extract_audio_features(
+    audio_path: str,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """
-    Extract mel spectrogram from audio file in fixed scaled-dB [0, 1] space.
+    Extract mel spectrogram + beat track from an audio file.
 
-    Uses an absolute dB reference (ref=1.0), clips to [DB_MIN, DB_MAX], and
-    rescales to [0, 1] so that absolute loudness is preserved across songs.
-    The dataset applies global whitening on top of this at load time.
+    Mel: fixed scaled-dB [0, 1] space (ref=1.0, clipped to [DB_MIN, DB_MAX]).
+    Beats: [T] uint8 binary array (1 at beat frames) at the same hop as mel.
+    The auxiliary beat head consumes this as a per-frame BCE target.
 
     Returns:
-        [T, N_MELS] float16 array, or None on failure.
+        (mel: [T, N_MELS] float16, beats: [T] uint8), or None on failure.
     """
     try:
         y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
@@ -123,8 +127,30 @@ def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
     mel_db = librosa.power_to_db(mel, ref=1.0, amin=1e-10, top_db=None)
     np.clip(mel_db, DB_MIN, DB_MAX, out=mel_db)
     mel_scaled = (mel_db - DB_MIN) / DB_RANGE  # -> [0, 1]
+    mel_arr = mel_scaled.T.astype(np.float16)  # [T, N_MELS]
 
-    return mel_scaled.T.astype(np.float16)  # [T, N_MELS]
+    # Beat track at the same hop as the mel grid so beat_frames index directly
+    # into mel rows. Failures (very short / silent songs) fall back to an
+    # all-zero beat track — the BCE just sees no positives there.
+    n_frames = mel_arr.shape[0]
+    beats = np.zeros(n_frames, dtype=np.uint8)
+    try:
+        _tempo, beat_frames = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=HOP_LENGTH,
+        )
+        beat_frames = np.asarray(beat_frames, dtype=np.int64)
+        beat_frames = beat_frames[(beat_frames >= 0) & (beat_frames < n_frames)]
+        beats[beat_frames] = 1
+    except Exception as e:
+        logger.warning(f"Beat track failed for {audio_path}: {e}")
+
+    return mel_arr, beats
+
+
+# Backwards-compat shim: older callers may still import the legacy name.
+def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
+    feats = extract_audio_features(audio_path)
+    return feats[0] if feats is not None else None
 
 
 def notes_to_frame_labels(notes, n_frames: int):
@@ -248,10 +274,11 @@ def process_chart_directory(
     if sm is None or not sm.charts:
         return []
 
-    # Extract mel spectrogram
-    mel = extract_mel_spectrogram(str(audio_file))
-    if mel is None:
+    # Extract mel spectrogram + beat track
+    feats = extract_audio_features(str(audio_file))
+    if feats is None:
         return []
+    mel, beats = feats
 
     n_frames = mel.shape[0]
     primary_bpm = sm.primary_bpm
@@ -306,6 +333,7 @@ def process_chart_directory(
     np.savez_compressed(
         output_dir / song_filename,
         mel=mel,
+        beats=beats,
         **arrays,
     )
     # Stats over the float16 stored values, accumulated in float64.

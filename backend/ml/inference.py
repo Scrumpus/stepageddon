@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 # Arrow index to Direction mapping
 ARROW_DIRECTIONS = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
 
+# Fallback empirical type prior over {tap, jump, hold_start} from typical DDR
+# corpora. Used for logit adjustment when the loaded checkpoint predates the
+# `type_prior` save (i.e. wasn't trained with the rebalancing changes). It's
+# a coarse approximation — a checkpoint-stored prior is preferred — but it's
+# close enough that adjustment still meaningfully shifts argmax toward the
+# rare classes on legacy checkpoints.
+DEFAULT_TYPE_PRIOR_FALLBACK = np.array([0.88, 0.08, 0.04], dtype=np.float32)
+
 # Difficulty name mapping (app difficulty → model difficulty_id)
 APP_DIFFICULTY_MAP = {
     'beginner': 0,
@@ -262,24 +270,78 @@ class MLChartGenerator:
         device: str = None,
         chunk_frames: int = 500,
         overlap_frames: int = 100,
-        confidence_threshold: float = 0.3,
+        confidence_threshold: Optional[float] = None,
         min_note_gap: float = 0.05,
         snap_to_beats: bool = True,
+        type_logit_adjust: float = 1.0,
+        jump_bias: float = 0.0,
+        hold_bias: float = 0.0,
+        type_prior_override: Optional[List[float]] = None,
     ):
+        """
+        Args (the new ones for type rebalancing):
+            type_logit_adjust: Strength of prior-based logit adjustment on
+                the type head, applied as `logits -= type_logit_adjust * log(prior)`.
+                0.0 disables it (raw model output, very tap-biased).
+                1.0 fully removes the empirical prior, giving a uniform
+                posterior over {tap, jump, hold_start}.
+                In practice 0.6–1.0 produces noticeably more jumps/holds
+                without breaking tap-dominated sections. Requires the
+                checkpoint to carry `type_prior`; ignored otherwise.
+            jump_bias: Additive logit bias applied to the jump class only.
+                Positive values encourage more jumps. Useful at inference
+                time to dial the jump rate per song without retraining.
+            hold_bias: Same as jump_bias for the hold_start class.
+            type_prior_override: Optional 3-vector P(class|onset) over
+                {tap, jump, hold_start} used for logit adjustment. Takes
+                precedence over the checkpoint's stored prior. When neither
+                is provided, falls back to DEFAULT_TYPE_PRIOR_FALLBACK so
+                the rebalancing still works on legacy checkpoints.
+        """
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
         self.chunk_frames = chunk_frames
         self.overlap_frames = overlap_frames
-        self.confidence_threshold = confidence_threshold
+        # confidence_threshold may be None at construction; load_model will
+        # populate it from the checkpoint's saved best_threshold (calibrated
+        # by the validation F1 sweep). Falls back to 0.3 if neither the
+        # constructor nor the checkpoint provides a value.
+        self._confidence_threshold_override = confidence_threshold
+        self.confidence_threshold = (
+            float(confidence_threshold) if confidence_threshold is not None else 0.3
+        )
         self.min_note_gap = min_note_gap
         self.snap_to_beats = snap_to_beats
+        self.type_logit_adjust = float(type_logit_adjust)
+        # Track whether the caller pinned the biases explicitly. Only
+        # caller-provided values take precedence over the per-class
+        # calibration written into the checkpoint by training.
+        self._jump_bias_override = jump_bias != 0.0
+        self._hold_bias_override = hold_bias != 0.0
+        self.jump_bias = float(jump_bias)
+        self.hold_bias = float(hold_bias)
+
+        # Empirical P(class|onset) over {tap, jump, hold_start} on the
+        # training corpus. Resolution order at load time:
+        #   1. type_prior_override constructor arg (caller-supplied)
+        #   2. checkpoint['type_prior'] (saved by retrained models)
+        #   3. DEFAULT_TYPE_PRIOR_FALLBACK (heuristic; covers legacy ckpts)
+        self.type_prior: Optional[np.ndarray] = None
+        self._type_prior_override = (
+            np.asarray(type_prior_override, dtype=np.float32)
+            if type_prior_override is not None else None
+        )
 
         self.model = None
         # Per-difficulty inference-time default density (steps/sec). Populated
         # from the checkpoint if it was saved with one, else falls back to the
         # hardcoded preset midpoints.
         self.default_density_by_id = DEFAULT_DENSITY_BY_ID.clone()
+        # Unit of the duration head's output. 'beats' for new checkpoints
+        # (BPM-factored target); 'seconds' for legacy checkpoints. Affects
+        # the post-decode conversion in generate_from_audio.
+        self.duration_unit: str = 'seconds'
         # Mel whitening stats. Populated from the checkpoint if present (new
         # training runs); when absent, mel_mean/mel_std stay None and we fall
         # back to the legacy per-file min-max normalization so legacy
@@ -328,6 +390,66 @@ class MLChartGenerator:
                 f"Using checkpoint default densities: "
                 f"{self.default_density_by_id.tolist()}"
             )
+
+        # Resolve the type prior used for logit adjustment.
+        # Override > checkpoint > heuristic fallback.
+        if self._type_prior_override is not None:
+            tp = self._type_prior_override.astype(np.float64)
+            source = "override"
+        elif checkpoint.get('type_prior') is not None:
+            tp = np.asarray(checkpoint['type_prior'], dtype=np.float64)
+            source = "checkpoint"
+        else:
+            tp = DEFAULT_TYPE_PRIOR_FALLBACK.astype(np.float64)
+            source = "fallback (legacy checkpoint, retrain to override)"
+        tp = tp / max(tp.sum(), 1e-9)
+        self.type_prior = tp.astype(np.float32)
+        logger.info(
+            f"Type prior [{source}]: tap={tp[0]:.3f} "
+            f"jump={tp[1]:.3f} hold_start={tp[2]:.3f}"
+        )
+
+        # Pull per-class calibration biases from the checkpoint (saved by
+        # training's post-hoc bias sweep that maximizes macro-F1 on val).
+        # Caller-supplied biases override these — that's what the explicit-
+        # override flags are for.
+        ckpt_jump = checkpoint.get('best_jump_bias')
+        ckpt_hold = checkpoint.get('best_hold_bias')
+        if not self._jump_bias_override and ckpt_jump is not None:
+            self.jump_bias = float(ckpt_jump)
+            logger.info(f"Jump bias = {self.jump_bias:+.3f} (from checkpoint)")
+        if not self._hold_bias_override and ckpt_hold is not None:
+            self.hold_bias = float(ckpt_hold)
+            logger.info(f"Hold bias = {self.hold_bias:+.3f} (from checkpoint)")
+
+        # Pull the calibrated decision threshold if the checkpoint stored
+        # one. Caller-supplied confidence_threshold always wins.
+        ckpt_thr = checkpoint.get('best_threshold')
+        if self._confidence_threshold_override is not None:
+            logger.info(
+                f"Onset threshold = {self.confidence_threshold:.3f} (caller override)"
+            )
+        elif ckpt_thr is not None:
+            self.confidence_threshold = float(ckpt_thr)
+            logger.info(
+                f"Onset threshold = {self.confidence_threshold:.3f} "
+                f"(from checkpoint best_threshold)"
+            )
+        else:
+            logger.warning(
+                f"Checkpoint has no best_threshold; using default "
+                f"{self.confidence_threshold:.3f}. Retrain to calibrate."
+            )
+
+        # Duration unit marker. New checkpoints train on beats; legacy on
+        # seconds. Inference converts beats → seconds using the song tempo.
+        self.duration_unit = str(checkpoint.get('duration_unit', 'seconds'))
+        if self.duration_unit not in ('beats', 'seconds'):
+            logger.warning(
+                f"Unknown duration_unit={self.duration_unit!r}; assuming 'seconds'."
+            )
+            self.duration_unit = 'seconds'
+        logger.info(f"Duration head unit: {self.duration_unit}")
 
         # Pull mel whitening stats if present. Their presence is also the
         # signal that this checkpoint was trained on the v2 fixed-dB pipeline,
@@ -434,6 +556,11 @@ class MLChartGenerator:
             mel_frames, difficulty_id, target_density
         )
 
+        # Convert beats → seconds for new (BPM-factored) checkpoints. Legacy
+        # checkpoints already emit seconds, so this is a no-op for them.
+        if self.duration_unit == 'beats':
+            duration_pred = duration_pred * (60.0 / max(tempo, 1.0))
+
         # Post-process into steps using difficulty preset
         diff_config = get_difficulty_config(difficulty)
         logger.info("Post-processing predictions...")
@@ -470,6 +597,8 @@ class MLChartGenerator:
             onset_probs:   [T] float32 sigmoid("note present")
             type_probs:    [T, 3] float32 softmax over {tap, jump, hold_start}
             duration_pred: [T] float32 predicted hold duration in seconds
+                (decoded from the model's log-space output via
+                StepChartModel.decode_duration)
         """
         T = mel_frames.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
@@ -479,6 +608,26 @@ class MLChartGenerator:
 
         stride = self.chunk_frames - self.overlap_frames
         density_norm = (target_density - DENSITY_MEAN) / DENSITY_STD
+
+        # Build the per-class additive logit bias once. Combines:
+        #   - prior-based logit adjustment (Menon et al. 2020): subtract
+        #     type_logit_adjust * log(prior) from each class so that with
+        #     adjust=1.0 the posterior is uniform over {tap, jump, hold}.
+        #   - explicit jump_bias / hold_bias for fine-tuning at inference.
+        # When type_prior is unavailable (legacy ckpt), only the explicit
+        # biases take effect, which is the desired graceful fallback.
+        type_logit_bias = np.zeros(3, dtype=np.float32)
+        if self.type_prior is not None and self.type_logit_adjust != 0.0:
+            log_prior = np.log(np.clip(self.type_prior, 1e-6, 1.0))
+            type_logit_bias -= self.type_logit_adjust * log_prior
+        type_logit_bias[1] += self.jump_bias
+        type_logit_bias[2] += self.hold_bias
+        if np.any(type_logit_bias != 0.0):
+            logger.info(
+                f"Type logit bias: tap={type_logit_bias[0]:+.3f} "
+                f"jump={type_logit_bias[1]:+.3f} "
+                f"hold_start={type_logit_bias[2]:+.3f}"
+            )
 
         for start in range(0, T, stride):
             end = min(start + self.chunk_frames, T)
@@ -494,9 +643,20 @@ class MLChartGenerator:
                 [density_norm], dtype=torch.float32, device=self.device
             )
 
-            onset_logits, type_logits, dur_pred = self.model(mel_tensor, diff_tensor, density_tensor)
+            model_out = self.model(mel_tensor, diff_tensor, density_tensor)
+            # New checkpoints return 4 tensors (incl. auxiliary beat head);
+            # legacy 3-tensor checkpoints still work because we only use the
+            # first three values downstream.
+            onset_logits, type_logits, dur_pred = model_out[0], model_out[1], model_out[2]
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]   # [T_chunk]
-            type_p = torch.softmax(type_logits.float(), dim=-1).cpu().numpy()[0]   # [T_chunk, 3]
+            # Apply prior-correction + explicit biases in logit space, then softmax.
+            # This recovers a near-balanced posterior over {tap, jump, hold_start}
+            # so argmax in postprocess actually picks holds/jumps when warranted.
+            type_logits_adj = type_logits.float().cpu().numpy()[0]                 # [T_chunk, 3]
+            type_logits_adj = type_logits_adj + type_logit_bias[None, :]
+            type_logits_adj -= type_logits_adj.max(axis=-1, keepdims=True)
+            exp = np.exp(type_logits_adj)
+            type_p = exp / exp.sum(axis=-1, keepdims=True)                          # [T_chunk, 3]
             dur_p = dur_pred.float().cpu().numpy()[0, :, 0]                         # [T_chunk]
 
             valid_len = min(end - start, self.chunk_frames)
@@ -508,7 +668,14 @@ class MLChartGenerator:
         counts = np.maximum(counts, 1.0)
         onset_probs = onset_sum / counts
         type_probs = type_sum / counts[:, None]
-        duration_pred = dur_sum / counts
+        # Average is performed in log-space (geometric mean of overlapping
+        # chunk predictions). Decode to seconds *after* the average so the
+        # downstream postprocess reads a real-seconds tensor.
+        duration_log_mean = dur_sum / counts
+        duration_pred = StepChartModel.decode_duration(duration_log_mean)
+        # Tiny negative values can appear if log_mean < log(offset);
+        # clip to keep the contract that durations are non-negative seconds.
+        np.clip(duration_pred, 0.0, None, out=duration_pred)
         return onset_probs, type_probs, duration_pred
 
     def _postprocess(
