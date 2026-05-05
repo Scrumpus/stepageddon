@@ -1,16 +1,18 @@
 """
 Step Chart Neural Network Model.
 
-Three-head onset-style architecture (Dance Dance Convolution formulation):
+Four-head architecture (arrow-aware variant of Dance Dance Convolution):
     mel -> AudioEncoder (CNN) -> Dilated TCN -> early FiLM (difficulty+density)
         -> RoPE Transformer -> LayerNorm
-        -> onset head     (sigmoid, "is there a note here?")
+        -> arrow head     (4 sigmoids, per-arrow "does this arrow fire?",
+                           conditioned on the previous emitted arrow vector)
         -> type  head     (3-way: tap / jump / hold_start)
         -> duration head  (linear scalar in log-space; decode_duration() to seconds)
+        -> beat head      (auxiliary: "is this a beat?")
 
-The type head is only supervised where onset target is positive.
-The duration head is only supervised where the type target is hold_start
-(plus a small ±2-frame window for extra gradient signal).
+Onset detection at inference time = `arrow_logits.sigmoid().max(-1)`. The
+type head is supervised where any arrow fires; the duration head where the
+type target is hold_start (plus a ±2-frame window).
 
 The duration head emits a raw scalar interpreted as log(seconds + DURATION_OFFSET).
 This converts the wide raw-seconds dynamic range (~0.2–5s) into a much
@@ -22,6 +24,11 @@ Conditioning uses a single early FiLM layer. Difficulty is an embedding,
 density is encoded with random Fourier features and concatenated before
 projection, making the density signal harder to ignore than a zero-init
 scalar linear.
+
+The arrow head consumes a 4-dim binary `prev_arrow` vector (the arrow set
+emitted at the most recent prior onset, or zeros pre-onset). This makes the
+head a per-frame Markov chain over arrows, P(arrow_t | audio_t, arrow_{prev}),
+which is what fixes the L-R-L-R mode-collapse seen with independent Bernoullis.
 """
 
 import math
@@ -124,10 +131,18 @@ class FourierFeatures(nn.Module):
 
 class FiLMConditioner(nn.Module):
     """
-    Single FiLM conditioner for (difficulty, density).
+    Single FiLM conditioner for (difficulty, density, song-position).
 
     Builds (gamma, beta) from a difficulty embedding concatenated with random
-    Fourier features of density, and applies `gamma * x + beta` to features.
+    Fourier features of density and song-position scalars (start_seconds,
+    remaining_seconds), and applies `gamma * x + beta` to features.
+
+    The position scalars let the model learn empirical edge-of-song patterns
+    (e.g., charts typically have several seconds of silence before the first
+    arrow, and often taper near the end). Per-chunk conditioning is
+    sufficient because the transformer's RoPE positions resolve intra-chunk
+    location; the FiLM signal only has to disambiguate "this chunk is at
+    song start" from "this chunk is mid-song".
 
     Proj is init so that at step 0 the layer is an identity (gamma=1, beta=0)
     regardless of input, so training isn't destabilized.
@@ -138,12 +153,20 @@ class FiLMConditioner(nn.Module):
         n_difficulties: int,
         hidden_dim: int,
         n_fourier: int = 16,
+        n_fourier_position: int = 16,
+        position_sigma: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.diff_emb = nn.Embedding(n_difficulties, hidden_dim)
         self.fourier = FourierFeatures(n_fourier)
-        cond_dim = hidden_dim + 2 * n_fourier
+        # Separate Fourier modules for the two position scalars. Sigma is
+        # tuned for the seconds scale: with sigma=0.1, the random frequencies
+        # have periods ranging from ~10s up to a few hundred seconds, which
+        # spans both intro silence (sub-10s) and song-section structure.
+        self.fourier_start = FourierFeatures(n_fourier_position, sigma=position_sigma)
+        self.fourier_remaining = FourierFeatures(n_fourier_position, sigma=position_sigma)
+        cond_dim = hidden_dim + 2 * n_fourier + 2 * (2 * n_fourier_position)
         self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
 
         nn.init.normal_(self.diff_emb.weight, mean=0.0, std=0.02)
@@ -158,12 +181,16 @@ class FiLMConditioner(nn.Module):
         x: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
+        start_seconds: torch.Tensor,
+        remaining_seconds: torch.Tensor,
     ) -> torch.Tensor:
-        # x: [B, T, H], difficulty: [B], density: [B]
-        d = self.diff_emb(difficulty)           # [B, H]
-        f = self.fourier(density)                # [B, 2*n_fourier]
-        cond = torch.cat([d, f], dim=-1)         # [B, H + 2*n_fourier]
-        params = self.proj(cond)                 # [B, 2H]
+        # x: [B, T, H]; difficulty: [B]; density/start_seconds/remaining_seconds: [B]
+        d = self.diff_emb(difficulty)                      # [B, H]
+        f = self.fourier(density)                          # [B, 2*n_fourier]
+        fs = self.fourier_start(start_seconds)             # [B, 2*n_fourier_position]
+        fr = self.fourier_remaining(remaining_seconds)     # [B, 2*n_fourier_position]
+        cond = torch.cat([d, f, fs, fr], dim=-1)
+        params = self.proj(cond)                            # [B, 2H]
         gamma, beta = params.chunk(2, dim=-1)
         return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
 
@@ -251,21 +278,24 @@ class TransformerBlock(nn.Module):
 
 class StepChartModel(nn.Module):
     """
-    Audio -> (onset_logits, type_logits, duration_pred).
+    Audio + prev_arrow -> (arrow_logits, type_logits, duration_pred, beat_logits).
 
-    Arrow-agnostic: the model predicts WHEN, WHAT type, and HOW LONG
-    (for holds). Arrow assignment is handled by rule-based post-processing
-    (FootStateArrowAssigner).
+    Arrow-aware: the model predicts WHICH arrows fire (4 independent Bernoullis
+    per frame, conditioned on the previous emitted arrow vector), WHAT type
+    of note it is (tap / jump / hold_start), and HOW LONG holds last.
 
-    onset_logits:  [B, T, 1]  "is there a note here?" pre-sigmoid
+    arrow_logits:  [B, T, 4]  per-arrow {L, D, U, R} pre-sigmoid
     type_logits:   [B, T, 3]  {tap, jump, hold_start}
-    duration_pred: [B, T, 1]  predicted hold duration in seconds (softplus)
+    duration_pred: [B, T, 1]  predicted hold duration in log-space
+    beat_logits:   [B, T, 1]  auxiliary "is this a beat?" pre-sigmoid
     """
 
     N_NOTE_TYPES = 3
     TYPE_TAP = 0
     TYPE_JUMP = 1
     TYPE_HOLD_START = 2
+    N_ARROWS = 4
+    PREV_ARROW_DIM = 4  # 4-dim binary vector input to the arrow head
 
     # Offset added inside log() to keep the duration target away from -inf
     # while preserving relative ordering at the small end of the range.
@@ -297,9 +327,9 @@ class StepChartModel(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_dim)
 
-        # Deeper onset head: onset is the harder of the two heads, so give it
+        # Deeper arrow head: arrow prediction is the harder head, so give it
         # extra capacity. `onset_head_layers` counts hidden Linear→GELU blocks
-        # before the final 1-unit projection (default 3 → was 1).
+        # before the final projection (default 3).
         def _build_mlp_head(out_dim: int, n_hidden: int) -> nn.Sequential:
             layers: list = []
             for _ in range(max(1, n_hidden)):
@@ -311,7 +341,33 @@ class StepChartModel(nn.Module):
             layers.append(nn.Linear(hidden_dim, out_dim))
             return nn.Sequential(*layers)
 
-        self.onset_head = _build_mlp_head(1, onset_head_layers)
+        # Arrow head: backbone feats + 4-dim prev_arrow vector → per-arrow
+        # logit. The first Linear absorbs the +4 conditioning dims; the rest
+        # of the head matches the legacy onset head shape.
+        cond_layers: list = [
+            nn.Linear(hidden_dim + self.PREV_ARROW_DIM, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        ]
+        for _ in range(max(1, onset_head_layers) - 1):
+            cond_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+        cond_layers.append(nn.Linear(hidden_dim, self.N_ARROWS))
+        self.arrow_head = nn.Sequential(*cond_layers)
+        # Small uniform init on the prev-arrow conditioning columns of the
+        # first Linear. Zero-init starves the conditioning of gradient signal
+        # in early epochs and the head settles into a marginal-matching local
+        # minimum that ignores prev_arrow; a small non-zero init kicks the
+        # gradients alive from step 1 while still being small enough not to
+        # dominate the audio features.
+        with torch.no_grad():
+            first_lin = self.arrow_head[0]
+            assert isinstance(first_lin, nn.Linear)
+            first_lin.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
+
         self.type_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -330,24 +386,31 @@ class StepChartModel(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         # Auxiliary beat head: predicts per-frame "is this a beat?" from the
-        # same backbone features. Same depth/shape as the onset head — beats
-        # and onsets share the rhythmic structure the backbone is learning,
-        # so reusing the same capacity is a safe default. Loss-weighted at
-        # ~0.3 so beat learning helps the backbone without crowding out the
-        # primary onset task.
+        # same backbone features. Same depth/shape as the legacy onset head —
+        # beats and onsets share the rhythmic structure the backbone is
+        # learning. Loss-weighted at ~0.3 so beat learning helps the backbone
+        # without crowding out the primary onset task.
         self.beat_head = _build_mlp_head(1, onset_head_layers)
 
-    def set_onset_prior(self, p: float) -> None:
-        """Initialize the onset head's final bias to logit(p).
+    def set_arrow_priors(self, priors) -> None:
+        """Initialize the arrow head's final bias to logit(p_a) per arrow.
 
-        Call once after construction with the empirical per-frame
-        onset rate. This alone typically removes the need for focal loss.
+        priors: iterable of length N_ARROWS giving the per-arrow positive
+            rate P(arrow_a fires at any given frame). Anchors the head at
+            the empirical marginal so step-0 predictions match base rates
+            instead of starting from random logits — same idea as the old
+            `set_onset_prior` but per-arrow.
         """
-        p = float(max(min(p, 0.999), 1e-4))
-        bias = math.log(p / (1.0 - p))
-        final = self.onset_head[-1]
+        priors = torch.as_tensor(list(priors), dtype=torch.float32)
+        assert priors.numel() == self.N_ARROWS, (
+            f"expected {self.N_ARROWS} priors, got {priors.numel()}"
+        )
+        priors = priors.clamp(min=1e-4, max=0.999)
+        bias = torch.log(priors / (1.0 - priors))
+        final = self.arrow_head[-1]
         assert isinstance(final, nn.Linear)
-        nn.init.constant_(final.bias, bias)
+        with torch.no_grad():
+            final.bias.copy_(bias)
 
     def set_beat_prior(self, p: float) -> None:
         """Initialize the beat head's final bias to logit(p).
@@ -410,36 +473,82 @@ class StepChartModel(nn.Module):
         with torch.no_grad():
             final.bias.copy_(log_priors)
 
+    def encode(
+        self,
+        mel: torch.Tensor,
+        difficulty: torch.Tensor,
+        density: torch.Tensor,
+        start_seconds: torch.Tensor,
+        remaining_seconds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Backbone-only forward. Returns per-frame features [B, T, H].
+
+        Inference uses this to share backbone work across calls that vary only
+        the prev_arrow conditioning input (sequential arrow decoding). Training
+        still goes through the full `forward`.
+        """
+        x = self.audio_encoder(mel)
+        x = self.tcn(x)
+        x = self.film(x, difficulty, density, start_seconds, remaining_seconds)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.norm(x)
+
+    def apply_arrow_head(
+        self, features: torch.Tensor, prev_arrow: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Arrow head, given backbone features. [B, T, H] -> [B, T, 4]."""
+        if prev_arrow is None:
+            prev_arrow = features.new_zeros(
+                features.size(0), features.size(1), self.PREV_ARROW_DIM,
+            )
+        arrow_in = torch.cat([features, prev_arrow], dim=-1)
+        return self.arrow_head(arrow_in)
+
+    def apply_type_head(self, features: torch.Tensor) -> torch.Tensor:
+        return self.type_head(features)
+
+    def apply_duration_head(self, features: torch.Tensor) -> torch.Tensor:
+        return self.duration_head(features)
+
+    def apply_beat_head(self, features: torch.Tensor) -> torch.Tensor:
+        return self.beat_head(features)
+
     def forward(
         self,
         mel: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
+        start_seconds: torch.Tensor,
+        remaining_seconds: torch.Tensor,
+        prev_arrow: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             mel: [B, T, n_mels]
             difficulty: [B] long
             density: [B] float (normalized)
+            start_seconds: [B] float — chunk's start time from song start (seconds)
+            remaining_seconds: [B] float — song length minus chunk end time (seconds)
+            prev_arrow: [B, T, 4] float — per-frame "previous emitted arrow"
+                vector for the arrow head's transition conditioning. If None
+                (legacy callers / one-shot inference), zeros are used —
+                equivalent to "no prior context".
 
         Returns:
-            onset_logits:  [B, T, 1]
+            arrow_logits:  [B, T, 4]  per-arrow {L, D, U, R} pre-sigmoid
             type_logits:   [B, T, 3]  {tap, jump, hold_start}
             duration_pred: [B, T, 1]  log-space scalar; decode via `decode_duration`
             beat_logits:   [B, T, 1]  auxiliary beat-frame prediction (pre-sigmoid)
         """
-        x = self.audio_encoder(mel)                 # [B, T, H]
-        x = self.tcn(x)                              # [B, T, H]
-        x = self.film(x, difficulty, density)        # [B, T, H]
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)                             # [B, T, H]
-
-        onset_logits = self.onset_head(x)            # [B, T, 1]
-        type_logits = self.type_head(x)              # [B, T, 3]
-        duration_pred = self.duration_head(x)        # [B, T, 1]
-        beat_logits = self.beat_head(x)              # [B, T, 1]
-        return onset_logits, type_logits, duration_pred, beat_logits
+        features = self.encode(
+            mel, difficulty, density, start_seconds, remaining_seconds,
+        )                                                       # [B, T, H]
+        arrow_logits = self.apply_arrow_head(features, prev_arrow)
+        type_logits = self.apply_type_head(features)
+        duration_pred = self.apply_duration_head(features)
+        beat_logits = self.apply_beat_head(features)
+        return arrow_logits, type_logits, duration_pred, beat_logits
 
 
 # ---------------------------------------------------------------------------
@@ -449,12 +558,15 @@ class StepChartModel(nn.Module):
 class StepChartLoss(nn.Module):
     """
     Combined loss:
-        - onset BCEWithLogits with pos_weight on soft (Gaussian-smoothed) targets
-          onset_logits: [B, T, 1], onset_soft: [B, T, 1]
+        - per-arrow BCEWithLogits with per-arrow pos_weight on soft
+          (Gaussian-smoothed) targets
+            arrow_logits: [B, T, 4], arrow_soft: [B, T, 4]
+        - diversity KL: per-chunk arrow distribution should match the target
+          arrow distribution; punishes mode collapse to one arrow
         - 3-way cross-entropy on type head, masked to frames with an onset
-          type_logits: [B, T, 3], type_target: [B, T] long (-100 where no note)
+            type_logits: [B, T, 3], type_target: [B, T] long (-100 where no note)
         - Smooth-L1 on duration head, masked to hold_start frames only
-          duration_pred: [B, T, 1], duration_target: [B, T] float (0 where no hold)
+            duration_pred: [B, T, 1], duration_target: [B, T] float (0 where no hold)
     """
 
     HOLD_START_CLASS = 2  # type target class index for hold_start
@@ -465,7 +577,7 @@ class StepChartLoss(nn.Module):
 
     def __init__(
         self,
-        pos_weight: float = 10.0,
+        pos_weight=10.0,
         type_weight: float = 1.0,
         duration_weight: float = 1.0,
         type_class_weights: Optional[torch.Tensor] = None,
@@ -473,13 +585,25 @@ class StepChartLoss(nn.Module):
         type_focal_gamma: float = 0.0,
         beat_weight: float = 0.0,
         beat_pos_weight: float = 10.0,
+        diversity_weight: float = 0.2,
+        commit_weight: float = 0.5,
     ):
         super().__init__()
-        self.register_buffer('pos_weight', torch.tensor(float(pos_weight)))
+        # Per-arrow pos_weight: scalar broadcasts across the 4 arrows; a
+        # length-4 tensor sets a distinct weight per arrow (recommended —
+        # outer arrows L/R fire ~2× as often as D/U in DDR data, so a uniform
+        # scalar over-weights D/U positives).
+        pw = torch.as_tensor(pos_weight, dtype=torch.float32)
+        if pw.ndim == 0:
+            pw = pw.expand(4).clone()
+        assert pw.numel() == 4, f"pos_weight must be scalar or length-4, got {pw.shape}"
+        self.register_buffer('pos_weight', pw)
         self.register_buffer('beat_pos_weight', torch.tensor(float(beat_pos_weight)))
         self.type_weight = type_weight
         self.duration_weight = duration_weight
         self.beat_weight = float(beat_weight)
+        self.diversity_weight = float(diversity_weight)
+        self.commit_weight = float(commit_weight)
         self.focal_gamma = float(focal_gamma)
         # Focal modulation on the type CE: down-weights confidently-correct
         # frames so the rare jump/hold classes contribute relatively more
@@ -502,32 +626,74 @@ class StepChartLoss(nn.Module):
 
     def forward(
         self,
-        onset_logits: torch.Tensor,    # [B, T, 1]
+        arrow_logits: torch.Tensor,    # [B, T, 4]
         type_logits: torch.Tensor,     # [B, T, 3]
         duration_pred: torch.Tensor,   # [B, T, 1]
-        onset_soft: torch.Tensor,      # [B, T, 1] float in [0,1]
+        arrow_soft: torch.Tensor,      # [B, T, 4] float in [0,1]
         type_target: torch.Tensor,     # [B, T] long, -100 where no note
         duration_target: torch.Tensor, # [B, T] float, seconds at hold_start, 0 elsewhere
         beat_logits: Optional[torch.Tensor] = None,  # [B, T, 1] pre-sigmoid
         beat_soft: Optional[torch.Tensor] = None,    # [B, T, 1] float in [0,1]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Per-arrow BCE. pos_weight is broadcast over [B, T, 4] from its [4]
+        # buffer — F.bce_with_logits handles the broadcast.
         if self.focal_gamma > 0.0:
-            # Focal BCE: down-weight easy examples (mostly negatives) by
-            # (1 - p_t)^gamma. Combined with pos_weight, this fights the
-            # precision collapse caused by too many low-confidence positives.
             bce = F.binary_cross_entropy_with_logits(
-                onset_logits, onset_soft, pos_weight=self.pos_weight,
+                arrow_logits, arrow_soft, pos_weight=self.pos_weight,
                 reduction='none',
             )
             with torch.no_grad():
-                p = torch.sigmoid(onset_logits)
-                p_t = onset_soft * p + (1.0 - onset_soft) * (1.0 - p)
+                p = torch.sigmoid(arrow_logits)
+                p_t = arrow_soft * p + (1.0 - arrow_soft) * (1.0 - p)
                 focal_w = (1.0 - p_t).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
-            onset_loss = (focal_w * bce).mean()
+            arrow_loss = (focal_w * bce).mean()
         else:
-            onset_loss = F.binary_cross_entropy_with_logits(
-                onset_logits, onset_soft, pos_weight=self.pos_weight
+            arrow_loss = F.binary_cross_entropy_with_logits(
+                arrow_logits, arrow_soft, pos_weight=self.pos_weight,
             )
+
+        # Per-frame commit CE: on frames where exactly one arrow fires, treat
+        # the 4 arrow logits as a 4-way softmax and CE against the firing
+        # arrow index. Per-arrow BCE alone is satisfied by predicting the
+        # marginal at every onset (no per-frame commitment required), which
+        # is the local minimum that pins stream coherence. Softmax CE forces
+        # the head to *pick* an arrow per onset frame.
+        if self.commit_weight > 0.0:
+            with torch.no_grad():
+                arrow_hard = (arrow_soft >= 0.5).float()
+                n_fire = arrow_hard.sum(dim=-1)
+                single_mask = (n_fire == 1.0)
+            if single_mask.any():
+                target_idx = arrow_hard.argmax(dim=-1)
+                commit_ce = F.cross_entropy(
+                    arrow_logits[single_mask],
+                    target_idx[single_mask],
+                )
+            else:
+                commit_ce = arrow_logits.sum() * 0.0
+            arrow_loss = arrow_loss + self.commit_weight * commit_ce
+
+        # Diversity regularizer: KL(target_dist || pred_dist) on per-chunk
+        # average arrow probabilities. Punishes "always L/R" collapse —
+        # if the target chunk is balanced across 4 arrows but predictions
+        # concentrate on two, the KL is high. Skipped on chunks where the
+        # ground truth has no onsets at all (denominator is zero).
+        with torch.no_grad():
+            true_norm = arrow_soft.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+            true_dist = arrow_soft.sum(dim=1, keepdim=True) / true_norm   # [B, 1, 4]
+            target_total = arrow_soft.sum(dim=(1, 2))                     # [B]
+        pred_probs = torch.sigmoid(arrow_logits)                          # [B, T, 4]
+        pred_norm = pred_probs.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+        pred_dist = pred_probs.sum(dim=1, keepdim=True) / pred_norm       # [B, 1, 4]
+        eps = 1e-6
+        kl_per_chunk = (
+            true_dist * (true_dist.clamp_min(eps).log() - pred_dist.clamp_min(eps).log())
+        ).sum(dim=-1).squeeze(1)                                          # [B]
+        valid_chunks = (target_total > 0).float()
+        if valid_chunks.sum() > 0:
+            diversity_loss = (kl_per_chunk * valid_chunks).sum() / valid_chunks.sum()
+        else:
+            diversity_loss = torch.zeros((), device=arrow_logits.device)
 
         B, T, C = type_logits.shape
         type_flat = type_logits.reshape(-1, C)
@@ -614,7 +780,7 @@ class StepChartLoss(nn.Module):
             true_log = StepChartModel.encode_duration(window_target[window_mask])
             dur_loss = F.smooth_l1_loss(pred_log, true_log)
         else:
-            dur_loss = torch.tensor(0.0, device=onset_logits.device)
+            dur_loss = torch.tensor(0.0, device=arrow_logits.device)
 
         # Auxiliary beat-frame BCE. The beat target is dense and structured
         # (1-3% of frames depending on tempo), so a moderate pos_weight is
@@ -629,16 +795,18 @@ class StepChartLoss(nn.Module):
                 beat_logits, beat_soft, pos_weight=self.beat_pos_weight,
             )
         else:
-            beat_loss = torch.zeros((), device=onset_logits.device)
+            beat_loss = torch.zeros((), device=arrow_logits.device)
 
-        total = (onset_loss
+        total = (arrow_loss
                  + self.type_weight * type_loss
                  + self.duration_weight * dur_loss
-                 + self.beat_weight * beat_loss)
+                 + self.beat_weight * beat_loss
+                 + self.diversity_weight * diversity_loss)
         return (
             total,
-            onset_loss.detach(),
+            arrow_loss.detach(),
             type_loss.detach(),
             dur_loss.detach(),
             beat_loss.detach(),
+            diversity_loss.detach(),
         )

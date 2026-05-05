@@ -11,7 +11,6 @@ class Settings(BaseSettings):
     """Application settings"""
     
     # API Keys
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     SPOTIFY_CLIENT_ID: str = os.getenv("SPOTIFY_CLIENT_ID", "")
     SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
     
@@ -40,7 +39,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ML Model Settings
-    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model_2.pt")
+    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model_time.pt")
     
     class Config:
         env_file = ".env"

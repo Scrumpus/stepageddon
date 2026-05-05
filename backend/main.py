@@ -36,12 +36,6 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.AUDIO_STORAGE_PATH, exist_ok=True)
     logger.info(f"📁 Audio storage: {settings.AUDIO_STORAGE_PATH}")
     
-    # Verify API keys
-    if not settings.ANTHROPIC_API_KEY:
-        logger.warning("⚠️  ANTHROPIC_API_KEY not set - AI generation will fail")
-    else:
-        logger.info("✓ Anthropic API key configured")
-    
     if not settings.SPOTIFY_CLIENT_ID or not settings.SPOTIFY_CLIENT_SECRET:
         logger.warning("⚠️  Spotify credentials not set - Spotify URLs won't work")
     else:

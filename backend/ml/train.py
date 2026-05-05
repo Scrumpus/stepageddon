@@ -48,6 +48,7 @@ from ml.dataset import (
     FRAMES_PER_SECOND,
     StepChartDataset,
     class_weights_from_prior,
+    compute_arrow_priors,
     compute_beat_prior,
     compute_default_density_per_difficulty,
     compute_hold_duration_median,
@@ -63,15 +64,18 @@ from ml.dataset import (
 
 
 def make_mixup_collate(p_mixup: float, alpha: float):
-    """Per-batch MixUp on mel + onset target, with type/duration masked out.
+    """Per-batch MixUp on mel + per-arrow onset targets, with type/duration masked.
 
-    The dataset yields (mel, diff, density, onset_soft, type_target, durations).
-    With probability `p_mixup`, draw lambda ~ Beta(alpha, alpha), permute the
-    batch, and replace mel/onset with the convex combination. Type and
-    duration supervision is dropped for the mixed batch (set to -100 / 0):
-    teaching the type head on mixed targets is ill-defined, but the onset
-    BCE handles soft targets natively, so MixUp regularizes onset learning
-    without poisoning the rare-class supervision the type head needs.
+    The dataset yields (mel, diff, density, arrow_soft, type_target, durations,
+    beat_soft, prev_arrow, start_seconds, remaining_seconds). With probability
+    `p_mixup`, draw lambda ~ Beta(alpha, alpha), permute the batch, and replace
+    mel/arrow_soft/beat_soft with the convex combination. Type and duration
+    supervision is dropped on mixed batches (set to -100 / 0): teaching the
+    type head on mixed targets is ill-defined, but per-arrow BCE handles soft
+    targets natively. prev_arrow is also linearly interpolated — it's a
+    binary 4-vector representing "previous arrow," and a soft mix is a
+    reasonable proxy for "previous arrow of the mixed audio." The two
+    song-position scalars are linearly mixed too — same conditioning logic.
 
     p_mixup=0.0 returns a default collate (no-op).
     """
@@ -84,7 +88,10 @@ def make_mixup_collate(p_mixup: float, alpha: float):
         out = default_collate(batch)
         if p_mixup <= 0.0 or torch.rand(()).item() >= p_mixup:
             return out
-        mel, diff, dens, onset_soft, type_t, dur_t, beat_soft = out
+        (
+            mel, diff, dens, arrow_soft, type_t, dur_t,
+            beat_soft, prev_arrow, start_s, remain_s,
+        ) = out
         B = mel.size(0)
         if B < 2:
             return out
@@ -92,13 +99,17 @@ def make_mixup_collate(p_mixup: float, alpha: float):
         lam = max(min(lam, 0.95), 0.05)  # keep both samples meaningfully present
         perm = torch.randperm(B)
         mel_mixed = lam * mel + (1.0 - lam) * mel[perm]
-        onset_mixed = lam * onset_soft + (1.0 - lam) * onset_soft[perm]
-        # Beats also mix proportionally — both songs' beat tracks remain
-        # valid frame-level supervision under mixup.
+        arrow_mixed = lam * arrow_soft + (1.0 - lam) * arrow_soft[perm]
         beat_mixed = lam * beat_soft + (1.0 - lam) * beat_soft[perm]
+        prev_mixed = lam * prev_arrow + (1.0 - lam) * prev_arrow[perm]
+        start_mixed = lam * start_s + (1.0 - lam) * start_s[perm]
+        remain_mixed = lam * remain_s + (1.0 - lam) * remain_s[perm]
         type_masked = torch.full_like(type_t, -100)
         dur_zeroed = torch.zeros_like(dur_t)
-        return mel_mixed, diff, dens, onset_mixed, type_masked, dur_zeroed, beat_mixed
+        return (
+            mel_mixed, diff, dens, arrow_mixed, type_masked, dur_zeroed,
+            beat_mixed, prev_mixed, start_mixed, remain_mixed,
+        )
 
     return collate
 
@@ -189,6 +200,7 @@ class BuildOutputs:
     val_idx: List[int]
     note_counts: np.ndarray
     onset_prior: float
+    arrow_priors: np.ndarray  # [4] per-arrow positive rate; arrow head bias init
     default_density_by_id: torch.Tensor
     type_prior: np.ndarray  # [3] P(class | onset) over {tap, jump, hold_start}
     hold_duration_median: float  # beats; bias-init for the duration head
@@ -215,6 +227,9 @@ def build_dataloaders(args) -> BuildOutputs:
         augment=True,
         density_swap_prob=float(getattr(args, 'p_density_swap', 0.5)),
         default_density_by_id=default_density_by_id,
+        intro_outro_oversample_prob=float(
+            getattr(args, 'intro_outro_oversample_prob', 0.15)
+        ),
     )
     print(f"[build_dataloaders] dataset built, n_entries={len(full_dataset.entries)}", flush=True)
 
@@ -232,6 +247,10 @@ def build_dataloaders(args) -> BuildOutputs:
     )
     print("[build_dataloaders] compute_onset_prior...", flush=True)
     onset_prior = compute_onset_prior(full_dataset.entries, str(data_dir), train_idx)
+    print("[build_dataloaders] compute_arrow_priors...", flush=True)
+    arrow_priors = compute_arrow_priors(
+        full_dataset.entries, str(data_dir), train_idx,
+    )
     print("[build_dataloaders] compute_type_class_distribution...", flush=True)
     type_prior = compute_type_class_distribution(
         full_dataset.entries, str(data_dir), train_idx,
@@ -331,6 +350,7 @@ def build_dataloaders(args) -> BuildOutputs:
         val_idx=val_idx,
         note_counts=note_counts,
         onset_prior=onset_prior,
+        arrow_priors=arrow_priors,
         default_density_by_id=default_density_by_id,
         type_prior=type_prior,
         hold_duration_median=hold_duration_median,
@@ -340,7 +360,7 @@ def build_dataloaders(args) -> BuildOutputs:
 
 def build_model(
     args,
-    onset_prior: float,
+    arrow_priors: np.ndarray,
     type_prior: np.ndarray,
     device: torch.device,
     hold_duration_median: float = 1.0,
@@ -357,7 +377,7 @@ def build_model(
         tcn_dilations=tcn_dilations,
         onset_head_layers=args.onset_head_layers,
     ).to(device)
-    model.set_onset_prior(onset_prior)
+    model.set_arrow_priors(arrow_priors)
     model.set_type_prior(type_prior)
     model.set_duration_prior(hold_duration_median)
     model.set_beat_prior(beat_prior)
@@ -375,7 +395,7 @@ def build_optimizer_and_scheduler(
     # onset training. Backbone + onset stay at base LR.
     head_mult = float(getattr(args, 'head_lr_mult', 1.0))
     base_lr = float(args.lr)
-    backbone_params, onset_params, type_params, dur_params = [], [], [], []
+    backbone_params, arrow_params, type_params, dur_params = [], [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -383,18 +403,18 @@ def build_optimizer_and_scheduler(
             type_params.append(p)
         elif name.startswith('duration_head'):
             dur_params.append(p)
-        elif name.startswith('onset_head'):
-            onset_params.append(p)
+        elif name.startswith('arrow_head'):
+            arrow_params.append(p)
         else:
             backbone_params.append(p)
     param_groups = [
         {'params': backbone_params, 'lr': base_lr, 'name': 'backbone'},
-        {'params': onset_params, 'lr': base_lr, 'name': 'onset_head'},
+        {'params': arrow_params, 'lr': base_lr, 'name': 'arrow_head'},
         {'params': type_params, 'lr': base_lr * head_mult, 'name': 'type_head'},
         {'params': dur_params, 'lr': base_lr * head_mult, 'name': 'duration_head'},
     ]
     logger.info(
-        f"Optimizer param groups: backbone/onset lr={base_lr:.2e}, "
+        f"Optimizer param groups: backbone/arrow lr={base_lr:.2e}, "
         f"type/duration lr={base_lr * head_mult:.2e} (head_lr_mult={head_mult:.2f})"
     )
     optimizer = torch.optim.AdamW(
@@ -414,17 +434,27 @@ def build_optimizer_and_scheduler(
 
 
 def build_loss(
-    onset_prior: float, type_prior: np.ndarray, args,
+    arrow_priors: np.ndarray, type_prior: np.ndarray, args,
 ) -> StepChartLoss:
-    p = max(onset_prior, 1e-5)
+    """Build the combined loss with per-arrow pos_weight derived from priors.
+
+    Per-arrow pos_weight = sqrt((1 - p_a) / p_a) per arrow, capped at 50.
+    Computing it per arrow (instead of a single onset rate) prevents the
+    model from leaning on whichever arrow happens to be most frequent —
+    pos_weight is highest for the rarest arrow, so its positives matter most.
+    `--pos-weight` (scalar) still overrides if set, broadcast across arrows.
+    """
     if args.pos_weight is not None:
-        pos_weight = float(args.pos_weight)
-        logger.info(f"BCE pos_weight = {pos_weight:.2f} (override)")
+        pw = torch.full((4,), float(args.pos_weight), dtype=torch.float32)
+        logger.info(f"BCE pos_weight = {float(args.pos_weight):.2f} (override, all arrows)")
     else:
-        pos_weight = min(max(((1.0 - p) / p) ** 0.5, 1.0), 50.0)
+        clipped = np.clip(arrow_priors, 1e-5, 0.5)
+        per_arrow = np.sqrt((1.0 - clipped) / clipped)
+        per_arrow = np.minimum(np.maximum(per_arrow, 1.0), 50.0)
+        pw = torch.from_numpy(per_arrow.astype(np.float32))
         logger.info(
-            f"BCE pos_weight = {pos_weight:.2f} (sqrt((1-p)/p) "
-            f"from onset_prior={p:.4f})"
+            f"BCE pos_weight per arrow [L,D,U,R] = {per_arrow.tolist()} "
+            f"(sqrt((1-p)/p) from arrow_priors)"
         )
     type_class_weights = class_weights_from_prior(
         type_prior,
@@ -432,37 +462,48 @@ def build_loss(
         max_weight=args.type_weight_cap,
     )
     return StepChartLoss(
-        pos_weight=pos_weight,
+        pos_weight=pw,
         type_weight=args.type_weight,
         duration_weight=args.duration_weight,
         type_class_weights=type_class_weights,
         focal_gamma=args.focal_gamma,
         type_focal_gamma=getattr(args, 'type_focal_gamma', 0.0),
         beat_weight=getattr(args, 'beat_weight', 0.0),
+        diversity_weight=getattr(args, 'diversity_weight', 0.2),
+        commit_weight=getattr(args, 'arrow_commit_weight', 0.5),
     )
 
 def train_one_epoch(
     model, loader, criterion, optimizer, scheduler, scaler, device,
     ema_model: Optional[AveragedModel] = None,
     log_interval: int = 50,
+    prev_arrow_dropout: float = 0.1,
 ) -> Dict[str, float]:
+    """One epoch of training.
+
+    `prev_arrow_dropout` zeros the entire prev_arrow vector for a fraction of
+    frames per chunk, so the arrow head learns to make sensible predictions
+    even with no transition context (matches inference at the start of a
+    song or after long silences). Independent Bernoulli mask per (B, T).
+    """
     print("  [train_one_epoch] model.train() done; about to iterate loader", flush=True)
     model.train()
     total_loss = 0.0
-    total_onset = 0.0
+    total_arrow = 0.0
     total_type = 0.0
     total_dur = 0.0
     total_beat = 0.0
+    total_div = 0.0
     total_samples = 0
     n_batches = len(loader)
     print(f"  [train_one_epoch] n_batches={n_batches}", flush=True)
 
-    # Running averages for intra-epoch logging
     interval_loss = 0.0
-    interval_onset = 0.0
+    interval_arrow = 0.0
     interval_type = 0.0
     interval_dur = 0.0
     interval_beat = 0.0
+    interval_div = 0.0
     interval_samples = 0
     t_start = time.time()
 
@@ -474,27 +515,43 @@ def train_one_epoch(
                 f"(fetch={time.time()-_t_fetch:.2f}s)",
                 flush=True,
             )
-        mel, difficulty, density, onset_soft, type_target, duration_target, beat_soft = batch
+        (
+            mel, difficulty, density, arrow_soft, type_target, duration_target,
+            beat_soft, prev_arrow, start_seconds, remaining_seconds,
+        ) = batch
         if step < 3:
             print(f"  [train_one_epoch] batch {step} unpacked, mel={tuple(mel.shape)}", flush=True)
         mel = mel.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
         density = density.to(device, non_blocking=True)
-        onset_soft = onset_soft.to(device, non_blocking=True)
+        arrow_soft = arrow_soft.to(device, non_blocking=True)
         type_target = type_target.to(device, non_blocking=True)
         duration_target = duration_target.to(device, non_blocking=True)
         beat_soft = beat_soft.to(device, non_blocking=True)
+        prev_arrow = prev_arrow.to(device, non_blocking=True)
+        start_seconds = start_seconds.to(device, non_blocking=True)
+        remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+
+        # Per-frame prev-arrow dropout: zero the conditioning vector with
+        # probability `prev_arrow_dropout`. Forces the head to remain useful
+        # without conditioning context, matching inference at song start or
+        # after long gaps where there's no recent prior arrow.
+        if prev_arrow_dropout > 0.0:
+            keep = (torch.rand(prev_arrow.shape[:2], device=device)
+                    >= prev_arrow_dropout).float().unsqueeze(-1)
+            prev_arrow = prev_arrow * keep
 
         optimizer.zero_grad(set_to_none=True)
         if step < 3:
             print(f"  [train_one_epoch] batch {step} forward...", flush=True)
         with autocast('cuda'):
-            onset_logits, type_logits, duration_pred, beat_logits = model(
+            arrow_logits, type_logits, duration_pred, beat_logits = model(
                 mel, difficulty, density,
+                start_seconds, remaining_seconds, prev_arrow,
             )
-            loss, onset_l, type_l, dur_l, beat_l = criterion(
-                onset_logits, type_logits, duration_pred,
-                onset_soft, type_target, duration_target,
+            loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
+                arrow_logits, type_logits, duration_pred,
+                arrow_soft, type_target, duration_target,
                 beat_logits=beat_logits, beat_soft=beat_soft,
             )
         if step < 3:
@@ -516,48 +573,53 @@ def train_one_epoch(
 
         bs = mel.size(0)
         total_loss += loss.item() * bs
-        total_onset += onset_l.item() * bs
+        total_arrow += arrow_l.item() * bs
         total_type += type_l.item() * bs
         total_dur += dur_l.item() * bs
         total_beat += beat_l.item() * bs
+        total_div += div_l.item() * bs
         total_samples += bs
 
         interval_loss += loss.item() * bs
-        interval_onset += onset_l.item() * bs
+        interval_arrow += arrow_l.item() * bs
         interval_type += type_l.item() * bs
         interval_dur += dur_l.item() * bs
         interval_beat += beat_l.item() * bs
+        interval_div += div_l.item() * bs
         interval_samples += bs
 
         if (step + 1) % log_interval == 0 or (step + 1) == n_batches:
             avg_l = interval_loss / max(interval_samples, 1)
-            avg_o = interval_onset / max(interval_samples, 1)
+            avg_a = interval_arrow / max(interval_samples, 1)
             avg_t = interval_type / max(interval_samples, 1)
             avg_d = interval_dur / max(interval_samples, 1)
             avg_b = interval_beat / max(interval_samples, 1)
+            avg_v = interval_div / max(interval_samples, 1)
             lr = optimizer.param_groups[0]['lr']
             elapsed = time.time() - t_start
             print(
                 f"  step {step+1:4d}/{n_batches} "
-                f"| loss={avg_l:.4f} (onset={avg_o:.4f} type={avg_t:.4f} "
-                f"dur={avg_d:.4f} beat={avg_b:.4f}) "
+                f"| loss={avg_l:.4f} (arrow={avg_a:.4f} type={avg_t:.4f} "
+                f"dur={avg_d:.4f} beat={avg_b:.4f} div={avg_v:.4f}) "
                 f"| lr={lr:.2e} | {elapsed:.1f}s",
                 flush=True,
             )
             interval_loss = 0.0
-            interval_onset = 0.0
+            interval_arrow = 0.0
             interval_type = 0.0
             interval_dur = 0.0
             interval_beat = 0.0
+            interval_div = 0.0
             interval_samples = 0
             t_start = time.time()
 
     return {
         'loss': total_loss / max(total_samples, 1),
-        'onset_loss': total_onset / max(total_samples, 1),
+        'arrow_loss': total_arrow / max(total_samples, 1),
         'type_loss': total_type / max(total_samples, 1),
         'duration_loss': total_dur / max(total_samples, 1),
         'beat_loss': total_beat / max(total_samples, 1),
+        'diversity_loss': total_div / max(total_samples, 1),
     }
 
 
@@ -666,26 +728,34 @@ def validate(
     n_val_batches = len(loader)
     print(f"  [validate] n_val_batches={n_val_batches}", flush=True)
     total_loss = 0.0
-    total_onset = 0.0
+    total_arrow = 0.0
     total_type = 0.0
     total_dur = 0.0
     total_beat = 0.0
+    total_div = 0.0
     total_samples = 0
 
+    # Aggregate "any-onset" prob per frame via row-max on per-arrow probs.
     all_pred = []
     all_true = []
+
+    # Per-arrow predictions/targets for per-arrow F1 calibration.
+    # `all_arrow_probs` is zero prev_arrow context — matches inference Phase 1
+    # (NMS peak picking). `all_arrow_probs_tf` is teacher-forced — matches
+    # inference Phase 2 (per-onset arrow re-scoring with the previous emitted
+    # arrow as context). The per-arrow threshold sweep below uses TF, the
+    # any-onset threshold sweep uses zero-context.
+    all_arrow_probs = []      # list of [B, T, 4] (prev_arrow=0)
+    all_arrow_probs_tf = []   # list of [B, T, 4] (teacher-forced prev_arrow)
+    all_arrow_true = []       # list of [B, T, 4]
 
     type_correct = 0
     type_total = 0
 
-    # Per-class confusion for {tap=0, jump=1, hold_start=2}.
     type_tp = np.zeros(3, dtype=np.int64)
     type_fp = np.zeros(3, dtype=np.int64)
     type_fn = np.zeros(3, dtype=np.int64)
 
-    # Collected raw type logits + targets at supervised frames so we can
-    # post-hoc sweep (jump_bias, hold_bias) for calibration. Cheap: only
-    # ~2% of frames are supervised so this is a few MB total.
     all_type_logits: List[np.ndarray] = []
     all_type_targets: List[np.ndarray] = []
 
@@ -699,37 +769,70 @@ def validate(
                 f"({time.time()-_t_val:.1f}s elapsed)",
                 flush=True,
             )
-        mel, difficulty, density, onset_soft, type_target, duration_target, beat_soft = batch
+        (
+            mel, difficulty, density, arrow_soft, type_target, duration_target,
+            beat_soft, prev_arrow, start_seconds, remaining_seconds,
+        ) = batch
         mel = mel.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
         density = density.to(device, non_blocking=True)
-        onset_soft = onset_soft.to(device, non_blocking=True)
+        arrow_soft = arrow_soft.to(device, non_blocking=True)
         type_target = type_target.to(device, non_blocking=True)
         duration_target = duration_target.to(device, non_blocking=True)
         beat_soft = beat_soft.to(device, non_blocking=True)
+        prev_arrow = prev_arrow.to(device, non_blocking=True)
+        start_seconds = start_seconds.to(device, non_blocking=True)
+        remaining_seconds = remaining_seconds.to(device, non_blocking=True)
 
         with autocast('cuda'):
-            onset_logits, type_logits, duration_pred, beat_logits = model(
-                mel, difficulty, density,
+            # Share the backbone encode across the two arrow-head calls below.
+            features = model.encode(
+                mel, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, type_l, dur_l, beat_l = criterion(
-                onset_logits, type_logits, duration_pred,
-                onset_soft, type_target, duration_target,
+            # Teacher-forced arrow logits: used for the loss (matches training)
+            # and per-frame loss reporting.
+            arrow_logits = model.apply_arrow_head(features, prev_arrow)
+            type_logits = model.apply_type_head(features)
+            duration_pred = model.apply_duration_head(features)
+            beat_logits = model.apply_beat_head(features)
+            # Zero-context arrow logits: matches the inference peak-picking
+            # distribution (`_predict_chunked` calls apply_arrow_head with
+            # prev_arrow=None, i.e. zeros). The threshold sweep below uses
+            # these so saved best_threshold / best_arrow_thresholds are
+            # calibrated against the distribution inference actually sees.
+            zero_prev = torch.zeros_like(prev_arrow)
+            arrow_logits_zero = model.apply_arrow_head(features, zero_prev)
+            loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
+                arrow_logits, type_logits, duration_pred,
+                arrow_soft, type_target, duration_target,
                 beat_logits=beat_logits, beat_soft=beat_soft,
             )
 
         bs = mel.size(0)
         total_loss += loss.item() * bs
-        total_onset += onset_l.item() * bs
+        total_arrow += arrow_l.item() * bs
         total_type += type_l.item() * bs
         total_dur += dur_l.item() * bs
         total_beat += beat_l.item() * bs
+        total_div += div_l.item() * bs
         total_samples += bs
 
-        probs = torch.sigmoid(onset_logits.float()).cpu().numpy()  # [B, T, 1]
-        true_hard = (onset_soft.cpu().numpy() > 0.5).astype(np.float32)  # [B, T, 1]
-        all_pred.append(probs)
-        all_true.append(true_hard)
+        # Any-onset threshold sweep / KL / stream_coh use the zero-context
+        # distribution (matches inference Phase 1 peak picking).
+        arrow_probs = torch.sigmoid(arrow_logits_zero.float()).cpu().numpy()  # [B, T, 4]
+        # Per-arrow threshold sweep uses the teacher-forced distribution
+        # (matches inference Phase 2, where prev_arrow tracks the previously
+        # emitted arrow per-onset).
+        arrow_probs_tf = torch.sigmoid(arrow_logits.float()).cpu().numpy()    # [B, T, 4]
+        arrow_true = (arrow_soft.cpu().numpy() > 0.5).astype(np.float32)   # [B, T, 4]
+        all_arrow_probs.append(arrow_probs)
+        all_arrow_probs_tf.append(arrow_probs_tf)
+        all_arrow_true.append(arrow_true)
+        # Aggregate "any-onset" probability is the max over the 4 arrows.
+        any_probs = arrow_probs.max(axis=-1, keepdims=True)                # [B, T, 1]
+        any_true = arrow_true.max(axis=-1, keepdims=True)                  # [B, T, 1]
+        all_pred.append(any_probs)
+        all_true.append(any_true)
 
         # Type accuracy on frames with an onset
         type_pred = type_logits.argmax(dim=-1)  # [B, T]
@@ -766,6 +869,9 @@ def validate(
     print("  [validate] val loop done; concatenating preds...", flush=True)
     pred_concat = np.concatenate(all_pred, axis=0).reshape(-1, 1)
     true_concat = np.concatenate(all_true, axis=0).reshape(-1, 1)
+    arrow_probs_concat = np.concatenate(all_arrow_probs, axis=0).reshape(-1, 4)  # [N, 4] zero-context
+    arrow_probs_tf_concat = np.concatenate(all_arrow_probs_tf, axis=0).reshape(-1, 4)  # [N, 4] teacher-forced
+    arrow_true_concat = np.concatenate(all_arrow_true, axis=0).reshape(-1, 4)    # [N, 4]
     pred_1d = pred_concat.reshape(-1)
     true_1d_hard = true_concat.reshape(-1)
     true_peaks = np.flatnonzero(true_1d_hard > 0.5)
@@ -787,6 +893,46 @@ def validate(
         if f_ > best_f1:
             best_f1, best_thr, best_p, best_r = f_, float(thr), p_, r_
     prec, rec, f1 = best_p, best_r, best_f1
+
+    # Per-arrow threshold sweep + F1. Each arrow is treated as an independent
+    # frame-level binary problem so the model can be calibrated separately
+    # per channel (outer arrows fire ~2× as often as D/U; one shared
+    # threshold under-fits the rarer ones). Uses the teacher-forced probs
+    # because inference Phase 2 (per-onset arrow re-scoring in
+    # `_choose_arrows`) sees the real previously-emitted arrow as context;
+    # calibrating against the zero-context distribution would make these
+    # thresholds far too conservative for that path.
+    per_arrow_best_thr = np.zeros(4, dtype=np.float32)
+    per_arrow_f1 = np.zeros(4, dtype=np.float32)
+    for a in range(4):
+        ap = arrow_probs_tf_concat[:, a]
+        at = arrow_true_concat[:, a]
+        true_a_peaks = np.flatnonzero(at > 0.5)
+        peak_a_idx, peak_a_probs = _all_local_max_peaks(
+            ap, tol_frames, min_threshold=min_thr,
+        )
+        best_af1, best_athr = -1.0, 0.5
+        for thr in thresholds:
+            _, _, fa = _f1_at_threshold(
+                peak_a_idx, peak_a_probs, true_a_peaks, tol_frames, float(thr),
+            )
+            if fa > best_af1:
+                best_af1, best_athr = fa, float(thr)
+        per_arrow_best_thr[a] = best_athr
+        per_arrow_f1[a] = max(best_af1, 0.0)
+
+    # Stream coherence on the predicted arrow argmax in dense regions.
+    # In any 1-second window with >= 4 onsets (predicted by max-arrow > thr),
+    # the fraction of consecutive non-equal arrows. ~0.7-0.85 on real charts.
+    stream_coh = _stream_coherence(
+        arrow_probs_concat, threshold=float(best_thr),
+        min_dense_count=4, frames_per_second=int(round(FRAMES_PER_SECOND)),
+    )
+    # Per-arrow KL divergence between predicted and true marginals over the
+    # *positive* frames. Punishes mode collapse: KL is 0 only when the
+    # predicted arrow distribution matches the ground-truth distribution
+    # over note-bearing frames.
+    arrow_kl = _arrow_distribution_kl(arrow_probs_concat, arrow_true_concat)
 
     # Multi-tolerance F1 at the primary best threshold. 50 ms / 100 ms windows
     # tell us how much of the recall gap is jitter (recoverable with a softer
@@ -884,25 +1030,40 @@ def validate(
 
     return {
         'loss': total_loss / max(total_samples, 1),
-        'onset_loss': total_onset / max(total_samples, 1),
+        'arrow_loss': total_arrow / max(total_samples, 1),
         'type_loss': total_type / max(total_samples, 1),
         'duration_loss': total_dur / max(total_samples, 1),
         'beat_loss': total_beat / max(total_samples, 1),
+        'diversity_loss': total_div / max(total_samples, 1),
+        # "Any-onset" F1 (row-max over per-arrow probs); kept for continuity
+        # with the legacy onset-head metric and for checkpoint selection.
         'tol_precision': prec,
         'tol_recall': rec,
         'tol_f1': f1,
-        # Multi-tolerance variants at the primary threshold (visibility only;
-        # they don't drive checkpoint selection).
         'tol_f1_50ms': float(extra_tols[5][2]),
         'tol_f1_100ms': float(extra_tols[10][2]),
         'best_thr': float(best_thr),
+        # Per-arrow F1 + per-arrow calibrated thresholds.
+        'arrow_f1_L': float(per_arrow_f1[0]),
+        'arrow_f1_D': float(per_arrow_f1[1]),
+        'arrow_f1_U': float(per_arrow_f1[2]),
+        'arrow_f1_R': float(per_arrow_f1[3]),
+        'arrow_f1_macro': float(per_arrow_f1.mean()),
+        'arrow_thr_L': float(per_arrow_best_thr[0]),
+        'arrow_thr_D': float(per_arrow_best_thr[1]),
+        'arrow_thr_U': float(per_arrow_best_thr[2]),
+        'arrow_thr_R': float(per_arrow_best_thr[3]),
+        # Diagnostic: KL(true||pred) on per-arrow marginal in note frames.
+        # Lower is better; > ~0.1 usually means the model is collapsing to
+        # one or two arrows.
+        'arrow_marginal_kl': float(arrow_kl),
+        # Stream coherence in dense sections; ground truth sits ~0.7-0.85.
+        'stream_coherence': float(stream_coh),
         'type_acc': type_correct / max(type_total, 1),
         'tap_f1': tap_f1, 'tap_p': tap_p, 'tap_r': tap_r,
         'jump_f1': jump_f1, 'jump_p': jump_p, 'jump_r': jump_r,
         'hold_f1': hold_f1, 'hold_p': hold_p, 'hold_r': hold_r,
         'type_macro_f1': type_macro_f1,
-        # Calibrated equivalents — what inference would achieve with the
-        # best (jump_bias, hold_bias) found via post-hoc bias sweep.
         'cal_jump_bias': cal_jump_bias,
         'cal_hold_bias': cal_hold_bias,
         'cal_macro_f1': cal_macro_f1,
@@ -919,6 +1080,68 @@ def validate(
         'prob_neg_mean': neg_mean,
     }
 
+
+def _stream_coherence(
+    arrow_probs: np.ndarray,
+    threshold: float,
+    min_dense_count: int = 4,
+    frames_per_second: int = 100,
+) -> float:
+    """Fraction of consecutive non-equal predicted arrows in dense windows.
+
+    A "dense" window is a 1-second slice containing ≥ min_dense_count frames
+    where any arrow exceeds `threshold`. Inside each dense window, take the
+    sequence of argmax-arrows at those onset frames and compute the fraction
+    of adjacent pairs that differ. Real DDR charts in stream sections sit
+    around 0.7-0.85 — pure L-R-L-R is 1.0 (suspiciously uniform), pure jacks
+    is 0.0. Returns 0.0 if no dense windows are found.
+    """
+    N = arrow_probs.shape[0]
+    if N == 0:
+        return 0.0
+    onset_mask = arrow_probs.max(axis=-1) >= threshold      # [N]
+    if onset_mask.sum() < min_dense_count:
+        return 0.0
+    onset_idx = np.flatnonzero(onset_mask)
+    onset_arrows = arrow_probs[onset_idx].argmax(axis=-1)   # [n_onsets]
+    win = frames_per_second
+    diffs, totals = 0, 0
+    i = 0
+    while i < onset_idx.size:
+        j = i
+        end_frame = onset_idx[i] + win
+        while j < onset_idx.size and onset_idx[j] < end_frame:
+            j += 1
+        seg = onset_arrows[i:j]
+        if seg.size >= min_dense_count:
+            diffs += int((seg[1:] != seg[:-1]).sum())
+            totals += int(seg.size - 1)
+        i = j
+    if totals == 0:
+        return 0.0
+    return float(diffs) / float(totals)
+
+
+def _arrow_distribution_kl(
+    arrow_probs: np.ndarray, arrow_true: np.ndarray, eps: float = 1e-6,
+) -> float:
+    """KL(true_marginal || pred_marginal) over note-bearing frames.
+
+    Marginal is per-arrow fraction of fires across positive frames. A pure
+    L-R model on a balanced ground truth gets KL ≈ ln(2) ≈ 0.69. Returns 0
+    when no frames have any onset.
+    """
+    onset_frames = arrow_true.max(axis=-1) > 0.5
+    if not onset_frames.any():
+        return 0.0
+    true_dist = arrow_true[onset_frames].sum(axis=0)
+    true_dist = true_dist / max(float(true_dist.sum()), eps)
+    pred_dist = arrow_probs[onset_frames].sum(axis=0)
+    pred_dist = pred_dist / max(float(pred_dist.sum()), eps)
+    pred_dist = np.clip(pred_dist, eps, 1.0)
+    true_dist = np.clip(true_dist, eps, 1.0)
+    return float(np.sum(true_dist * (np.log(true_dist) - np.log(pred_dist))))
+
 def save_checkpoint(
     path: Path,
     epoch: int,
@@ -932,10 +1155,16 @@ def save_checkpoint(
     mel_mean: float,
     mel_std: float,
     type_prior: np.ndarray,
+    arrow_priors: np.ndarray,
     args,
 ) -> None:
     ckpt = {
         'epoch': epoch,
+        # arch_version history:
+        #   1 = legacy single-onset head (missing key)
+        #   2 = per-arrow head with prev_arrow conditioning
+        #   3 = +(start_seconds, remaining_seconds) FiLM conditioning
+        'arch_version': 3,
         'model_state_dict': model.state_dict(),
         'ema_state_dict': (
             ema_model.module.state_dict() if ema_model is not None else None
@@ -944,21 +1173,23 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
         'metrics': metrics,
-        # Marker for inference: this checkpoint's duration head was trained
-        # on beats targets (seconds * tempo / 60). Inference must convert
-        # back to seconds via `beats * 60 / tempo`. Legacy checkpoints
-        # without this flag are interpreted as 'seconds' for backward compat.
         'duration_unit': 'beats',
         'best_threshold': float(metrics.get('best_thr', 0.5)),
-        # Per-class calibration biases — applied additively to the type
-        # head's logits at inference. Saving them with the checkpoint means
-        # MLChartGenerator gets calibrated defaults out of the box.
+        # Per-arrow calibrated thresholds saved alongside the legacy
+        # `best_threshold` so inference can use them per channel.
+        'best_arrow_thresholds': [
+            float(metrics.get('arrow_thr_L', 0.5)),
+            float(metrics.get('arrow_thr_D', 0.5)),
+            float(metrics.get('arrow_thr_U', 0.5)),
+            float(metrics.get('arrow_thr_R', 0.5)),
+        ],
         'best_jump_bias': float(metrics.get('cal_jump_bias', 0.0)),
         'best_hold_bias': float(metrics.get('cal_hold_bias', 0.0)),
         'default_density_by_id': default_density_by_id.tolist(),
         'mel_mean': float(mel_mean),
         'mel_std': float(mel_std),
         'type_prior': [float(x) for x in type_prior],
+        'arrow_priors': [float(x) for x in arrow_priors],
         'args': vars(args) if not isinstance(args, dict) else args,
         'git_sha': _git_sha(),
     }
@@ -1016,6 +1247,12 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Probability that the density input is swapped at '
                              'training time for the per-difficulty default '
                              '(the constant inference uses). 0.0 disables.')
+    parser.add_argument('--intro-outro-oversample-prob', type=float, default=0.15,
+                        help='Per-sample probability of forcing a training '
+                             'chunk to start at song frame 0 (intro), with the '
+                             'same probability of anchoring to song end. '
+                             'Without this, edge chunks are far too rare for '
+                             'the model to learn intro-silence patterns.')
     parser.add_argument('--mixup-p', type=float, default=0.3,
                         help='Per-batch probability of applying MixUp to mel + '
                              'onset target. Type/duration supervision is dropped '
@@ -1030,6 +1267,25 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Loss weight on the auxiliary beat-prediction '
                              'head. 0.0 disables — head still emits logits but '
                              'gets no gradient.')
+    parser.add_argument('--diversity-weight', type=float, default=0.05,
+                        help='Loss weight on the per-chunk arrow-distribution '
+                             'KL regularizer. Rewards predicted marginals '
+                             'matching the target marginals — useful against '
+                             'mode collapse, but actively counterproductive '
+                             'once a per-frame commit loss is present, since '
+                             'it pulls predictions back toward marginal '
+                             'matching at every onset. 0.0 disables.')
+    parser.add_argument('--arrow-commit-weight', type=float, default=0.5,
+                        help='Loss weight on the per-frame softmax-CE applied '
+                             'to single-arrow frames. Forces the arrow head '
+                             'to commit to a specific arrow per onset rather '
+                             'than predicting the per-arrow marginal — fixes '
+                             'low stream coherence. 0.0 disables.')
+    parser.add_argument('--prev-arrow-dropout', type=float, default=0.1,
+                        help='Per-frame probability of zeroing the prev_arrow '
+                             'conditioning vector during training. Forces the '
+                             'arrow head to remain useful without context, '
+                             'matching inference at song start / after gaps.')
     parser.add_argument('--tcn-dilations', type=str, default='1,2,4,8,16,32',
                         help='Comma-separated dilations for the TCN stack')
     parser.add_argument('--onset-head-layers', type=int, default=3,
@@ -1088,12 +1344,12 @@ def main():
     built = build_dataloaders(args)
     print("Dataloaders built. Building model...", flush=True)
     model = build_model(
-        args, built.onset_prior, built.type_prior, device,
+        args, built.arrow_priors, built.type_prior, device,
         hold_duration_median=built.hold_duration_median,
         beat_prior=built.beat_prior,
     )
     print("[main] model built; building loss...", flush=True)
-    criterion = build_loss(built.onset_prior, built.type_prior, args).to(device)
+    criterion = build_loss(built.arrow_priors, built.type_prior, args).to(device)
     print("[main] loss built; computing steps_per_epoch (calls len(train_loader))...", flush=True)
     steps_per_epoch = max(1, len(built.train_loader))
     print(f"[main] steps_per_epoch={steps_per_epoch}; building optimizer...", flush=True)
@@ -1153,6 +1409,7 @@ def main():
             model, built.train_loader, criterion, optimizer, scheduler,
             scaler, device, ema_model=ema_model,
             log_interval=args.log_interval,
+            prev_arrow_dropout=args.prev_arrow_dropout,
         )
         val_metrics = validate(
             ema_model.module, built.val_loader, criterion, device,
@@ -1177,33 +1434,29 @@ def main():
         print(
             f"Epoch {epoch+1:3d}/{args.epochs} "
             f"| train_loss={train_metrics['loss']:.4f} "
-            f"(onset={train_metrics['onset_loss']:.4f} "
+            f"(arrow={train_metrics['arrow_loss']:.4f} "
             f"type={train_metrics['type_loss']:.4f} "
-            f"dur={train_metrics['duration_loss']:.4f}) "
+            f"dur={train_metrics['duration_loss']:.4f} "
+            f"div={train_metrics['diversity_loss']:.4f}) "
             f"| val_loss={val_metrics['loss']:.4f} "
             f"tol_f1={val_metrics['tol_f1']:.3f} "
             f"(P={val_metrics['tol_precision']:.3f} "
             f"R={val_metrics['tol_recall']:.3f} "
             f"thr={val_metrics['best_thr']:.2f}) "
-            f"f1@50/100ms="
-            f"{val_metrics['tol_f1_50ms']:.3f}/"
-            f"{val_metrics['tol_f1_100ms']:.3f} "
-            f"type_acc={val_metrics['type_acc']:.3f} "
-            f"type_F1[tap/jump/hold]="
+            f"arrow_F1[L/D/U/R]="
+            f"{val_metrics['arrow_f1_L']:.2f}/"
+            f"{val_metrics['arrow_f1_D']:.2f}/"
+            f"{val_metrics['arrow_f1_U']:.2f}/"
+            f"{val_metrics['arrow_f1_R']:.2f} "
+            f"(macro={val_metrics['arrow_f1_macro']:.3f}) "
+            f"arrow_kl={val_metrics['arrow_marginal_kl']:.3f} "
+            f"stream_coh={val_metrics['stream_coherence']:.3f} "
+            f"| type_F1[tap/jump/hold]="
             f"{val_metrics['tap_f1']:.3f}/"
             f"{val_metrics['jump_f1']:.3f}/"
             f"{val_metrics['hold_f1']:.3f} "
             f"(macro={val_metrics['type_macro_f1']:.3f}) "
-            f"jump[P={val_metrics['jump_p']:.3f} R={val_metrics['jump_r']:.3f}] "
-            f"hold[P={val_metrics['hold_p']:.3f} R={val_metrics['hold_r']:.3f}] "
             f"dur_mae={val_metrics['dur_mae_beats']:.3f}b "
-            f"| probs[max={val_metrics['prob_max']:.3f} "
-            f"p99={val_metrics['prob_p99']:.3f} "
-            f"p999={val_metrics['prob_p999']:.3f}] "
-            f"pos[max={val_metrics['prob_pos_max']:.3f} "
-            f"mean={val_metrics['prob_pos_mean']:.3f} "
-            f"p50={val_metrics['prob_pos_p50']:.3f}] "
-            f"neg_mean={val_metrics['prob_neg_mean']:.3f} "
             f"| lr={lr:.2e} | {elapsed:.1f}s",
             flush=True,
         )
@@ -1214,7 +1467,7 @@ def main():
             optimizer, scheduler, scaler, val_metrics,
             built.default_density_by_id,
             built.full_dataset.mel_mean, built.full_dataset.mel_std,
-            built.type_prior,
+            built.type_prior, built.arrow_priors,
             args,
         )
 
@@ -1226,7 +1479,7 @@ def main():
                 optimizer, scheduler, scaler, val_metrics,
                 built.default_density_by_id,
                 built.full_dataset.mel_mean, built.full_dataset.mel_std,
-                built.type_prior,
+                built.type_prior, built.arrow_priors,
                 args,
             )
             print(
@@ -1249,7 +1502,7 @@ def main():
                 optimizer, scheduler, scaler, val_metrics,
                 built.default_density_by_id,
                 built.full_dataset.mel_mean, built.full_dataset.mel_std,
-                built.type_prior,
+                built.type_prior, built.arrow_priors,
                 args,
             )
             print(f"  -> New best macro F1 = {best_macro_f1:.3f}", flush=True)
@@ -1260,7 +1513,7 @@ def main():
                 optimizer, scheduler, scaler, val_metrics,
                 built.default_density_by_id,
                 built.full_dataset.mel_mean, built.full_dataset.mel_std,
-                built.type_prior,
+                built.type_prior, built.arrow_priors,
                 args,
             )
             print(f"  -> New best dur MAE = {best_dur_mae:.3f}b", flush=True)
