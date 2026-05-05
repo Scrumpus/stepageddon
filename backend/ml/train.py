@@ -471,6 +471,8 @@ def build_loss(
         beat_weight=getattr(args, 'beat_weight', 0.0),
         diversity_weight=getattr(args, 'diversity_weight', 0.2),
         commit_weight=getattr(args, 'arrow_commit_weight', 0.5),
+        jack_weight=getattr(args, 'jack_weight', 0.3),
+        jack_stride=getattr(args, 'jack_stride', 3),
     )
 
 def train_one_epoch(
@@ -1216,17 +1218,23 @@ def build_argparser() -> argparse.ArgumentParser:
                              'BCE — empirically the head collapses to all-tap '
                              'unless this is >=4 with aggressive class balancing')
     parser.add_argument('--duration-weight', type=float, default=1.0)
-    parser.add_argument('--type-weight-smoothing', type=float, default=0.5,
+    parser.add_argument('--type-weight-smoothing', type=float, default=0.65,
                         help='Exponent for inverse-frequency type-class weights '
-                             '(0=uniform, 1=raw inverse-frequency). 0.5 keeps '
-                             'an order of magnitude of imbalance — required to '
-                             'lift jump/hold above the dominant tap class.')
+                             '(0=uniform, 1=raw inverse-frequency). 0.65 gives '
+                             'jumps/holds noticeably more weight than 0.5 — the '
+                             'last run finished with cal_F1[j/h]=0.24/0.28, '
+                             'and the calibration sweep landed on hb=-0.5 '
+                             '(suppress holds further), indicating the head '
+                             'needs more class-imbalance correction.')
     parser.add_argument('--type-weight-cap', type=float, default=30.0,
                         help='Max per-class CE weight after smoothing')
-    parser.add_argument('--type-focal-gamma', type=float, default=1.0,
+    parser.add_argument('--type-focal-gamma', type=float, default=2.0,
                         help='Focal-loss gamma on the type CE. 0 disables; '
-                             '1.0 down-weights confidently-correct frames so '
-                             'rare classes contribute relatively more gradient.')
+                             '2.0 down-weights confidently-correct (easy tap) '
+                             'frames hard so rare jump/hold frames dominate '
+                             'the gradient. Bumped from 1.0 after a run where '
+                             'jump/hold F1 stayed ~0.23/0.28 throughout 80 '
+                             'epochs while taps held at 0.89.')
     parser.add_argument('--pos-weight', type=float, default=None,
                         help='Override BCE pos_weight on the onset head. '
                              'Default = sqrt((1-p)/p) capped at 50.')
@@ -1267,20 +1275,34 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Loss weight on the auxiliary beat-prediction '
                              'head. 0.0 disables — head still emits logits but '
                              'gets no gradient.')
-    parser.add_argument('--diversity-weight', type=float, default=0.05,
+    parser.add_argument('--diversity-weight', type=float, default=0.10,
                         help='Loss weight on the per-chunk arrow-distribution '
                              'KL regularizer. Rewards predicted marginals '
                              'matching the target marginals — useful against '
-                             'mode collapse, but actively counterproductive '
-                             'once a per-frame commit loss is present, since '
-                             'it pulls predictions back toward marginal '
-                             'matching at every onset. 0.0 disables.')
+                             'mode collapse, but in tension with the per-frame '
+                             'commit loss since both want to constrain the '
+                             'arrow head. Modest bump from 0.05 paired with '
+                             'the new jack penalty to push stream_coh up '
+                             'from the 0.31 floor seen last run. 0.0 disables.')
     parser.add_argument('--arrow-commit-weight', type=float, default=0.5,
                         help='Loss weight on the per-frame softmax-CE applied '
                              'to single-arrow frames. Forces the arrow head '
                              'to commit to a specific arrow per onset rather '
                              'than predicting the per-arrow marginal — fixes '
                              'low stream coherence. 0.0 disables.')
+    parser.add_argument('--jack-weight', type=float, default=0.3,
+                        help='Loss weight on the anti-jack penalty: '
+                             'discourages same-arrow argmax on co-active '
+                             'onset pairs separated by --jack-stride frames. '
+                             'Targets stream_coherence directly (last run '
+                             'finished at 0.31, real charts ~0.7-0.85). '
+                             '0.0 disables.')
+    parser.add_argument('--jack-stride', type=int, default=3,
+                        help='Frame offset for the anti-jack penalty pair. '
+                             'Set just outside the onset-smoothing kernel '
+                             '(sigma=1.5 → ~2-frame radius) so the penalty '
+                             'acts on distinct events, not the same event '
+                             'spread across adjacent frames.')
     parser.add_argument('--prev-arrow-dropout', type=float, default=0.1,
                         help='Per-frame probability of zeroing the prev_arrow '
                              'conditioning vector during training. Forces the '
@@ -1449,7 +1471,7 @@ def main():
             f"{val_metrics['arrow_f1_U']:.2f}/"
             f"{val_metrics['arrow_f1_R']:.2f} "
             f"(macro={val_metrics['arrow_f1_macro']:.3f}) "
-            f"arrow_kl={val_metrics['arrow_marginal_kl']:.3f} "
+            f"arrow_kl={val_metrics['arrow_marginal_kl']:.4f} "
             f"stream_coh={val_metrics['stream_coherence']:.3f} "
             f"| type_F1[tap/jump/hold]="
             f"{val_metrics['tap_f1']:.3f}/"

@@ -254,7 +254,7 @@ class MLChartGenerator:
         jump_bias: float = 0.0,
         hold_bias: float = 0.0,
         type_prior_override: Optional[List[float]] = None,
-        min_first_step_time: float = 0.5,
+        min_first_step_time: float = 0.25,
         min_last_step_buffer: float = 0.0,
     ):
         """

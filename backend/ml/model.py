@@ -587,6 +587,8 @@ class StepChartLoss(nn.Module):
         beat_pos_weight: float = 10.0,
         diversity_weight: float = 0.2,
         commit_weight: float = 0.5,
+        jack_weight: float = 0.3,
+        jack_stride: int = 3,
     ):
         super().__init__()
         # Per-arrow pos_weight: scalar broadcasts across the 4 arrows; a
@@ -604,6 +606,14 @@ class StepChartLoss(nn.Module):
         self.beat_weight = float(beat_weight)
         self.diversity_weight = float(diversity_weight)
         self.commit_weight = float(commit_weight)
+        # Anti-jack penalty: discourages same-arrow argmax on pairs of co-active
+        # onset frames separated by `jack_stride` frames. Stride is chosen just
+        # outside the Gaussian onset-smoothing radius (~2 frames at sigma=1.5)
+        # so we penalize distinct predicted events, not the same event spread
+        # across adjacent frames. Pushes stream coherence toward 0.7+ in dense
+        # sections where per-arrow BCE alone is satisfied by marginal-matching.
+        self.jack_weight = float(jack_weight)
+        self.jack_stride = int(jack_stride)
         self.focal_gamma = float(focal_gamma)
         # Focal modulation on the type CE: down-weights confidently-correct
         # frames so the rare jump/hold classes contribute relatively more
@@ -672,6 +682,36 @@ class StepChartLoss(nn.Module):
             else:
                 commit_ce = arrow_logits.sum() * 0.0
             arrow_loss = arrow_loss + self.commit_weight * commit_ce
+
+        # Anti-jack penalty: at pairs of co-active onset frames separated by
+        # `jack_stride`, penalize the inner product of softmax(arrow_logits) —
+        # i.e. the probability that the model picks the *same* arrow at both
+        # frames. Anchored on ground-truth onsets (smoothed peak >= 0.5) and
+        # gated by the model's predicted onset confidence so we only penalize
+        # frames the model itself is committing to as events.
+        #
+        # When the labels actually contain a jack (L→L), the per-frame commit
+        # CE above already pulls the model toward L at both frames, so the
+        # jack penalty trades off against — but does not override — real
+        # supervision. Empirically this only suppresses *unsupervised* jacks
+        # that emerge from marginal-matching on the per-arrow head.
+        if self.jack_weight > 0.0 and arrow_logits.size(1) > self.jack_stride:
+            stride = self.jack_stride
+            with torch.no_grad():
+                soft_any = arrow_soft.max(dim=-1).values             # [B, T]
+                gt_pair = (
+                    (soft_any[:, :-stride] >= 0.5)
+                    & (soft_any[:, stride:] >= 0.5)
+                ).float()                                            # [B, T-s]
+                pred_any = torch.sigmoid(arrow_logits).max(dim=-1).values
+                pred_gate = pred_any[:, :-stride] * pred_any[:, stride:]
+                gate = gt_pair * pred_gate
+                gate_norm = gate.sum().clamp_min(1.0)
+            prev_probs = F.softmax(arrow_logits[:, :-stride], dim=-1)
+            cur_probs = F.softmax(arrow_logits[:, stride:], dim=-1)
+            same_arrow_prob = (prev_probs * cur_probs).sum(dim=-1)   # [B, T-s]
+            jack_loss = (gate * same_arrow_prob).sum() / gate_norm
+            arrow_loss = arrow_loss + self.jack_weight * jack_loss
 
         # Diversity regularizer: KL(target_dist || pred_dist) on per-chunk
         # average arrow probabilities. Punishes "always L/R" collapse —
