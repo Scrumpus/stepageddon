@@ -28,7 +28,7 @@ audio_processor = AudioProcessor()
 audio_downloader = AudioDownloader()
 
 logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
-ml_generator = MLChartGenerator(model_path=settings.ML_MODEL_PATH)
+ml_generator = MLChartGenerator(model_path=settings.ML_MODEL_PATH, type_logit_adjust=0.0)
 logger.info("ML chart generator loaded successfully")
 
 
