@@ -302,6 +302,18 @@ class StepChartDataset(Dataset):
         prev_arrow_chunk = prev_arrow_full[start:end].astype(np.float32)      # [T, 4]
         difficulty = entry['difficulty_id']
 
+        # L↔R + D↔U mirror augmentation (180° pad rotation). Arrows are
+        # columns [0=L, 1=D, 2=U, 3=R]; the mirrored permutation is [3,2,1,0].
+        # The mel input is unchanged because audio carries no chirality — a
+        # chart with all arrows rotated is an equally valid mapping for the
+        # same audio. Doubles effective per-arrow data and breaks any
+        # incidental L-side bias in the corpus. Type targets and durations
+        # are arrow-agnostic so they don't need touching.
+        if self.is_train and self.augment and np.random.random() < 0.5:
+            mirror_idx = [3, 2, 1, 0]
+            arrow_labels_chunk = arrow_labels_chunk[:, mirror_idx]
+            prev_arrow_chunk = prev_arrow_chunk[:, mirror_idx]
+
         # Convert hold durations from seconds to *beats* using the song's
         # tempo. Beats factor BPM out of the regression target so the duration
         # head sees a much narrower distribution (DDR holds quantize to 1/4,
