@@ -239,6 +239,31 @@ def build_dataloaders(args) -> BuildOutputs:
     )
     print(f"[build_dataloaders] split: train={len(train_idx)} val={len(val_idx)}", flush=True)
 
+    # Per-difficulty filter: restrict both train and val indices to entries
+    # whose difficulty_id matches `args.difficulty`. All downstream priors
+    # (note counts, arrow priors, type priors, beat priors, rare-chunk index)
+    # are computed from these filtered indices, so the loss / sampler
+    # naturally specialize to this difficulty without further plumbing.
+    if getattr(args, 'difficulty', None) is not None:
+        target = int(args.difficulty)
+        train_idx = [
+            i for i in train_idx
+            if int(full_dataset.entries[i]['difficulty_id']) == target
+        ]
+        val_idx = [
+            i for i in val_idx
+            if int(full_dataset.entries[i]['difficulty_id']) == target
+        ]
+        if not train_idx:
+            raise SystemExit(
+                f"--difficulty={target} filter produced 0 train entries; "
+                f"check the manifest's difficulty_id distribution."
+            )
+        logger.info(
+            f"--difficulty={target} filter: train={len(train_idx)} "
+            f"val={len(val_idx)} (after restricting to one class)"
+        )
+
     print("[build_dataloaders] compute_note_counts...", flush=True)
     note_counts = compute_note_counts(full_dataset.entries, str(data_dir))
     print("[build_dataloaders] compute_note_type_counts...", flush=True)
@@ -794,16 +819,22 @@ def validate(
             # Teacher-forced arrow logits: used for the loss (matches training)
             # and per-frame loss reporting.
             arrow_logits = model.apply_arrow_head(features, prev_arrow)
-            type_logits = model.apply_type_head(features)
-            duration_pred = model.apply_duration_head(features)
             beat_logits = model.apply_beat_head(features)
             # Zero-context arrow logits: matches the inference peak-picking
             # distribution (`_predict_chunked` calls apply_arrow_head with
             # prev_arrow=None, i.e. zeros). The threshold sweep below uses
             # these so saved best_threshold / best_arrow_thresholds are
             # calibrated against the distribution inference actually sees.
+            # Type/duration heads are also conditioned on the zero-context
+            # arrow logits so their train/test distributions agree.
             zero_prev = torch.zeros_like(prev_arrow)
             arrow_logits_zero = model.apply_arrow_head(features, zero_prev)
+            type_logits = model.apply_type_head(
+                features, arrow_logits_zero, beat_logits,
+            )
+            duration_pred = model.apply_duration_head(
+                features, arrow_logits_zero, beat_logits,
+            )
             loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
                 arrow_logits, type_logits, duration_pred,
                 arrow_soft, type_target, duration_target,
@@ -1166,7 +1197,8 @@ def save_checkpoint(
         #   1 = legacy single-onset head (missing key)
         #   2 = per-arrow head with prev_arrow conditioning
         #   3 = +(start_seconds, remaining_seconds) FiLM conditioning
-        'arch_version': 3,
+        #   4 = type/duration heads conditioned on zero-context arrow + beat logits
+        'arch_version': 4,
         'model_state_dict': model.state_dict(),
         'ema_state_dict': (
             ema_model.module.state_dict() if ema_model is not None else None
@@ -1201,6 +1233,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Train step chart model')
     parser.add_argument('--data-dir', type=str, required=True)
     parser.add_argument('--checkpoint-dir', type=str, default='ml/checkpoints')
+    parser.add_argument('--difficulty', type=int, default=None, choices=[0, 1, 2, 3, 4],
+                        help='Train on a single difficulty only (0=beginner, '
+                             '1=easy, 2=medium, 3=hard, 4=challenge). When set, '
+                             'train+val indices are filtered to that difficulty '
+                             'and checkpoints land in <checkpoint-dir>/diff_<N>/ '
+                             'so multiple per-difficulty runs do not collide. '
+                             'Trade-off: each model fully specializes but sees '
+                             'only ~1/5 the data, so the audio backbone learns '
+                             'less generalizable rhythmic features. Run 5x to '
+                             'get a per-difficulty model bank.')
     parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -1345,6 +1387,10 @@ def main():
     logger.info(f"Using device: {device} | git_sha={_git_sha()} | seed={args.seed}")
 
     checkpoint_dir = Path(args.checkpoint_dir)
+    if getattr(args, 'difficulty', None) is not None:
+        # Sub-folder per single-difficulty run so 5 parallel runs don't
+        # overwrite each other's `best_model.pt`.
+        checkpoint_dir = checkpoint_dir / f'diff_{int(args.difficulty)}'
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     wandb_run = None

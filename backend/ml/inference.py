@@ -668,8 +668,15 @@ class MLChartGenerator:
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             arrow_logits = self.model.apply_arrow_head(features, prev_arrow=None)
-            type_logits = self.model.apply_type_head(features)
-            dur_pred = self.model.apply_duration_head(features)
+            beat_logits = self.model.apply_beat_head(features)
+            # Type/duration heads are conditioned on the same zero-context
+            # arrow logits the model was trained against (see model.forward).
+            type_logits = self.model.apply_type_head(
+                features, arrow_logits, beat_logits,
+            )
+            dur_pred = self.model.apply_duration_head(
+                features, arrow_logits, beat_logits,
+            )
 
             features_np = features.float().cpu().numpy()[0]                      # [T_chunk, H]
             arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0]       # [T_chunk, 4]

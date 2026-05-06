@@ -6,13 +6,26 @@ Four-head architecture (arrow-aware variant of Dance Dance Convolution):
         -> RoPE Transformer -> LayerNorm
         -> arrow head     (4 sigmoids, per-arrow "does this arrow fire?",
                            conditioned on the previous emitted arrow vector)
-        -> type  head     (3-way: tap / jump / hold_start)
-        -> duration head  (linear scalar in log-space; decode_duration() to seconds)
         -> beat head      (auxiliary: "is this a beat?")
+        -> type  head     (3-way: tap / jump / hold_start, conditioned on
+                           detached arrow + beat logits)
+        -> duration head  (linear scalar in log-space; decode_duration() to seconds,
+                           conditioned on detached arrow + beat logits)
 
 Onset detection at inference time = `arrow_logits.sigmoid().max(-1)`. The
 type head is supervised where any arrow fires; the duration head where the
 type target is hold_start (plus a ±2-frame window).
+
+Type/duration conditioning rationale: a *jump* literally means "≥2 arrows
+fire simultaneously," and that information lives in the arrow head, not the
+mel spectrogram. A *hold* often correlates with rhythmic position (downbeats
+vs offbeats), and that lives in the beat head. Feeding both into the type
+and duration heads — with stop-gradient so the auxiliary losses don't push
+the upstream heads around — gives them a feature space that already encodes
+the per-frame structure they need to classify. To match inference (where
+`prev_arrow=None` for Phase 1 chart decoding), the arrow logits used for
+conditioning are always recomputed with `prev_arrow=zeros` even at training,
+so the type/duration heads see a consistent distribution across train/test.
 
 The duration head emits a raw scalar interpreted as log(seconds + DURATION_OFFSET).
 This converts the wide raw-seconds dynamic range (~0.2–5s) into a much
@@ -296,6 +309,9 @@ class StepChartModel(nn.Module):
     TYPE_HOLD_START = 2
     N_ARROWS = 4
     PREV_ARROW_DIM = 4  # 4-dim binary vector input to the arrow head
+    # Per-frame conditioning fed into the type and duration heads:
+    # sigmoid(arrow_logits) ∈ R^4 + sigmoid(beat_logits) ∈ R^1
+    TYPE_DUR_COND_DIM = N_ARROWS + 1
 
     # Offset added inside log() to keep the duration target away from -inf
     # while preserving relative ordering at the small end of the range.
@@ -368,8 +384,14 @@ class StepChartModel(nn.Module):
             assert isinstance(first_lin, nn.Linear)
             first_lin.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
 
+        # Type and duration heads consume `[features, sigmoid(arrow_logits),
+        # sigmoid(beat_logits)]`. The first Linear absorbs the +5 conditioning
+        # dims; final Linear bias still corresponds to the per-class logit
+        # (resp. log-duration) so `set_type_prior` / `set_duration_prior`
+        # continue to work unchanged.
+        type_dur_in = hidden_dim + self.TYPE_DUR_COND_DIM
         self.type_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(type_dur_in, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, self.N_NOTE_TYPES),
@@ -380,11 +402,21 @@ class StepChartModel(nn.Module):
         # [-3, 1.6], which is a well-conditioned regression target.
         # Inference must apply `decode_duration` to recover seconds.
         self.duration_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(type_dur_in, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        # Same trick as the arrow head: small uniform init on the conditioning
+        # columns of each head's first Linear so gradients flow through the
+        # arrow/beat conditioning from step 1. Zero-init starves the
+        # conditioning of signal early on and the heads settle into a
+        # backbone-only solution that ignores the new inputs.
+        with torch.no_grad():
+            for _head in (self.type_head, self.duration_head):
+                _first = _head[0]
+                assert isinstance(_first, nn.Linear)
+                _first.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
         # Auxiliary beat head: predicts per-frame "is this a beat?" from the
         # same backbone features. Same depth/shape as the legacy onset head —
         # beats and onsets share the rhythmic structure the backbone is
@@ -505,11 +537,37 @@ class StepChartModel(nn.Module):
         arrow_in = torch.cat([features, prev_arrow], dim=-1)
         return self.arrow_head(arrow_in)
 
-    def apply_type_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.type_head(features)
+    def _type_dur_cond(
+        self, arrow_logits: torch.Tensor, beat_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the conditioning tensor fed into type/duration heads.
 
-    def apply_duration_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.duration_head(features)
+        Returns [..., TYPE_DUR_COND_DIM] = sigmoid(arrow_logits) ⊕
+        sigmoid(beat_logits). Callers should pass detached logits at training
+        time so the type/duration losses don't backprop into the arrow/beat
+        heads (those have their own well-shaped supervision).
+        """
+        arrow_p = torch.sigmoid(arrow_logits)
+        beat_p = torch.sigmoid(beat_logits)
+        return torch.cat([arrow_p, beat_p], dim=-1)
+
+    def apply_type_head(
+        self,
+        features: torch.Tensor,
+        arrow_logits: torch.Tensor,
+        beat_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        cond = self._type_dur_cond(arrow_logits, beat_logits)
+        return self.type_head(torch.cat([features, cond], dim=-1))
+
+    def apply_duration_head(
+        self,
+        features: torch.Tensor,
+        arrow_logits: torch.Tensor,
+        beat_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        cond = self._type_dur_cond(arrow_logits, beat_logits)
+        return self.duration_head(torch.cat([features, cond], dim=-1))
 
     def apply_beat_head(self, features: torch.Tensor) -> torch.Tensor:
         return self.beat_head(features)
@@ -545,9 +603,24 @@ class StepChartModel(nn.Module):
             mel, difficulty, density, start_seconds, remaining_seconds,
         )                                                       # [B, T, H]
         arrow_logits = self.apply_arrow_head(features, prev_arrow)
-        type_logits = self.apply_type_head(features)
-        duration_pred = self.apply_duration_head(features)
         beat_logits = self.apply_beat_head(features)
+        # Type/duration conditioning always uses zero-context arrow logits
+        # (prev_arrow=zeros) so the train-time distribution matches inference
+        # Phase 1, where we run the arrow head with prev_arrow=None before
+        # any onsets have been emitted. If `prev_arrow` is None at the call
+        # site, `arrow_logits` is already zero-context and we reuse it;
+        # otherwise we recompute (cheap — the arrow head is a 3-layer MLP).
+        if prev_arrow is not None:
+            zero_prev = torch.zeros_like(prev_arrow)
+            cond_arrow_logits = self.apply_arrow_head(features, zero_prev)
+        else:
+            cond_arrow_logits = arrow_logits
+        type_logits = self.apply_type_head(
+            features, cond_arrow_logits.detach(), beat_logits.detach(),
+        )
+        duration_pred = self.apply_duration_head(
+            features, cond_arrow_logits.detach(), beat_logits.detach(),
+        )
         return arrow_logits, type_logits, duration_pred, beat_logits
 
 
