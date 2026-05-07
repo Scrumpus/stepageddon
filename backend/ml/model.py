@@ -11,37 +11,6 @@ Four-head architecture (arrow-aware variant of Dance Dance Convolution):
                            detached arrow + beat logits)
         -> duration head  (linear scalar in log-space; decode_duration() to seconds,
                            conditioned on detached arrow + beat logits)
-
-Onset detection at inference time = `arrow_logits.sigmoid().max(-1)`. The
-type head is supervised where any arrow fires; the duration head where the
-type target is hold_start (plus a ±2-frame window).
-
-Type/duration conditioning rationale: a *jump* literally means "≥2 arrows
-fire simultaneously," and that information lives in the arrow head, not the
-mel spectrogram. A *hold* often correlates with rhythmic position (downbeats
-vs offbeats), and that lives in the beat head. Feeding both into the type
-and duration heads — with stop-gradient so the auxiliary losses don't push
-the upstream heads around — gives them a feature space that already encodes
-the per-frame structure they need to classify. To match inference (where
-`prev_arrow=None` for Phase 1 chart decoding), the arrow logits used for
-conditioning are always recomputed with `prev_arrow=zeros` even at training,
-so the type/duration heads see a consistent distribution across train/test.
-
-The duration head emits a raw scalar interpreted as log(seconds + DURATION_OFFSET).
-This converts the wide raw-seconds dynamic range (~0.2–5s) into a much
-better-conditioned ~[-1.6, 1.6] target range and lets the loss treat
-relative error symmetrically. Inference must call `decode_duration` to
-get back to seconds.
-
-Conditioning uses a single early FiLM layer. Difficulty is an embedding,
-density is encoded with random Fourier features and concatenated before
-projection, making the density signal harder to ignore than a zero-init
-scalar linear.
-
-The arrow head consumes a 4-dim binary `prev_arrow` vector (the arrow set
-emitted at the most recent prior onset, or zeros pre-onset). This makes the
-head a per-frame Markov chain over arrows, P(arrow_t | audio_t, arrow_{prev}),
-which is what fixes the L-R-L-R mode-collapse seen with independent Bernoullis.
 """
 
 import math
@@ -50,12 +19,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ---------------------------------------------------------------------------
-# Audio encoder (CNN)
-# ---------------------------------------------------------------------------
-
 class AudioEncoder(nn.Module):
     """CNN encoder for mel spectrogram features. [B, T, n_mels] -> [B, T, H]."""
 
@@ -80,11 +43,9 @@ class AudioEncoder(nn.Module):
         x = self.net(x)           # [B, H, T]
         return x.transpose(1, 2)  # [B, T, H]
 
-
 # ---------------------------------------------------------------------------
 # Dilated temporal conv stack (widens receptive field before attention)
 # ---------------------------------------------------------------------------
-
 class DilatedTCNBlock(nn.Module):
     """Residual dilated-conv block: LN -> Conv(dilated) -> GELU -> Dropout."""
 
@@ -102,8 +63,6 @@ class DilatedTCNBlock(nn.Module):
         y = F.gelu(y)
         y = self.drop(y)
         return x + y
-
-
 class DilatedTCN(nn.Module):
     """Stack of dilated residual conv blocks. [B, T, H] -> [B, T, H]."""
 
@@ -119,17 +78,12 @@ class DilatedTCN(nn.Module):
             x = b(x)
         return x.transpose(1, 2)  # [B, T, H]
 
-
 # ---------------------------------------------------------------------------
 # Conditioning: difficulty embedding + Fourier features on density -> FiLM
 # ---------------------------------------------------------------------------
-
 class FourierFeatures(nn.Module):
     """
     Random Fourier features for a scalar input.
-
-    sin/cos of random-frequency projections of the (normalized) density scalar.
-    Output dim = 2 * n_features.
     """
 
     def __init__(self, n_features: int = 16, sigma: float = 1.0):
@@ -149,16 +103,6 @@ class FiLMConditioner(nn.Module):
     Builds (gamma, beta) from a difficulty embedding concatenated with random
     Fourier features of density and song-position scalars (start_seconds,
     remaining_seconds), and applies `gamma * x + beta` to features.
-
-    The position scalars let the model learn empirical edge-of-song patterns
-    (e.g., charts typically have several seconds of silence before the first
-    arrow, and often taper near the end). Per-chunk conditioning is
-    sufficient because the transformer's RoPE positions resolve intra-chunk
-    location; the FiLM signal only has to disambiguate "this chunk is at
-    song start" from "this chunk is mid-song".
-
-    Proj is init so that at step 0 the layer is an identity (gamma=1, beta=0)
-    regardless of input, so training isn't destabilized.
     """
 
     def __init__(
@@ -173,6 +117,7 @@ class FiLMConditioner(nn.Module):
         self.hidden_dim = hidden_dim
         self.diff_emb = nn.Embedding(n_difficulties, hidden_dim)
         self.fourier = FourierFeatures(n_fourier)
+
         # Separate Fourier modules for the two position scalars. Sigma is
         # tuned for the seconds scale: with sigma=0.1, the random frequencies
         # have periods ranging from ~10s up to a few hundred seconds, which
@@ -185,7 +130,6 @@ class FiLMConditioner(nn.Module):
         nn.init.normal_(self.diff_emb.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj.weight)
         with torch.no_grad():
-            # bias: gamma init = 1, beta init = 0
             self.proj.bias.zero_()
             self.proj.bias[:hidden_dim] = 1.0
 
@@ -225,8 +169,8 @@ class RotaryEmbedding(nn.Module):
         assert head_dim % 2 == 0, "RoPE requires even head_dim"
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         t = torch.arange(max_len).float()
-        freqs = torch.outer(t, inv_freq)                    # [max_len, head_dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)              # [max_len, head_dim]
+        freqs = torch.outer(t, inv_freq)                    
+        emb = torch.cat([freqs, freqs], dim=-1)              
         self.register_buffer('cos', emb.cos(), persistent=False)
         self.register_buffer('sin', emb.sin(), persistent=False)
 
@@ -236,8 +180,6 @@ class RotaryEmbedding(nn.Module):
         cos = self.cos[:T].to(dtype=x.dtype)
         sin = self.sin[:T].to(dtype=x.dtype)
         return x * cos + _rotate_half(x) * sin
-
-
 class RoPESelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -252,7 +194,7 @@ class RoPESelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)                       # [3, B, H, T, Dh]
+        qkv = qkv.permute(2, 0, 3, 1, 4)                       
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = self.rope(q)
         k = self.rope(k)
@@ -262,8 +204,6 @@ class RoPESelfAttention(nn.Module):
         )
         attn = attn.transpose(1, 2).reshape(B, T, D)
         return self.out(attn)
-
-
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, ff_mult: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -293,8 +233,7 @@ class StepChartModel(nn.Module):
     """
     Audio + prev_arrow -> (arrow_logits, type_logits, duration_pred, beat_logits).
 
-    Arrow-aware: the model predicts WHICH arrows fire (4 independent Bernoullis
-    per frame, conditioned on the previous emitted arrow vector), WHAT type
+    Arrow-aware: the model predicts WHICH arrows fire, conditioned on the previous emitted arrow vector, WHAT type
     of note it is (tap / jump / hold_start), and HOW LONG holds last.
 
     arrow_logits:  [B, T, 4]  per-arrow {L, D, U, R} pre-sigmoid
@@ -308,18 +247,8 @@ class StepChartModel(nn.Module):
     TYPE_JUMP = 1
     TYPE_HOLD_START = 2
     N_ARROWS = 4
-    PREV_ARROW_DIM = 4  # 4-dim binary vector input to the arrow head
-    # Per-frame conditioning fed into the type and duration heads:
-    # sigmoid(arrow_logits) ∈ R^4 + sigmoid(beat_logits) ∈ R^1
-    # + sigmoid(hold_logits) ∈ R^4. The hold head's per-arrow in-hold
-    # signal is the densest hold-related supervision the upstream graph
-    # produces, so feeding it forward sharpens the type/duration heads.
+    PREV_ARROW_DIM = 4 
     TYPE_DUR_COND_DIM = N_ARROWS + 1 + N_ARROWS
-
-    # Offset added inside log() to keep the duration target away from -inf
-    # while preserving relative ordering at the small end of the range.
-    # Used by both `encode_duration` (training target) and `decode_duration`
-    # (inference). Must stay in lockstep across model + dataset + inference.
     DURATION_OFFSET: float = 0.05
 
     def __init__(
@@ -347,8 +276,7 @@ class StepChartModel(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
         # Deeper arrow head: arrow prediction is the harder head, so give it
-        # extra capacity. `onset_head_layers` counts hidden Linear→GELU blocks
-        # before the final projection (default 3).
+        # extra capacity.
         def _build_mlp_head(out_dim: int, n_hidden: int) -> nn.Sequential:
             layers: list = []
             for _ in range(max(1, n_hidden)):
@@ -361,8 +289,7 @@ class StepChartModel(nn.Module):
             return nn.Sequential(*layers)
 
         # Arrow head: backbone feats + 4-dim prev_arrow vector → per-arrow
-        # logit. The first Linear absorbs the +4 conditioning dims; the rest
-        # of the head matches the legacy onset head shape.
+        # logit
         cond_layers: list = [
             nn.Linear(hidden_dim + self.PREV_ARROW_DIM, hidden_dim),
             nn.GELU(),
@@ -376,22 +303,12 @@ class StepChartModel(nn.Module):
             ])
         cond_layers.append(nn.Linear(hidden_dim, self.N_ARROWS))
         self.arrow_head = nn.Sequential(*cond_layers)
-        # Small uniform init on the prev-arrow conditioning columns of the
-        # first Linear. Zero-init starves the conditioning of gradient signal
-        # in early epochs and the head settles into a marginal-matching local
-        # minimum that ignores prev_arrow; a small non-zero init kicks the
-        # gradients alive from step 1 while still being small enough not to
-        # dominate the audio features.
+
         with torch.no_grad():
             first_lin = self.arrow_head[0]
             assert isinstance(first_lin, nn.Linear)
             first_lin.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
 
-        # Type and duration heads consume `[features, sigmoid(arrow_logits),
-        # sigmoid(beat_logits)]`. The first Linear absorbs the +5 conditioning
-        # dims; final Linear bias still corresponds to the per-class logit
-        # (resp. log-duration) so `set_type_prior` / `set_duration_prior`
-        # continue to work unchanged.
         type_dur_in = hidden_dim + self.TYPE_DUR_COND_DIM
         self.type_head = nn.Sequential(
             nn.Linear(type_dur_in, hidden_dim),
@@ -399,50 +316,48 @@ class StepChartModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, self.N_NOTE_TYPES),
         )
-        # Duration head emits a raw scalar interpreted as
-        # log(duration_seconds + DURATION_OFFSET). No Softplus — the log
-        # transform itself maps the natural [0.05, ~5]s range into roughly
-        # [-3, 1.6], which is a well-conditioned regression target.
-        # Inference must apply `decode_duration` to recover seconds.
+
         self.duration_head = nn.Sequential(
             nn.Linear(type_dur_in, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-        # Same trick as the arrow head: small uniform init on the conditioning
-        # columns of each head's first Linear so gradients flow through the
-        # arrow/beat conditioning from step 1. Zero-init starves the
-        # conditioning of signal early on and the heads settle into a
-        # backbone-only solution that ignores the new inputs.
+
         with torch.no_grad():
             for _head in (self.type_head, self.duration_head):
                 _first = _head[0]
                 assert isinstance(_first, nn.Linear)
                 _first.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
-        # Auxiliary beat head: predicts per-frame "is this a beat?" from the
-        # same backbone features. Same depth/shape as the legacy onset head —
-        # beats and onsets share the rhythmic structure the backbone is
-        # learning. Loss-weighted at ~0.3 so beat learning helps the backbone
-        # without crowding out the primary onset task.
+
         self.beat_head = _build_mlp_head(1, onset_head_layers)
-        # Hold head: per-arrow "is this frame mid-hold?" prediction. Trained
-        # against a dense `in_hold` target synthesized in the dataloader from
-        # the v5 NPZ `arrow_labels`/`durations` arrays — supervision spans
-        # the entire hold body (~50 frames per hold at 100fps), giving the
-        # head ~50× more positive signal per hold than the type head's
-        # single-frame hold_start indicator.
-        self.hold_head = _build_mlp_head(self.N_ARROWS, onset_head_layers)
+
+        # Hold head: backbone feats + 4-dim sigmoid(cond_arrow_logits.detach())
+        # → per-arrow in-hold logit. Without arrow conditioning the head only
+        # sees the backbone's encoding and has to derive "an arrow recently
+        # fired" from audio alone — a span-state task the audio doesn't carry
+        # explicitly. Feeding the same cond_arrow signal the type/duration
+        # heads use gives the head an explicit "is anything firing here"
+        # input, mirroring how the arrow head consumes prev_arrow.
+        hold_layers: list = [
+            nn.Linear(hidden_dim + self.N_ARROWS, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        ]
+        for _ in range(max(1, onset_head_layers) - 1):
+            hold_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+        hold_layers.append(nn.Linear(hidden_dim, self.N_ARROWS))
+        self.hold_head = nn.Sequential(*hold_layers)
+        with torch.no_grad():
+            hold_first = self.hold_head[0]
+            assert isinstance(hold_first, nn.Linear)
+            hold_first.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
 
     def set_arrow_priors(self, priors) -> None:
-        """Initialize the arrow head's final bias to logit(p_a) per arrow.
-
-        priors: iterable of length N_ARROWS giving the per-arrow positive
-            rate P(arrow_a fires at any given frame). Anchors the head at
-            the empirical marginal so step-0 predictions match base rates
-            instead of starting from random logits — same idea as the old
-            `set_onset_prior` but per-arrow.
-        """
         priors = torch.as_tensor(list(priors), dtype=torch.float32)
         assert priors.numel() == self.N_ARROWS, (
             f"expected {self.N_ARROWS} priors, got {priors.numel()}"
@@ -455,14 +370,6 @@ class StepChartModel(nn.Module):
             final.bias.copy_(bias)
 
     def set_hold_priors(self, priors) -> None:
-        """Initialize the hold head's final bias to logit(p_a) per arrow.
-
-        priors: iterable of length N_ARROWS giving the per-arrow in-hold
-            rate P(arrow_a is mid-hold at any given frame). Anchors the
-            head at the empirical marginal so step-0 predictions match
-            base rates instead of starting from random logits — same idea
-            as `set_arrow_priors` but for the hold head.
-        """
         priors = torch.as_tensor(list(priors), dtype=torch.float32)
         assert priors.numel() == self.N_ARROWS, (
             f"expected {self.N_ARROWS} priors, got {priors.numel()}"
@@ -609,8 +516,17 @@ class StepChartModel(nn.Module):
     def apply_beat_head(self, features: torch.Tensor) -> torch.Tensor:
         return self.beat_head(features)
 
-    def apply_hold_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.hold_head(features)
+    def apply_hold_head(
+        self, features: torch.Tensor, arrow_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Hold head, conditioned on sigmoid(arrow_logits).
+
+        Callers should pass detached zero-context arrow logits (`prev_arrow=
+        zeros`) so the hold loss doesn't backprop into the arrow head and
+        the train-time distribution matches inference Phase 1.
+        """
+        arrow_p = torch.sigmoid(arrow_logits)
+        return self.hold_head(torch.cat([features, arrow_p], dim=-1))
 
     def forward(
         self,
@@ -645,18 +561,17 @@ class StepChartModel(nn.Module):
         )                                                       # [B, T, H]
         arrow_logits = self.apply_arrow_head(features, prev_arrow)
         beat_logits = self.apply_beat_head(features)
-        hold_logits = self.apply_hold_head(features)
-        # Type/duration conditioning always uses zero-context arrow logits
-        # (prev_arrow=zeros) so the train-time distribution matches inference
-        # Phase 1, where we run the arrow head with prev_arrow=None before
-        # any onsets have been emitted. If `prev_arrow` is None at the call
-        # site, `arrow_logits` is already zero-context and we reuse it;
-        # otherwise we recompute (cheap — the arrow head is a 3-layer MLP).
+        # Zero-context arrow logits drive both the hold head's conditioning
+        # and the type/duration heads' conditioning, matching inference
+        # Phase 1 (`prev_arrow=None`). If `prev_arrow` was already zeros at
+        # the call site, `arrow_logits` is itself zero-context and we reuse
+        # it; otherwise we recompute (cheap — the arrow head is a 3-layer MLP).
         if prev_arrow is not None:
             zero_prev = torch.zeros_like(prev_arrow)
             cond_arrow_logits = self.apply_arrow_head(features, zero_prev)
         else:
             cond_arrow_logits = arrow_logits
+        hold_logits = self.apply_hold_head(features, cond_arrow_logits.detach())
         type_logits = self.apply_type_head(
             features, cond_arrow_logits.detach(),
             beat_logits.detach(), hold_logits.detach(),

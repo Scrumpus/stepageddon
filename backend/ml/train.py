@@ -434,7 +434,9 @@ def build_optimizer_and_scheduler(
     # onset training. Backbone + onset stay at base LR.
     head_mult = float(getattr(args, 'head_lr_mult', 1.0))
     base_lr = float(args.lr)
-    backbone_params, arrow_params, type_params, dur_params = [], [], [], []
+    backbone_params, arrow_params, type_params, dur_params, hold_params = (
+        [], [], [], [], [],
+    )
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -444,16 +446,24 @@ def build_optimizer_and_scheduler(
             dur_params.append(p)
         elif name.startswith('arrow_head'):
             arrow_params.append(p)
+        elif name.startswith('hold_head'):
+            # Hold supervision is dense (~3% per arrow per frame) — much
+            # denser than the type/duration heads' frame-masked CE/L1 — so
+            # head_lr_mult would overshoot. Keep hold at base_lr alongside
+            # arrow (the other dense-supervised head) and out of the
+            # backbone bucket so its membership is explicit.
+            hold_params.append(p)
         else:
             backbone_params.append(p)
     param_groups = [
         {'params': backbone_params, 'lr': base_lr, 'name': 'backbone'},
         {'params': arrow_params, 'lr': base_lr, 'name': 'arrow_head'},
+        {'params': hold_params, 'lr': base_lr, 'name': 'hold_head'},
         {'params': type_params, 'lr': base_lr * head_mult, 'name': 'type_head'},
         {'params': dur_params, 'lr': base_lr * head_mult, 'name': 'duration_head'},
     ]
     logger.info(
-        f"Optimizer param groups: backbone/arrow lr={base_lr:.2e}, "
+        f"Optimizer param groups: backbone/arrow/hold lr={base_lr:.2e}, "
         f"type/duration lr={base_lr * head_mult:.2e} (head_lr_mult={head_mult:.2f})"
     )
     optimizer = torch.optim.AdamW(
@@ -888,16 +898,16 @@ def validate(
             # and per-frame loss reporting.
             arrow_logits = model.apply_arrow_head(features, prev_arrow)
             beat_logits = model.apply_beat_head(features)
-            hold_logits = model.apply_hold_head(features)
             # Zero-context arrow logits: matches the inference peak-picking
             # distribution (`_predict_chunked` calls apply_arrow_head with
             # prev_arrow=None, i.e. zeros). The threshold sweep below uses
             # these so saved best_threshold / best_arrow_thresholds are
             # calibrated against the distribution inference actually sees.
-            # Type/duration heads are also conditioned on the zero-context
-            # arrow logits and the hold logits, matching inference.
+            # The hold head, type head, and duration head are all conditioned
+            # on these zero-context arrow logits, matching inference.
             zero_prev = torch.zeros_like(prev_arrow)
             arrow_logits_zero = model.apply_arrow_head(features, zero_prev)
+            hold_logits = model.apply_hold_head(features, arrow_logits_zero)
             type_logits = model.apply_type_head(
                 features, arrow_logits_zero, beat_logits, hold_logits,
             )
@@ -1315,7 +1325,9 @@ def save_checkpoint(
         #   4 = type/duration heads conditioned on zero-context arrow + beat logits
         #   5 = +hold_head (per-arrow in-hold), dense duration loss,
         #       jump co-fire, multi-stride jack penalty
-        'arch_version': 5,
+        #   6 = hold_head conditioned on zero-context arrow logits (input
+        #       dim hidden+4 instead of hidden); separate optimizer bucket
+        'arch_version': 6,
         'model_state_dict': model.state_dict(),
         'ema_state_dict': (
             ema_model.module.state_dict() if ema_model is not None else None

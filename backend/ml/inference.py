@@ -347,21 +347,21 @@ class MLChartGenerator:
         """Load trained model from checkpoint."""
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
 
-        # Hard-fail on pre-arch_version=5 checkpoints. The hold_head added in
-        # v5 changes the type/duration head input shape (5 → 9 conditioning
-        # dims), so a strict=False load would silently zero-init the type/
-        # duration heads' first Linear weights and produce garbage output.
-        # Keeping the legacy `best_model_2.pt` (arch=4) on disk for the
-        # frontend to serve via ML_MODEL_PATH until a new checkpoint passes
-        # verification — see plans/polymorphic-bubble.md.
+        # Hard-fail on pre-arch_version=6 checkpoints. v5 added the hold_head
+        # at input dim hidden_dim; v6 conditions it on zero-context arrow
+        # logits (input dim hidden_dim + 4). A strict=False load would
+        # silently zero-init the new conditioning columns and produce
+        # garbage hold output. Keep the legacy `best_model_2.pt` (arch=4)
+        # on disk for the frontend to serve via ML_MODEL_PATH until a new
+        # checkpoint passes verification.
         arch_version = int(checkpoint.get('arch_version', 1))
-        if arch_version < 5:
+        if arch_version < 6:
             raise ValueError(
                 f"Checkpoint at {model_path} is arch_version={arch_version}; "
-                f"retrain with current model.py — hold_head is required "
-                f"(v5 added per-arrow hold supervision and changed the "
-                f"type/duration head conditioning shape). Use the legacy "
-                f"checkpoint via ML_MODEL_PATH while you retrain."
+                f"retrain with current model.py — hold_head now consumes "
+                f"zero-context arrow_logits as conditioning (v6 changed its "
+                f"first-Linear input shape from hidden to hidden+4). Use "
+                f"the legacy checkpoint via ML_MODEL_PATH while you retrain."
             )
 
         # Extract model hyperparameters from checkpoint
@@ -686,7 +686,10 @@ class MLChartGenerator:
             )
             arrow_logits = self.model.apply_arrow_head(features, prev_arrow=None)
             beat_logits = self.model.apply_beat_head(features)
-            hold_logits = self.model.apply_hold_head(features)
+            # `arrow_logits` here is already zero-context (prev_arrow=None →
+            # zeros), so it's the same signal model.forward() conditions
+            # the hold head on at training time.
+            hold_logits = self.model.apply_hold_head(features, arrow_logits)
             # Type/duration heads are conditioned on the same zero-context
             # arrow logits + beat + hold the model was trained against
             # (see model.forward). The duration head now predicts
