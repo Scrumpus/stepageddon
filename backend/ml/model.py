@@ -956,24 +956,42 @@ class StepChartLoss(nn.Module):
             else:
                 type_loss = type_flat.sum() * 0.0
 
-        # Dense duration loss: log-space smooth-L1 on every frame inside any
-        # active hold span. The duration target is dense `remaining_beats`
-        # (linearly tapering from total_dur at hold_start to 0 at release),
-        # so the head now predicts "remaining duration from this frame to
-        # hold-end" rather than "total hold duration". At hold_start the two
-        # are identical, so inference (which reads the head at the
-        # peak-picked hold_start frame) is unchanged. Supervision goes from
-        # ~6k frames/epoch to ~60k+, ~10× density.
-        if in_hold_target is not None:
-            in_hold_any = in_hold_target.max(-1).values > 0.5  # [B, T]
-            if in_hold_any.any():
-                pred_log = duration_pred[:, :, 0][in_hold_any]
-                true_log = StepChartModel.encode_duration(
-                    duration_target[in_hold_any]
+        # Duration loss: log-space smooth-L1 on a ±DURATION_WINDOW window
+        # around each hold_start frame. The dense `remaining_beats` target
+        # the dataloader produces is *total_dur* exactly at the hold_start
+        # frame (taper starts at 1.0), so we mask by `type_target == hold`
+        # and supervise on those frames + ±W neighbors using the value at
+        # the hold_start frame. (Earlier v5 iterations supervised every
+        # in-hold frame with the per-frame remaining value, but eval reads
+        # the head at hold_start — and with no positional signal in the
+        # head's input, dense supervision pulled predictions toward the
+        # span mean ≈ total/2, which doubled dur_mae. The hold_head still
+        # consumes the dense `in_hold_target` via BCE — that's where the
+        # extra signal goes.)
+        hold_start_mask = (type_target == self.HOLD_START_CLASS)  # [B, T]
+        if hold_start_mask.any():
+            window = self.DURATION_WINDOW
+            base = duration_target * hold_start_mask.float()
+            window_mask = hold_start_mask.clone()
+            window_target = base.clone()
+            for offset in range(1, window + 1):
+                # Right shift: copy hold_start contributions to t+offset
+                window_mask[:, offset:] |= hold_start_mask[:, :-offset]
+                window_target[:, offset:] = torch.where(
+                    hold_start_mask[:, :-offset],
+                    base[:, :-offset],
+                    window_target[:, offset:],
                 )
-                dur_loss = F.smooth_l1_loss(pred_log, true_log)
-            else:
-                dur_loss = torch.tensor(0.0, device=arrow_logits.device)
+                # Left shift: copy to t-offset
+                window_mask[:, :-offset] |= hold_start_mask[:, offset:]
+                window_target[:, :-offset] = torch.where(
+                    hold_start_mask[:, offset:],
+                    base[:, offset:],
+                    window_target[:, :-offset],
+                )
+            pred_log = duration_pred[:, :, 0][window_mask]
+            true_log = StepChartModel.encode_duration(window_target[window_mask])
+            dur_loss = F.smooth_l1_loss(pred_log, true_log)
         else:
             dur_loss = torch.tensor(0.0, device=arrow_logits.device)
 
