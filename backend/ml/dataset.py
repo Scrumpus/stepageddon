@@ -75,6 +75,69 @@ def _build_prev_arrow_stream(arrow_labels: np.ndarray) -> np.ndarray:
     return out
 
 
+def _build_hold_streams(
+    arrow_labels: np.ndarray,
+    labels: np.ndarray,
+    durations_seconds: np.ndarray,
+    fps: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-frame in-hold indicators and remaining-duration target for the song.
+
+    Args:
+        arrow_labels: [T, 4] uint8 — per-arrow onset indicator at each frame.
+            Used at hold_start frames to determine which arrows are mid-hold.
+        labels: [T] uint8 — frame-level note class. Hold starts have value 3.
+        durations_seconds: [T] float32 — total hold duration in seconds at
+            hold_start frames, 0 elsewhere.
+        fps: frames per second of the mel grid.
+
+    Returns:
+        in_hold: [T, 4] float32. `in_hold[t, a] = 1` iff arrow `a` is
+            mid-hold at frame t (between a hold_start and the implied
+            release).
+        remaining_seconds: [T] float32. Max-over-active-holds of remaining
+            hold time in seconds, linearly tapering from total_dur at the
+            hold_start frame to 0 at the release. 0 outside any hold.
+
+    The dataloader converts `remaining_seconds` to beats per song tempo
+    after slicing — this helper is tempo-agnostic so it can be reused by
+    `compute_hold_priors` without needing per-entry tempo lookup.
+    """
+    T = arrow_labels.shape[0]
+    in_hold = np.zeros((T, 4), dtype=np.float32)
+    remaining = np.zeros(T, dtype=np.float32)
+    if T == 0:
+        return in_hold, remaining
+    hs_indices = np.flatnonzero(labels == 3)
+    if hs_indices.size == 0:
+        return in_hold, remaining
+    for hs in hs_indices:
+        dur_seconds = float(durations_seconds[hs])
+        if dur_seconds <= 0.0:
+            continue
+        dur_frames = max(1, int(round(dur_seconds * fps)))
+        end = min(T, int(hs) + dur_frames)
+        n = end - int(hs)
+        if n <= 0:
+            continue
+        # Per-arrow indicator: any arrow firing at the hold_start frame is
+        # treated as the holding arrow. When 2+ holds land on the same frame
+        # both columns get filled (rare; matches the v5 NPZ encoding).
+        arrows_at_hs = arrow_labels[int(hs)]  # [4]
+        for a in range(4):
+            if arrows_at_hs[a]:
+                in_hold[int(hs):end, a] = 1.0
+        # Linearly taper the remaining-duration scalar from dur_seconds to 0
+        # over the hold span. When two holds overlap (shouldn't happen but
+        # could after data quirks), keep the max-active remaining duration.
+        taper = dur_seconds * (
+            1.0 - (np.arange(n, dtype=np.float32) / float(dur_frames))
+        )
+        np.clip(taper, 0.0, None, out=taper)
+        np.maximum(remaining[int(hs):end], taper, out=remaining[int(hs):end])
+    return in_hold, remaining
+
+
 def load_manifest(manifest_path: str) -> dict:
     """Load a v2 manifest, validating the format version.
 
@@ -292,14 +355,23 @@ class StepChartDataset(Dataset):
         # or zeros if t precedes any onset.
         prev_arrow_full = _build_prev_arrow_stream(arrow_labels_full)
 
+        # Build the dense hold streams over the *full song* before chunking so
+        # chunks starting mid-hold still get the correct supervision (in_hold
+        # and remaining_seconds at the chunk's first frames inherit from the
+        # hold that started before the chunk boundary). Slicing happens after.
+        in_hold_full, remaining_seconds_full = _build_hold_streams(
+            arrow_labels_full, labels, durations, FRAMES_PER_SECOND,
+        )
+
         # Extract chunk
         end = start + self.chunk_frames
         mel_chunk = mel[start:end].astype(np.float32)
         labels_chunk = labels[start:end].astype(np.int64)
-        durations_chunk = durations[start:end].astype(np.float32)
         beats_chunk = beats[start:end].astype(np.float32)
         arrow_labels_chunk = arrow_labels_full[start:end].astype(np.float32)  # [T, 4]
         prev_arrow_chunk = prev_arrow_full[start:end].astype(np.float32)      # [T, 4]
+        in_hold_chunk = in_hold_full[start:end].astype(np.float32)            # [T, 4]
+        remaining_seconds_chunk = remaining_seconds_full[start:end].astype(np.float32)
         difficulty = entry['difficulty_id']
 
         # L↔R + D↔U mirror augmentation (180° pad rotation). Arrows are
@@ -307,20 +379,27 @@ class StepChartDataset(Dataset):
         # The mel input is unchanged because audio carries no chirality — a
         # chart with all arrows rotated is an equally valid mapping for the
         # same audio. Doubles effective per-arrow data and breaks any
-        # incidental L-side bias in the corpus. Type targets and durations
-        # are arrow-agnostic so they don't need touching.
+        # incidental L-side bias in the corpus. Type targets and the
+        # remaining-duration scalar are arrow-agnostic so they don't need
+        # touching; in_hold is per-arrow so it gets the same permutation.
         if self.is_train and self.augment and np.random.random() < 0.5:
             mirror_idx = [3, 2, 1, 0]
             arrow_labels_chunk = arrow_labels_chunk[:, mirror_idx]
             prev_arrow_chunk = prev_arrow_chunk[:, mirror_idx]
+            in_hold_chunk = in_hold_chunk[:, mirror_idx]
 
-        # Convert hold durations from seconds to *beats* using the song's
-        # tempo. Beats factor BPM out of the regression target so the duration
-        # head sees a much narrower distribution (DDR holds quantize to 1/4,
-        # 1/2, 1, 2 beats regardless of tempo). Inference reverses this with
-        # `beats * 60 / tempo` to recover seconds.
+        # Convert hold remaining-durations from seconds to *beats* using the
+        # song's tempo. Beats factor BPM out of the regression target so the
+        # duration head sees a much narrower distribution (DDR holds quantize
+        # to 1/4, 1/2, 1, 2 beats regardless of tempo). Inference reverses
+        # this with `beats * 60 / tempo` to recover seconds. The dense
+        # `remaining_beats` is the per-frame target — at the hold_start frame
+        # it equals total_dur (matches the inference decode site), tapering
+        # linearly to 0 at the implied release.
         tempo = float(entry.get('tempo', 120.0)) or 120.0
-        durations_chunk = (durations_chunk * (tempo / 60.0)).astype(np.float32)
+        remaining_beats_chunk = (
+            remaining_seconds_chunk * (tempo / 60.0)
+        ).astype(np.float32)
 
         # Per-chunk step density (steps/sec): a "step" is any frame with a
         # note event (tap, jump, or hold_start).
@@ -372,9 +451,8 @@ class StepChartDataset(Dataset):
         type_target = labels_chunk - 1
         type_target[type_target < 0] = -100
         if self.is_train and self.type_target_dilate > 0:
-            type_target, durations_chunk = self._dilate_type_and_duration(
-                labels_chunk, type_target, durations_chunk,
-                self.type_target_dilate,
+            type_target = self._dilate_type(
+                labels_chunk, type_target, self.type_target_dilate,
             )
 
         # ---- Mel augmentation + whitening ----
@@ -394,11 +472,12 @@ class StepChartDataset(Dataset):
             torch.tensor(density_norm, dtype=torch.float32),
             torch.from_numpy(arrow_soft),
             torch.from_numpy(type_target),
-            torch.from_numpy(durations_chunk),
+            torch.from_numpy(remaining_beats_chunk),
             torch.from_numpy(beat_soft),
             torch.from_numpy(prev_arrow_chunk),
             torch.tensor(start_seconds, dtype=torch.float32),
             torch.tensor(remaining_seconds, dtype=torch.float32),
+            torch.from_numpy(in_hold_chunk),
         )
 
     # ------------------------------------------------------------------
@@ -427,29 +506,25 @@ class StepChartDataset(Dataset):
         return np.clip(out, 0.0, 1.0).astype(np.float32)
 
     @staticmethod
-    def _dilate_type_and_duration(
+    def _dilate_type(
         labels_chunk: np.ndarray,
         type_target: np.ndarray,
-        durations_chunk: np.ndarray,
         width: int,
-    ):
-        """Spread each note's type class (and hold duration) into a ±width
-        window of ignore frames.
+    ) -> np.ndarray:
+        """Spread each note's type class into a ±width window of ignore frames.
 
         Original-frame labels are never overwritten, so when two notes are
         within 2*width of each other, both keep their own class — only the
-        ignore frames between/around them get filled in. For hold_start
-        notes, the corresponding duration value is also propagated into the
-        same dilated frames so the duration loss sees the correct target
-        everywhere it now sees `type==hold_start`.
+        ignore frames between/around them get filled in. The dense hold-stream
+        supervision now feeds the duration head, so duration propagation is
+        no longer needed here.
         """
         n = type_target.shape[0]
         note_frames = np.where(labels_chunk > 0)[0]
         if note_frames.size == 0:
-            return type_target, durations_chunk
+            return type_target
         note_classes = (labels_chunk[note_frames] - 1).astype(np.int64)
         out_type = type_target.copy()
-        out_dur = durations_chunk.copy()
         for f, c in zip(note_frames, note_classes):
             lo = max(0, int(f) - width)
             hi = min(n, int(f) + width + 1)
@@ -457,11 +532,7 @@ class StepChartDataset(Dataset):
             ignore_mask = type_window == -100
             type_window[ignore_mask] = int(c)
             out_type[lo:hi] = type_window
-            if c == 2:  # hold_start: propagate duration too
-                dur_window = out_dur[lo:hi]
-                dur_window[ignore_mask] = float(durations_chunk[f])
-                out_dur[lo:hi] = dur_window
-        return out_type, out_dur
+        return out_type
 
     def _spec_augment(self, mel: np.ndarray) -> np.ndarray:
         """SpecAugment time + freq masks. Operates on whitened mel.
@@ -830,6 +901,64 @@ def compute_arrow_priors(
     priors = pos.astype(np.float64) / float(total)
     logger.info(
         f"Per-arrow positive rate: L={priors[0]:.5f} D={priors[1]:.5f} "
+        f"U={priors[2]:.5f} R={priors[3]:.5f}"
+    )
+    return priors
+
+
+def compute_hold_priors(
+    manifest: List[dict],
+    data_dir: str,
+    indices: Optional[List[int]] = None,
+    sample_limit: int = 200,
+) -> np.ndarray:
+    """Empirical per-frame in-hold rate for each of the 4 arrows.
+
+    Returns a length-4 float64 array P(arrow_a is mid-hold at any frame).
+    Used to bias-init the hold head's per-arrow logits and to derive a
+    per-arrow BCE pos_weight (in-hold positives are ~3% per arrow, so a
+    pos_weight of ~5–10 is needed to keep the head from collapsing to
+    "predict no hold"). Falls back to a uniform 0.03 when no holds are
+    found in the sampled archives (legacy data).
+    """
+    data_dir = Path(data_dir)
+    idxs = indices if indices is not None else list(range(len(manifest)))
+    if len(idxs) > sample_limit:
+        step = max(1, len(idxs) // sample_limit)
+        idxs = idxs[::step][:sample_limit]
+    pos = np.zeros(4, dtype=np.int64)
+    total = 0
+    seen_any = False
+    for i in idxs:
+        entry = manifest[i]
+        archive = np.load(data_dir / entry['filename'])
+        labels_key = entry.get('labels_key')
+        durations_key = entry.get('durations_key')
+        arrow_key = entry.get('arrow_labels_key')
+        if (
+            not labels_key or labels_key not in archive.files
+            or not durations_key or durations_key not in archive.files
+            or not arrow_key or arrow_key not in archive.files
+        ):
+            continue
+        labels = archive[labels_key]
+        durations = archive[durations_key]
+        arrow_labels = archive[arrow_key]
+        in_hold, _ = _build_hold_streams(
+            arrow_labels, labels, durations, FRAMES_PER_SECOND,
+        )
+        seen_any = True
+        pos += in_hold.sum(axis=0).astype(np.int64)
+        total += int(in_hold.shape[0])
+    if not seen_any or total == 0:
+        logger.warning(
+            "No hold-stream data found while computing hold priors; using "
+            "0.03 uniform fallback."
+        )
+        return np.full(4, 0.03, dtype=np.float64)
+    priors = pos.astype(np.float64) / float(total)
+    logger.info(
+        f"Per-arrow in-hold rate: L={priors[0]:.5f} D={priors[1]:.5f} "
         f"U={priors[2]:.5f} R={priors[3]:.5f}"
     )
     return priors

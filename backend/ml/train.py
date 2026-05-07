@@ -52,6 +52,7 @@ from ml.dataset import (
     compute_beat_prior,
     compute_default_density_per_difficulty,
     compute_hold_duration_median,
+    compute_hold_priors,
     compute_note_counts,
     compute_note_type_counts,
     compute_onset_prior,
@@ -64,18 +65,21 @@ from ml.dataset import (
 
 
 def make_mixup_collate(p_mixup: float, alpha: float):
-    """Per-batch MixUp on mel + per-arrow onset targets, with type/duration masked.
+    """Per-batch MixUp on mel + per-arrow onset / hold targets, with type
+    and dense duration masked out.
 
-    The dataset yields (mel, diff, density, arrow_soft, type_target, durations,
-    beat_soft, prev_arrow, start_seconds, remaining_seconds). With probability
-    `p_mixup`, draw lambda ~ Beta(alpha, alpha), permute the batch, and replace
-    mel/arrow_soft/beat_soft with the convex combination. Type and duration
-    supervision is dropped on mixed batches (set to -100 / 0): teaching the
-    type head on mixed targets is ill-defined, but per-arrow BCE handles soft
-    targets natively. prev_arrow is also linearly interpolated — it's a
-    binary 4-vector representing "previous arrow," and a soft mix is a
-    reasonable proxy for "previous arrow of the mixed audio." The two
-    song-position scalars are linearly mixed too — same conditioning logic.
+    The dataset yields (mel, diff, density, arrow_soft, type_target,
+    remaining_beats, beat_soft, prev_arrow, start_seconds, remaining_seconds,
+    in_hold_target). With probability `p_mixup`, draw lambda ~
+    Beta(alpha, alpha), permute the batch, and replace mel / arrow_soft /
+    beat_soft / in_hold_target / remaining_beats with the convex combination.
+    Type supervision is dropped on mixed batches (set to -100): teaching the
+    type head on mixed targets is ill-defined. The remaining_beats target is
+    blended linearly because the dense duration loss masks by in_hold > 0.5;
+    a blended in_hold may still trigger the mask, so we want the target to
+    be a sensible interpolation rather than zeroed garbage. prev_arrow and
+    the two song-position scalars are linearly mixed — same conditioning
+    logic as the existing per-arrow blend.
 
     p_mixup=0.0 returns a default collate (no-op).
     """
@@ -90,7 +94,7 @@ def make_mixup_collate(p_mixup: float, alpha: float):
             return out
         (
             mel, diff, dens, arrow_soft, type_t, dur_t,
-            beat_soft, prev_arrow, start_s, remain_s,
+            beat_soft, prev_arrow, start_s, remain_s, in_hold,
         ) = out
         B = mel.size(0)
         if B < 2:
@@ -104,11 +108,12 @@ def make_mixup_collate(p_mixup: float, alpha: float):
         prev_mixed = lam * prev_arrow + (1.0 - lam) * prev_arrow[perm]
         start_mixed = lam * start_s + (1.0 - lam) * start_s[perm]
         remain_mixed = lam * remain_s + (1.0 - lam) * remain_s[perm]
+        in_hold_mixed = lam * in_hold + (1.0 - lam) * in_hold[perm]
+        dur_blended = lam * dur_t + (1.0 - lam) * dur_t[perm]
         type_masked = torch.full_like(type_t, -100)
-        dur_zeroed = torch.zeros_like(dur_t)
         return (
-            mel_mixed, diff, dens, arrow_mixed, type_masked, dur_zeroed,
-            beat_mixed, prev_mixed, start_mixed, remain_mixed,
+            mel_mixed, diff, dens, arrow_mixed, type_masked, dur_blended,
+            beat_mixed, prev_mixed, start_mixed, remain_mixed, in_hold_mixed,
         )
 
     return collate
@@ -205,6 +210,7 @@ class BuildOutputs:
     type_prior: np.ndarray  # [3] P(class | onset) over {tap, jump, hold_start}
     hold_duration_median: float  # beats; bias-init for the duration head
     beat_prior: float  # per-frame beat rate; bias-init for the beat head
+    hold_priors: np.ndarray  # [4] per-arrow in-hold rate; hold head bias init
 
 
 def build_dataloaders(args) -> BuildOutputs:
@@ -286,6 +292,10 @@ def build_dataloaders(args) -> BuildOutputs:
     )
     print("[build_dataloaders] compute_beat_prior...", flush=True)
     beat_prior = compute_beat_prior(
+        full_dataset.entries, str(data_dir), train_idx,
+    )
+    print("[build_dataloaders] compute_hold_priors...", flush=True)
+    hold_priors = compute_hold_priors(
         full_dataset.entries, str(data_dir), train_idx,
     )
     print("[build_dataloaders] all priors done", flush=True)
@@ -380,6 +390,7 @@ def build_dataloaders(args) -> BuildOutputs:
         type_prior=type_prior,
         hold_duration_median=hold_duration_median,
         beat_prior=beat_prior,
+        hold_priors=hold_priors,
     )
 
 
@@ -390,6 +401,7 @@ def build_model(
     device: torch.device,
     hold_duration_median: float = 1.0,
     beat_prior: float = 0.02,
+    hold_priors: Optional[np.ndarray] = None,
 ) -> StepChartModel:
     tcn_dilations = tuple(int(x) for x in args.tcn_dilations.split(','))
     model = StepChartModel(
@@ -406,6 +418,8 @@ def build_model(
     model.set_type_prior(type_prior)
     model.set_duration_prior(hold_duration_median)
     model.set_beat_prior(beat_prior)
+    if hold_priors is not None:
+        model.set_hold_priors(hold_priors)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
     return model
@@ -459,7 +473,10 @@ def build_optimizer_and_scheduler(
 
 
 def build_loss(
-    arrow_priors: np.ndarray, type_prior: np.ndarray, args,
+    arrow_priors: np.ndarray,
+    type_prior: np.ndarray,
+    args,
+    hold_priors: Optional[np.ndarray] = None,
 ) -> StepChartLoss:
     """Build the combined loss with per-arrow pos_weight derived from priors.
 
@@ -486,6 +503,35 @@ def build_loss(
         smoothing=args.type_weight_smoothing,
         max_weight=args.type_weight_cap,
     )
+    # Hold pos_weight: explicit CLI override first, else derive per-arrow
+    # from the in-hold prior with the same sqrt((1-p)/p) recipe used for the
+    # arrow head (capped lower because in-hold rates are ~3% — much higher
+    # than the per-arrow onset rate — so the raw weight is already smaller).
+    hpw_arg = float(getattr(args, 'hold_pos_weight', 0.0))
+    if hpw_arg > 0.0:
+        hpw = torch.full((4,), hpw_arg, dtype=torch.float32)
+        logger.info(
+            f"Hold-head pos_weight = {hpw_arg:.2f} (override, all arrows)"
+        )
+    elif hold_priors is not None:
+        hp_clipped = np.clip(np.asarray(hold_priors), 1e-4, 0.5)
+        per_arrow_hpw = np.sqrt((1.0 - hp_clipped) / hp_clipped)
+        per_arrow_hpw = np.minimum(np.maximum(per_arrow_hpw, 1.0), 20.0)
+        hpw = torch.from_numpy(per_arrow_hpw.astype(np.float32))
+        logger.info(
+            f"Hold-head pos_weight per arrow [L,D,U,R] = "
+            f"{per_arrow_hpw.tolist()} (sqrt((1-p)/p) from hold_priors)"
+        )
+    else:
+        hpw = torch.full((4,), 5.0, dtype=torch.float32)
+        logger.info("Hold-head pos_weight = 5.0 (uniform fallback)")
+    jack_strides_arg = getattr(args, 'jack_strides', '3,6,9')
+    if isinstance(jack_strides_arg, str):
+        jack_strides = tuple(
+            int(s.strip()) for s in jack_strides_arg.split(',') if s.strip()
+        )
+    else:
+        jack_strides = tuple(int(x) for x in jack_strides_arg)
     return StepChartLoss(
         pos_weight=pw,
         type_weight=args.type_weight,
@@ -497,7 +543,11 @@ def build_loss(
         diversity_weight=getattr(args, 'diversity_weight', 0.2),
         commit_weight=getattr(args, 'arrow_commit_weight', 0.5),
         jack_weight=getattr(args, 'jack_weight', 0.3),
-        jack_stride=getattr(args, 'jack_stride', 3),
+        jack_strides=jack_strides,
+        jack_stride_decay=float(getattr(args, 'jack_stride_decay', 0.5)),
+        jump_cofire_weight=float(getattr(args, 'jump_cofire_weight', 0.5)),
+        hold_weight=float(getattr(args, 'hold_weight', 0.3)),
+        hold_pos_weight=hpw,
     )
 
 def train_one_epoch(
@@ -521,6 +571,7 @@ def train_one_epoch(
     total_dur = 0.0
     total_beat = 0.0
     total_div = 0.0
+    total_hold = 0.0
     total_samples = 0
     n_batches = len(loader)
     print(f"  [train_one_epoch] n_batches={n_batches}", flush=True)
@@ -531,6 +582,7 @@ def train_one_epoch(
     interval_dur = 0.0
     interval_beat = 0.0
     interval_div = 0.0
+    interval_hold = 0.0
     interval_samples = 0
     t_start = time.time()
 
@@ -544,7 +596,7 @@ def train_one_epoch(
             )
         (
             mel, difficulty, density, arrow_soft, type_target, duration_target,
-            beat_soft, prev_arrow, start_seconds, remaining_seconds,
+            beat_soft, prev_arrow, start_seconds, remaining_seconds, in_hold_target,
         ) = batch
         if step < 3:
             print(f"  [train_one_epoch] batch {step} unpacked, mel={tuple(mel.shape)}", flush=True)
@@ -558,6 +610,7 @@ def train_one_epoch(
         prev_arrow = prev_arrow.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+        in_hold_target = in_hold_target.to(device, non_blocking=True)
 
         # Per-frame prev-arrow dropout: zero the conditioning vector with
         # probability `prev_arrow_dropout`. Forces the head to remain useful
@@ -572,14 +625,15 @@ def train_one_epoch(
         if step < 3:
             print(f"  [train_one_epoch] batch {step} forward...", flush=True)
         with autocast('cuda'):
-            arrow_logits, type_logits, duration_pred, beat_logits = model(
+            arrow_logits, type_logits, duration_pred, beat_logits, hold_logits = model(
                 mel, difficulty, density,
                 start_seconds, remaining_seconds, prev_arrow,
             )
-            loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
+            loss, arrow_l, type_l, dur_l, beat_l, div_l, hold_l = criterion(
                 arrow_logits, type_logits, duration_pred,
                 arrow_soft, type_target, duration_target,
                 beat_logits=beat_logits, beat_soft=beat_soft,
+                hold_logits=hold_logits, in_hold_target=in_hold_target,
             )
         if step < 3:
             print(f"  [train_one_epoch] batch {step} loss={loss.item():.4f} backward...", flush=True)
@@ -605,6 +659,7 @@ def train_one_epoch(
         total_dur += dur_l.item() * bs
         total_beat += beat_l.item() * bs
         total_div += div_l.item() * bs
+        total_hold += hold_l.item() * bs
         total_samples += bs
 
         interval_loss += loss.item() * bs
@@ -613,6 +668,7 @@ def train_one_epoch(
         interval_dur += dur_l.item() * bs
         interval_beat += beat_l.item() * bs
         interval_div += div_l.item() * bs
+        interval_hold += hold_l.item() * bs
         interval_samples += bs
 
         if (step + 1) % log_interval == 0 or (step + 1) == n_batches:
@@ -622,12 +678,14 @@ def train_one_epoch(
             avg_d = interval_dur / max(interval_samples, 1)
             avg_b = interval_beat / max(interval_samples, 1)
             avg_v = interval_div / max(interval_samples, 1)
+            avg_h = interval_hold / max(interval_samples, 1)
             lr = optimizer.param_groups[0]['lr']
             elapsed = time.time() - t_start
             print(
                 f"  step {step+1:4d}/{n_batches} "
                 f"| loss={avg_l:.4f} (arrow={avg_a:.4f} type={avg_t:.4f} "
-                f"dur={avg_d:.4f} beat={avg_b:.4f} div={avg_v:.4f}) "
+                f"dur={avg_d:.4f} beat={avg_b:.4f} div={avg_v:.4f} "
+                f"hold={avg_h:.4f}) "
                 f"| lr={lr:.2e} | {elapsed:.1f}s",
                 flush=True,
             )
@@ -637,6 +695,7 @@ def train_one_epoch(
             interval_dur = 0.0
             interval_beat = 0.0
             interval_div = 0.0
+            interval_hold = 0.0
             interval_samples = 0
             t_start = time.time()
 
@@ -647,6 +706,7 @@ def train_one_epoch(
         'duration_loss': total_dur / max(total_samples, 1),
         'beat_loss': total_beat / max(total_samples, 1),
         'diversity_loss': total_div / max(total_samples, 1),
+        'hold_loss': total_hold / max(total_samples, 1),
     }
 
 
@@ -760,7 +820,14 @@ def validate(
     total_dur = 0.0
     total_beat = 0.0
     total_div = 0.0
+    total_hold = 0.0
     total_samples = 0
+    # Per-arrow hold-head probabilities and targets, accumulated across the
+    # val set so we can sweep a per-arrow threshold for raw hold F1 — the
+    # diagnostic that tells us the new dense supervision is actually being
+    # absorbed by the head (vs. just collapsing to the prior bias).
+    all_hold_probs: List[np.ndarray] = []
+    all_hold_targets: List[np.ndarray] = []
 
     # Aggregate "any-onset" prob per frame via row-max on per-arrow probs.
     all_pred = []
@@ -798,7 +865,7 @@ def validate(
             )
         (
             mel, difficulty, density, arrow_soft, type_target, duration_target,
-            beat_soft, prev_arrow, start_seconds, remaining_seconds,
+            beat_soft, prev_arrow, start_seconds, remaining_seconds, in_hold_target,
         ) = batch
         mel = mel.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -810,6 +877,7 @@ def validate(
         prev_arrow = prev_arrow.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+        in_hold_target = in_hold_target.to(device, non_blocking=True)
 
         with autocast('cuda'):
             # Share the backbone encode across the two arrow-head calls below.
@@ -820,25 +888,27 @@ def validate(
             # and per-frame loss reporting.
             arrow_logits = model.apply_arrow_head(features, prev_arrow)
             beat_logits = model.apply_beat_head(features)
+            hold_logits = model.apply_hold_head(features)
             # Zero-context arrow logits: matches the inference peak-picking
             # distribution (`_predict_chunked` calls apply_arrow_head with
             # prev_arrow=None, i.e. zeros). The threshold sweep below uses
             # these so saved best_threshold / best_arrow_thresholds are
             # calibrated against the distribution inference actually sees.
             # Type/duration heads are also conditioned on the zero-context
-            # arrow logits so their train/test distributions agree.
+            # arrow logits and the hold logits, matching inference.
             zero_prev = torch.zeros_like(prev_arrow)
             arrow_logits_zero = model.apply_arrow_head(features, zero_prev)
             type_logits = model.apply_type_head(
-                features, arrow_logits_zero, beat_logits,
+                features, arrow_logits_zero, beat_logits, hold_logits,
             )
             duration_pred = model.apply_duration_head(
-                features, arrow_logits_zero, beat_logits,
+                features, arrow_logits_zero, beat_logits, hold_logits,
             )
-            loss, arrow_l, type_l, dur_l, beat_l, div_l = criterion(
+            loss, arrow_l, type_l, dur_l, beat_l, div_l, hold_l = criterion(
                 arrow_logits, type_logits, duration_pred,
                 arrow_soft, type_target, duration_target,
                 beat_logits=beat_logits, beat_soft=beat_soft,
+                hold_logits=hold_logits, in_hold_target=in_hold_target,
             )
 
         bs = mel.size(0)
@@ -848,7 +918,16 @@ def validate(
         total_dur += dur_l.item() * bs
         total_beat += beat_l.item() * bs
         total_div += div_l.item() * bs
+        total_hold += hold_l.item() * bs
         total_samples += bs
+
+        # Stash hold-head probs and targets for the per-arrow F1 sweep
+        # below. Hold supervision is dense (in-hold spans), so we don't need
+        # NMS — a plain per-frame threshold sweep is the right diagnostic.
+        all_hold_probs.append(
+            torch.sigmoid(hold_logits.float()).cpu().numpy()
+        )
+        all_hold_targets.append(in_hold_target.cpu().numpy())
 
         # Any-onset threshold sweep / KL / stream_coh use the zero-context
         # distribution (matches inference Phase 1 peak picking).
@@ -1059,6 +1138,31 @@ def validate(
                     best = (macro, float(jb), float(hb))
                     cal_tap_f1, cal_jump_f1, cal_hold_f1 = per_class
         cal_macro_f1, cal_jump_bias, cal_hold_bias = best
+
+    # Per-arrow hold-head raw F1: sanity-check that the new dense
+    # supervision is being absorbed. Sweep a single threshold per arrow on
+    # plain per-frame BCE probs (no NMS — in-hold is a span, not a peak).
+    hold_arrow_f1 = np.zeros(4, dtype=np.float32)
+    hold_arrow_thr = np.full(4, 0.5, dtype=np.float32)
+    if all_hold_probs:
+        hp = np.concatenate(all_hold_probs, axis=0).reshape(-1, 4)
+        ht = (np.concatenate(all_hold_targets, axis=0).reshape(-1, 4) > 0.5)
+        for a in range(4):
+            best_af1, best_athr = 0.0, 0.5
+            for thr in np.arange(0.1, 0.91, 0.05):
+                pred = hp[:, a] >= thr
+                tp_h = int(np.sum(pred & ht[:, a]))
+                fp_h = int(np.sum(pred & ~ht[:, a]))
+                fn_h = int(np.sum(~pred & ht[:, a]))
+                if tp_h + fp_h == 0 or tp_h + fn_h == 0:
+                    continue
+                prec_h = tp_h / max(tp_h + fp_h, 1)
+                rec_h = tp_h / max(tp_h + fn_h, 1)
+                f1_h = 2 * prec_h * rec_h / max(prec_h + rec_h, 1e-8)
+                if f1_h > best_af1:
+                    best_af1, best_athr = float(f1_h), float(thr)
+            hold_arrow_f1[a] = best_af1
+            hold_arrow_thr[a] = best_athr
     print("  [validate] done", flush=True)
 
     return {
@@ -1068,6 +1172,17 @@ def validate(
         'duration_loss': total_dur / max(total_samples, 1),
         'beat_loss': total_beat / max(total_samples, 1),
         'diversity_loss': total_div / max(total_samples, 1),
+        'hold_loss': total_hold / max(total_samples, 1),
+        # Per-arrow raw hold-head F1 (diagnostic on the new dense head).
+        'hold_head_f1_L': float(hold_arrow_f1[0]),
+        'hold_head_f1_D': float(hold_arrow_f1[1]),
+        'hold_head_f1_U': float(hold_arrow_f1[2]),
+        'hold_head_f1_R': float(hold_arrow_f1[3]),
+        'hold_head_f1_macro': float(hold_arrow_f1.mean()),
+        'hold_head_thr_L': float(hold_arrow_thr[0]),
+        'hold_head_thr_D': float(hold_arrow_thr[1]),
+        'hold_head_thr_U': float(hold_arrow_thr[2]),
+        'hold_head_thr_R': float(hold_arrow_thr[3]),
         # "Any-onset" F1 (row-max over per-arrow probs); kept for continuity
         # with the legacy onset-head metric and for checkpoint selection.
         'tol_precision': prec,
@@ -1198,7 +1313,9 @@ def save_checkpoint(
         #   2 = per-arrow head with prev_arrow conditioning
         #   3 = +(start_seconds, remaining_seconds) FiLM conditioning
         #   4 = type/duration heads conditioned on zero-context arrow + beat logits
-        'arch_version': 4,
+        #   5 = +hold_head (per-arrow in-hold), dense duration loss,
+        #       jump co-fire, multi-stride jack penalty
+        'arch_version': 5,
         'model_state_dict': model.state_dict(),
         'ema_state_dict': (
             ema_model.module.state_dict() if ema_model is not None else None
@@ -1270,13 +1387,17 @@ def build_argparser() -> argparse.ArgumentParser:
                              'needs more class-imbalance correction.')
     parser.add_argument('--type-weight-cap', type=float, default=30.0,
                         help='Max per-class CE weight after smoothing')
-    parser.add_argument('--type-focal-gamma', type=float, default=2.0,
+    parser.add_argument('--type-focal-gamma', type=float, default=1.0,
                         help='Focal-loss gamma on the type CE. 0 disables; '
-                             '2.0 down-weights confidently-correct (easy tap) '
-                             'frames hard so rare jump/hold frames dominate '
-                             'the gradient. Bumped from 1.0 after a run where '
-                             'jump/hold F1 stayed ~0.23/0.28 throughout 80 '
-                             'epochs while taps held at 0.89.')
+                             '1.0 lightly down-weights confidently-correct '
+                             '(easy tap) frames so rare jump/hold frames '
+                             'contribute more gradient. Lowered from 2.0 in '
+                             'v5: with the new dedicated hold_head carrying '
+                             'the bulk of hold supervision, gamma=2.0 was '
+                             'over-aggressive on top of type_weight=4.0 + '
+                             'class weights + 8×/16× sampler boosts and '
+                             'pinned the calibration sweep at hb=-0.25 for '
+                             '27 consecutive epochs.')
     parser.add_argument('--pos-weight', type=float, default=None,
                         help='Override BCE pos_weight on the onset head. '
                              'Default = sqrt((1-p)/p) capped at 50.')
@@ -1335,16 +1456,43 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--jack-weight', type=float, default=0.3,
                         help='Loss weight on the anti-jack penalty: '
                              'discourages same-arrow argmax on co-active '
-                             'onset pairs separated by --jack-stride frames. '
-                             'Targets stream_coherence directly (last run '
-                             'finished at 0.31, real charts ~0.7-0.85). '
-                             '0.0 disables.')
-    parser.add_argument('--jack-stride', type=int, default=3,
-                        help='Frame offset for the anti-jack penalty pair. '
-                             'Set just outside the onset-smoothing kernel '
-                             '(sigma=1.5 → ~2-frame radius) so the penalty '
-                             'acts on distinct events, not the same event '
-                             'spread across adjacent frames.')
+                             'onset pairs separated by any of --jack-strides '
+                             'frames. Targets stream_coherence directly '
+                             '(real charts sit ~0.7-0.85). 0.0 disables.')
+    parser.add_argument('--jack-strides', type=str, default='3,6,9',
+                        help='Comma-separated frame offsets for the anti-jack '
+                             'penalty pair. Stride 3 sits just outside the '
+                             'onset-smoothing kernel (sigma=1.5 → ~2-frame '
+                             'radius); strides 6/9 catch 8th/16th-note jacks '
+                             'at 120-180 BPM that the kernel masks at stride '
+                             '3 alone. Per-stride contributions weighted by '
+                             '--jack-stride-decay^k and averaged.')
+    parser.add_argument('--jack-stride-decay', type=float, default=0.5,
+                        help='Geometric decay applied to per-stride jack '
+                             'penalty contributions (later strides get '
+                             'decay^k weight). 1.0 = uniform, 0.0 = stride-0 '
+                             'only.')
+    parser.add_argument('--jump-cofire-weight', type=float, default=0.5,
+                        help='Loss weight on the jump co-fire term: extra '
+                             'BCE on positive arrows of jump frames, '
+                             'rewarding the joint event the per-arrow BCE '
+                             'marginal cannot see (P(L)·P(R) caps at the '
+                             'product of marginals, so independent BCE '
+                             'never directly pulls the model toward firing '
+                             'both arrows together). 0.0 disables.')
+    parser.add_argument('--hold-weight', type=float, default=0.3,
+                        help='Loss weight on the per-arrow hold-head BCE. '
+                             'The hold head is supervised on dense in-hold '
+                             'spans synthesized by the dataloader, giving '
+                             '~10× more gradient than the single-frame '
+                             'hold_start signal the type head sees. 0.0 '
+                             'disables — head still emits logits but gets '
+                             'no gradient.')
+    parser.add_argument('--hold-pos-weight', type=float, default=0.0,
+                        help='Override per-arrow BCE pos_weight on the '
+                             'hold head (broadcast across arrows). 0 = '
+                             'derive from the in-hold prior with the same '
+                             'sqrt((1-p)/p) recipe as the arrow head.')
     parser.add_argument('--prev-arrow-dropout', type=float, default=0.1,
                         help='Per-frame probability of zeroing the prev_arrow '
                              'conditioning vector during training. Forces the '
@@ -1415,9 +1563,13 @@ def main():
         args, built.arrow_priors, built.type_prior, device,
         hold_duration_median=built.hold_duration_median,
         beat_prior=built.beat_prior,
+        hold_priors=built.hold_priors,
     )
     print("[main] model built; building loss...", flush=True)
-    criterion = build_loss(built.arrow_priors, built.type_prior, args).to(device)
+    criterion = build_loss(
+        built.arrow_priors, built.type_prior, args,
+        hold_priors=built.hold_priors,
+    ).to(device)
     print("[main] loss built; computing steps_per_epoch (calls len(train_loader))...", flush=True)
     steps_per_epoch = max(1, len(built.train_loader))
     print(f"[main] steps_per_epoch={steps_per_epoch}; building optimizer...", flush=True)
@@ -1505,7 +1657,8 @@ def main():
             f"(arrow={train_metrics['arrow_loss']:.4f} "
             f"type={train_metrics['type_loss']:.4f} "
             f"dur={train_metrics['duration_loss']:.4f} "
-            f"div={train_metrics['diversity_loss']:.4f}) "
+            f"div={train_metrics['diversity_loss']:.4f} "
+            f"hold={train_metrics['hold_loss']:.4f}) "
             f"| val_loss={val_metrics['loss']:.4f} "
             f"tol_f1={val_metrics['tol_f1']:.3f} "
             f"(P={val_metrics['tol_precision']:.3f} "
@@ -1524,6 +1677,7 @@ def main():
             f"{val_metrics['jump_f1']:.3f}/"
             f"{val_metrics['hold_f1']:.3f} "
             f"(macro={val_metrics['type_macro_f1']:.3f}) "
+            f"hold_head_F1={val_metrics['hold_head_f1_macro']:.3f} "
             f"dur_mae={val_metrics['dur_mae_beats']:.3f}b "
             f"| lr={lr:.2e} | {elapsed:.1f}s",
             flush=True,

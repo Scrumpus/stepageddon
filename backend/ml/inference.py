@@ -347,6 +347,23 @@ class MLChartGenerator:
         """Load trained model from checkpoint."""
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
 
+        # Hard-fail on pre-arch_version=5 checkpoints. The hold_head added in
+        # v5 changes the type/duration head input shape (5 → 9 conditioning
+        # dims), so a strict=False load would silently zero-init the type/
+        # duration heads' first Linear weights and produce garbage output.
+        # Keeping the legacy `best_model_2.pt` (arch=4) on disk for the
+        # frontend to serve via ML_MODEL_PATH until a new checkpoint passes
+        # verification — see plans/polymorphic-bubble.md.
+        arch_version = int(checkpoint.get('arch_version', 1))
+        if arch_version < 5:
+            raise ValueError(
+                f"Checkpoint at {model_path} is arch_version={arch_version}; "
+                f"retrain with current model.py — hold_head is required "
+                f"(v5 added per-arrow hold supervision and changed the "
+                f"type/duration head conditioning shape). Use the legacy "
+                f"checkpoint via ML_MODEL_PATH while you retrain."
+            )
+
         # Extract model hyperparameters from checkpoint
         args = checkpoint.get('args', {})
         self.model = StepChartModel(
@@ -669,13 +686,18 @@ class MLChartGenerator:
             )
             arrow_logits = self.model.apply_arrow_head(features, prev_arrow=None)
             beat_logits = self.model.apply_beat_head(features)
+            hold_logits = self.model.apply_hold_head(features)
             # Type/duration heads are conditioned on the same zero-context
-            # arrow logits the model was trained against (see model.forward).
+            # arrow logits + beat + hold the model was trained against
+            # (see model.forward). The duration head now predicts
+            # "remaining beats from this frame to hold release"; at the
+            # peak-picked hold_start frame this equals total duration, so
+            # the postprocess decode site is unchanged.
             type_logits = self.model.apply_type_head(
-                features, arrow_logits, beat_logits,
+                features, arrow_logits, beat_logits, hold_logits,
             )
             dur_pred = self.model.apply_duration_head(
-                features, arrow_logits, beat_logits,
+                features, arrow_logits, beat_logits, hold_logits,
             )
 
             features_np = features.float().cpu().numpy()[0]                      # [T_chunk, H]
