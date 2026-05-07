@@ -1,16 +1,17 @@
 """
-Step Chart Neural Network Model.
+Step Chart Neural Network Model (v7 hybrid).
 
-Four-head architecture (arrow-aware variant of Dance Dance Convolution):
-    mel -> AudioEncoder (CNN) -> Dilated TCN -> early FiLM (difficulty+density)
+Three-head architecture:
+    feats[T,88] -> AudioEncoder (CNN) -> Dilated TCN -> early FiLM
+        (difficulty + density + start_seconds + remaining_seconds)
         -> RoPE Transformer -> LayerNorm
-        -> arrow head     (4 sigmoids, per-arrow "does this arrow fire?",
-                           conditioned on the previous emitted arrow vector)
-        -> beat head      (auxiliary: "is this a beat?")
-        -> type  head     (3-way: tap / jump / hold_start, conditioned on
-                           detached arrow + beat logits)
-        -> duration head  (linear scalar in log-space; decode_duration() to seconds,
-                           conditioned on detached arrow + beat logits)
+        -> onset head      [T, 1] sigmoid: any-onset prob (Gaussian-smoothed BCE)
+        -> sustain head    [T, 1] sigmoid: in-any-hold prob (dense BCE)
+        -> intensity head  [T, 1] linear:  jump-vs-tap intensity (MSE regression)
+
+The model predicts dense, style-agnostic signals only. Algorithmic
+post-processing (see `inference.py`) decides arrows, jump vs. tap, hold
+start/end, and jumpholds, parameterized by selectable style profiles.
 """
 
 import math
@@ -19,13 +20,25 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-class AudioEncoder(nn.Module):
-    """CNN encoder for mel spectrogram features. [B, T, n_mels] -> [B, T, H]."""
 
-    def __init__(self, n_mels: int, hidden_dim: int, dropout: float = 0.1):
+
+# Bumped to v7: full hybrid rewrite. The arrow/type/duration/beat/hold heads
+# of v6 are gone; the model now emits only onset/sustain/intensity.
+ARCH_VERSION = 7
+
+
+class AudioEncoder(nn.Module):
+    """CNN encoder for the v7 88-channel audio feature tensor.
+
+    Input is `feats[B, T, n_in_channels]` (mel ⊕ onset_strength ⊕ spec_contrast)
+    rather than the v6 mel-only input — the conv stack widens the channel
+    count from `n_in_channels` to `hidden_dim` in the first conv.
+    """
+
+    def __init__(self, n_in_channels: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv1d(n_mels, hidden_dim, kernel_size=3, padding=1),
+            nn.Conv1d(n_in_channels, hidden_dim, kernel_size=3, padding=1),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -38,10 +51,11 @@ class AudioEncoder(nn.Module):
             nn.GELU(),
         )
 
-    def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        x = mel.transpose(1, 2)   # [B, n_mels, T]
-        x = self.net(x)           # [B, H, T]
-        return x.transpose(1, 2)  # [B, T, H]
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        x = feats.transpose(1, 2)   # [B, n_in_channels, T]
+        x = self.net(x)             # [B, H, T]
+        return x.transpose(1, 2)    # [B, T, H]
+
 
 # ---------------------------------------------------------------------------
 # Dilated temporal conv stack (widens receptive field before attention)
@@ -63,10 +77,12 @@ class DilatedTCNBlock(nn.Module):
         y = F.gelu(y)
         y = self.drop(y)
         return x + y
+
+
 class DilatedTCN(nn.Module):
     """Stack of dilated residual conv blocks. [B, T, H] -> [B, T, H]."""
 
-    def __init__(self, hidden_dim: int, dilations=(1, 2, 4, 8), dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, dilations=(1, 2, 4, 8, 16), dropout: float = 0.1):
         super().__init__()
         self.blocks = nn.ModuleList(
             [DilatedTCNBlock(hidden_dim, d, dropout=dropout) for d in dilations]
@@ -78,13 +94,12 @@ class DilatedTCN(nn.Module):
             x = b(x)
         return x.transpose(1, 2)  # [B, T, H]
 
+
 # ---------------------------------------------------------------------------
 # Conditioning: difficulty embedding + Fourier features on density -> FiLM
 # ---------------------------------------------------------------------------
 class FourierFeatures(nn.Module):
-    """
-    Random Fourier features for a scalar input.
-    """
+    """Random Fourier features for a scalar input."""
 
     def __init__(self, n_features: int = 16, sigma: float = 1.0):
         super().__init__()
@@ -98,11 +113,11 @@ class FourierFeatures(nn.Module):
 
 class FiLMConditioner(nn.Module):
     """
-    Single FiLM conditioner for (difficulty, density, song-position).
+    FiLM conditioner for (difficulty, density, start_seconds, remaining_seconds).
 
     Builds (gamma, beta) from a difficulty embedding concatenated with random
-    Fourier features of density and song-position scalars (start_seconds,
-    remaining_seconds), and applies `gamma * x + beta` to features.
+    Fourier features of density and the two song-position scalars, then
+    applies `gamma * x + beta` to features.
     """
 
     def __init__(
@@ -117,11 +132,6 @@ class FiLMConditioner(nn.Module):
         self.hidden_dim = hidden_dim
         self.diff_emb = nn.Embedding(n_difficulties, hidden_dim)
         self.fourier = FourierFeatures(n_fourier)
-
-        # Separate Fourier modules for the two position scalars. Sigma is
-        # tuned for the seconds scale: with sigma=0.1, the random frequencies
-        # have periods ranging from ~10s up to a few hundred seconds, which
-        # spans both intro silence (sub-10s) and song-section structure.
         self.fourier_start = FourierFeatures(n_fourier_position, sigma=position_sigma)
         self.fourier_remaining = FourierFeatures(n_fourier_position, sigma=position_sigma)
         cond_dim = hidden_dim + 2 * n_fourier + 2 * (2 * n_fourier_position)
@@ -141,13 +151,12 @@ class FiLMConditioner(nn.Module):
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
     ) -> torch.Tensor:
-        # x: [B, T, H]; difficulty: [B]; density/start_seconds/remaining_seconds: [B]
-        d = self.diff_emb(difficulty)                      # [B, H]
-        f = self.fourier(density)                          # [B, 2*n_fourier]
-        fs = self.fourier_start(start_seconds)             # [B, 2*n_fourier_position]
-        fr = self.fourier_remaining(remaining_seconds)     # [B, 2*n_fourier_position]
+        d = self.diff_emb(difficulty)
+        f = self.fourier(density)
+        fs = self.fourier_start(start_seconds)
+        fr = self.fourier_remaining(remaining_seconds)
         cond = torch.cat([d, f, fs, fr], dim=-1)
-        params = self.proj(cond)                            # [B, 2H]
+        params = self.proj(cond)
         gamma, beta = params.chunk(2, dim=-1)
         return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
 
@@ -169,17 +178,18 @@ class RotaryEmbedding(nn.Module):
         assert head_dim % 2 == 0, "RoPE requires even head_dim"
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         t = torch.arange(max_len).float()
-        freqs = torch.outer(t, inv_freq)                    
-        emb = torch.cat([freqs, freqs], dim=-1)              
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
         self.register_buffer('cos', emb.cos(), persistent=False)
         self.register_buffer('sin', emb.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, T, Dh]
         T = x.size(-2)
         cos = self.cos[:T].to(dtype=x.dtype)
         sin = self.sin[:T].to(dtype=x.dtype)
         return x * cos + _rotate_half(x) * sin
+
+
 class RoPESelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -194,7 +204,7 @@ class RoPESelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)                       
+        qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = self.rope(q)
         k = self.rope(k)
@@ -204,6 +214,8 @@ class RoPESelfAttention(nn.Module):
         )
         attn = attn.transpose(1, 2).reshape(B, T, D)
         return self.out(attn)
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, ff_mult: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -226,46 +238,34 @@ class TransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full step chart model
+# Full step chart model (v7)
 # ---------------------------------------------------------------------------
 
 class StepChartModel(nn.Module):
     """
-    Audio + prev_arrow -> (arrow_logits, type_logits, duration_pred, beat_logits).
+    feats -> (onset_logits, sustain_logits, intensity_pred).
 
-    Arrow-aware: the model predicts WHICH arrows fire, conditioned on the previous emitted arrow vector, WHAT type
-    of note it is (tap / jump / hold_start), and HOW LONG holds last.
-
-    arrow_logits:  [B, T, 4]  per-arrow {L, D, U, R} pre-sigmoid
-    type_logits:   [B, T, 3]  {tap, jump, hold_start}
-    duration_pred: [B, T, 1]  predicted hold duration in log-space
-    beat_logits:   [B, T, 1]  auxiliary "is this a beat?" pre-sigmoid
+    onset_logits:    [B, T, 1]  any-onset pre-sigmoid
+    sustain_logits:  [B, T, 1]  "any arrow currently held" pre-sigmoid
+    intensity_pred:  [B, T, 1]  continuous jump-vs-tap intensity (linear out)
     """
-
-    N_NOTE_TYPES = 3
-    TYPE_TAP = 0
-    TYPE_JUMP = 1
-    TYPE_HOLD_START = 2
-    N_ARROWS = 4
-    PREV_ARROW_DIM = 4 
-    TYPE_DUR_COND_DIM = N_ARROWS + 1 + N_ARROWS
-    DURATION_OFFSET: float = 0.05
 
     def __init__(
         self,
-        n_mels: int = 80,
-        hidden_dim: int = 256,
-        n_heads: int = 8,
-        n_transformer_layers: int = 4,
+        n_in_channels: int = 88,
+        hidden_dim: int = 160,
+        n_heads: int = 4,
+        n_transformer_layers: int = 3,
         n_difficulties: int = 5,
         dropout: float = 0.1,
-        tcn_dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32),
-        onset_head_layers: int = 3,
+        tcn_dilations: Tuple[int, ...] = (1, 2, 4, 8, 16),
+        head_layers: int = 2,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.n_in_channels = int(n_in_channels)
 
-        self.audio_encoder = AudioEncoder(n_mels, hidden_dim, dropout)
+        self.audio_encoder = AudioEncoder(n_in_channels, hidden_dim, dropout)
         self.tcn = DilatedTCN(hidden_dim, dilations=tcn_dilations, dropout=dropout)
         self.film = FiLMConditioner(n_difficulties, hidden_dim)
 
@@ -275,11 +275,9 @@ class StepChartModel(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_dim)
 
-        # Deeper arrow head: arrow prediction is the harder head, so give it
-        # extra capacity.
-        def _build_mlp_head(out_dim: int, n_hidden: int) -> nn.Sequential:
+        def _mlp_head(out_dim: int) -> nn.Sequential:
             layers: list = []
-            for _ in range(max(1, n_hidden)):
+            for _ in range(max(1, head_layers)):
                 layers.extend([
                     nn.Linear(hidden_dim, hidden_dim),
                     nn.GELU(),
@@ -288,299 +286,74 @@ class StepChartModel(nn.Module):
             layers.append(nn.Linear(hidden_dim, out_dim))
             return nn.Sequential(*layers)
 
-        # Arrow head: backbone feats + 4-dim prev_arrow vector → per-arrow
-        # logit
-        cond_layers: list = [
-            nn.Linear(hidden_dim + self.PREV_ARROW_DIM, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        ]
-        for _ in range(max(1, onset_head_layers) - 1):
-            cond_layers.extend([
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-        cond_layers.append(nn.Linear(hidden_dim, self.N_ARROWS))
-        self.arrow_head = nn.Sequential(*cond_layers)
+        self.onset_head = _mlp_head(1)
+        self.sustain_head = _mlp_head(1)
+        self.intensity_head = _mlp_head(1)
 
-        with torch.no_grad():
-            first_lin = self.arrow_head[0]
-            assert isinstance(first_lin, nn.Linear)
-            first_lin.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
+    def set_onset_prior(self, p: float) -> None:
+        """Bias-init the onset head's final layer to logit(p).
 
-        type_dur_in = hidden_dim + self.TYPE_DUR_COND_DIM
-        self.type_head = nn.Sequential(
-            nn.Linear(type_dur_in, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.N_NOTE_TYPES),
-        )
-
-        self.duration_head = nn.Sequential(
-            nn.Linear(type_dur_in, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-        with torch.no_grad():
-            for _head in (self.type_head, self.duration_head):
-                _first = _head[0]
-                assert isinstance(_first, nn.Linear)
-                _first.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
-
-        self.beat_head = _build_mlp_head(1, onset_head_layers)
-
-        # Hold head: backbone feats + 4-dim sigmoid(cond_arrow_logits.detach())
-        # → per-arrow in-hold logit. Without arrow conditioning the head only
-        # sees the backbone's encoding and has to derive "an arrow recently
-        # fired" from audio alone — a span-state task the audio doesn't carry
-        # explicitly. Feeding the same cond_arrow signal the type/duration
-        # heads use gives the head an explicit "is anything firing here"
-        # input, mirroring how the arrow head consumes prev_arrow.
-        hold_layers: list = [
-            nn.Linear(hidden_dim + self.N_ARROWS, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        ]
-        for _ in range(max(1, onset_head_layers) - 1):
-            hold_layers.extend([
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-        hold_layers.append(nn.Linear(hidden_dim, self.N_ARROWS))
-        self.hold_head = nn.Sequential(*hold_layers)
-        with torch.no_grad():
-            hold_first = self.hold_head[0]
-            assert isinstance(hold_first, nn.Linear)
-            hold_first.weight[:, hidden_dim:].uniform_(-0.02, 0.02)
-
-    def set_arrow_priors(self, priors) -> None:
-        priors = torch.as_tensor(list(priors), dtype=torch.float32)
-        assert priors.numel() == self.N_ARROWS, (
-            f"expected {self.N_ARROWS} priors, got {priors.numel()}"
-        )
-        priors = priors.clamp(min=1e-4, max=0.999)
-        bias = torch.log(priors / (1.0 - priors))
-        final = self.arrow_head[-1]
-        assert isinstance(final, nn.Linear)
-        with torch.no_grad():
-            final.bias.copy_(bias)
-
-    def set_hold_priors(self, priors) -> None:
-        priors = torch.as_tensor(list(priors), dtype=torch.float32)
-        assert priors.numel() == self.N_ARROWS, (
-            f"expected {self.N_ARROWS} priors, got {priors.numel()}"
-        )
-        priors = priors.clamp(min=1e-4, max=0.999)
-        bias = torch.log(priors / (1.0 - priors))
-        final = self.hold_head[-1]
-        assert isinstance(final, nn.Linear)
-        with torch.no_grad():
-            final.bias.copy_(bias)
-
-    def set_beat_prior(self, p: float) -> None:
-        """Initialize the beat head's final bias to logit(p).
-
-        Beats are denser than onsets (~120-180 BPM × songs) — typically 1-3%
-        of frames at 100 fps depending on tempo. Anchoring the head at the
-        empirical rate gives the auxiliary task a sane starting point.
+        Anchors the freshly-built model at the empirical onset rate so the
+        BCE doesn't spend its first few epochs just reaching the prior.
         """
         p = float(max(min(p, 0.999), 1e-4))
         bias = math.log(p / (1.0 - p))
-        final = self.beat_head[-1]
+        final = self.onset_head[-1]
         assert isinstance(final, nn.Linear)
         nn.init.constant_(final.bias, bias)
 
-    @classmethod
-    def encode_duration(cls, seconds: torch.Tensor) -> torch.Tensor:
-        """Convert a (batch of) duration in seconds to the log-space target."""
-        return torch.log(seconds.clamp_min(0.0) + cls.DURATION_OFFSET)
-
-    @classmethod
-    def decode_duration(cls, log_value):
-        """Inverse of `encode_duration`. Accepts torch tensor or numpy array."""
-        if isinstance(log_value, torch.Tensor):
-            return torch.exp(log_value) - cls.DURATION_OFFSET
-        import numpy as _np
-        return _np.exp(log_value) - cls.DURATION_OFFSET
-
-    def set_duration_prior(self, median_seconds: float) -> None:
-        """Initialize the duration head's final bias to log(median+offset).
-
-        Call once after construction with the empirical median hold duration.
-        Without this, the freshly-built model emits ~0 (= 1s after decode),
-        which is a fine starting guess but converges slowly. Anchoring to
-        the corpus median saves several epochs of "find the right scale".
-        """
-        median_seconds = float(max(median_seconds, 0.0))
-        bias = math.log(median_seconds + self.DURATION_OFFSET)
-        final = self.duration_head[-1]
+    def set_sustain_prior(self, p: float) -> None:
+        """Bias-init the sustain head to logit(p) (any-arrow in-hold rate)."""
+        p = float(max(min(p, 0.999), 1e-4))
+        bias = math.log(p / (1.0 - p))
+        final = self.sustain_head[-1]
         assert isinstance(final, nn.Linear)
         nn.init.constant_(final.bias, bias)
-
-    def set_type_prior(self, priors) -> None:
-        """Initialize the type head's final bias to log(prior) per class.
-
-        priors: iterable of length N_NOTE_TYPES giving P(class | onset)
-            for {tap, jump, hold_start}. With this init, a freshly built
-            model produces softmax probabilities matching the empirical
-            class distribution at step 0, which is the right starting
-            point on a heavily imbalanced 3-way head.
-        """
-        priors = torch.as_tensor(list(priors), dtype=torch.float32)
-        assert priors.numel() == self.N_NOTE_TYPES, (
-            f"expected {self.N_NOTE_TYPES} priors, got {priors.numel()}"
-        )
-        priors = priors.clamp_min(1e-6)
-        priors = priors / priors.sum()
-        log_priors = torch.log(priors)
-        final = self.type_head[-1]
-        assert isinstance(final, nn.Linear)
-        with torch.no_grad():
-            final.bias.copy_(log_priors)
 
     def encode(
         self,
-        mel: torch.Tensor,
+        feats: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
     ) -> torch.Tensor:
-        """Backbone-only forward. Returns per-frame features [B, T, H].
-
-        Inference uses this to share backbone work across calls that vary only
-        the prev_arrow conditioning input (sequential arrow decoding). Training
-        still goes through the full `forward`.
-        """
-        x = self.audio_encoder(mel)
+        """Backbone forward. [B, T, n_in_channels] -> [B, T, H]."""
+        x = self.audio_encoder(feats)
         x = self.tcn(x)
         x = self.film(x, difficulty, density, start_seconds, remaining_seconds)
         for blk in self.blocks:
             x = blk(x)
         return self.norm(x)
 
-    def apply_arrow_head(
-        self, features: torch.Tensor, prev_arrow: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Arrow head, given backbone features. [B, T, H] -> [B, T, 4]."""
-        if prev_arrow is None:
-            prev_arrow = features.new_zeros(
-                features.size(0), features.size(1), self.PREV_ARROW_DIM,
-            )
-        arrow_in = torch.cat([features, prev_arrow], dim=-1)
-        return self.arrow_head(arrow_in)
-
-    def _type_dur_cond(
-        self,
-        arrow_logits: torch.Tensor,
-        beat_logits: torch.Tensor,
-        hold_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build the conditioning tensor fed into type/duration heads.
-
-        Returns [..., TYPE_DUR_COND_DIM] = sigmoid(arrow_logits) ⊕
-        sigmoid(beat_logits) ⊕ sigmoid(hold_logits). Callers should pass
-        detached logits at training time so the type/duration losses don't
-        backprop into the arrow/beat/hold heads (those have their own
-        well-shaped supervision).
-        """
-        arrow_p = torch.sigmoid(arrow_logits)
-        beat_p = torch.sigmoid(beat_logits)
-        hold_p = torch.sigmoid(hold_logits)
-        return torch.cat([arrow_p, beat_p, hold_p], dim=-1)
-
-    def apply_type_head(
-        self,
-        features: torch.Tensor,
-        arrow_logits: torch.Tensor,
-        beat_logits: torch.Tensor,
-        hold_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        cond = self._type_dur_cond(arrow_logits, beat_logits, hold_logits)
-        return self.type_head(torch.cat([features, cond], dim=-1))
-
-    def apply_duration_head(
-        self,
-        features: torch.Tensor,
-        arrow_logits: torch.Tensor,
-        beat_logits: torch.Tensor,
-        hold_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        cond = self._type_dur_cond(arrow_logits, beat_logits, hold_logits)
-        return self.duration_head(torch.cat([features, cond], dim=-1))
-
-    def apply_beat_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.beat_head(features)
-
-    def apply_hold_head(
-        self, features: torch.Tensor, arrow_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Hold head, conditioned on sigmoid(arrow_logits).
-
-        Callers should pass detached zero-context arrow logits (`prev_arrow=
-        zeros`) so the hold loss doesn't backprop into the arrow head and
-        the train-time distribution matches inference Phase 1.
-        """
-        arrow_p = torch.sigmoid(arrow_logits)
-        return self.hold_head(torch.cat([features, arrow_p], dim=-1))
-
     def forward(
         self,
-        mel: torch.Tensor,
+        feats: torch.Tensor,
         difficulty: torch.Tensor,
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
-        prev_arrow: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            mel: [B, T, n_mels]
+            feats: [B, T, n_in_channels]
             difficulty: [B] long
             density: [B] float (normalized)
-            start_seconds: [B] float — chunk's start time from song start (seconds)
-            remaining_seconds: [B] float — song length minus chunk end time (seconds)
-            prev_arrow: [B, T, 4] float — per-frame "previous emitted arrow"
-                vector for the arrow head's transition conditioning. If None
-                (legacy callers / one-shot inference), zeros are used —
-                equivalent to "no prior context".
+            start_seconds: [B] float
+            remaining_seconds: [B] float
 
         Returns:
-            arrow_logits:  [B, T, 4]  per-arrow {L, D, U, R} pre-sigmoid
-            type_logits:   [B, T, 3]  {tap, jump, hold_start}
-            duration_pred: [B, T, 1]  log-space scalar; decode via `decode_duration`
-            beat_logits:   [B, T, 1]  auxiliary beat-frame prediction (pre-sigmoid)
-            hold_logits:   [B, T, 4]  per-arrow "is this frame mid-hold?" pre-sigmoid
+            onset_logits:    [B, T, 1] pre-sigmoid
+            sustain_logits:  [B, T, 1] pre-sigmoid
+            intensity_pred:  [B, T, 1] linear regression output
         """
         features = self.encode(
-            mel, difficulty, density, start_seconds, remaining_seconds,
-        )                                                       # [B, T, H]
-        arrow_logits = self.apply_arrow_head(features, prev_arrow)
-        beat_logits = self.apply_beat_head(features)
-        # Zero-context arrow logits drive both the hold head's conditioning
-        # and the type/duration heads' conditioning, matching inference
-        # Phase 1 (`prev_arrow=None`). If `prev_arrow` was already zeros at
-        # the call site, `arrow_logits` is itself zero-context and we reuse
-        # it; otherwise we recompute (cheap — the arrow head is a 3-layer MLP).
-        if prev_arrow is not None:
-            zero_prev = torch.zeros_like(prev_arrow)
-            cond_arrow_logits = self.apply_arrow_head(features, zero_prev)
-        else:
-            cond_arrow_logits = arrow_logits
-        hold_logits = self.apply_hold_head(features, cond_arrow_logits.detach())
-        type_logits = self.apply_type_head(
-            features, cond_arrow_logits.detach(),
-            beat_logits.detach(), hold_logits.detach(),
+            feats, difficulty, density, start_seconds, remaining_seconds,
         )
-        duration_pred = self.apply_duration_head(
-            features, cond_arrow_logits.detach(),
-            beat_logits.detach(), hold_logits.detach(),
-        )
-        return arrow_logits, type_logits, duration_pred, beat_logits, hold_logits
+        onset_logits = self.onset_head(features)
+        sustain_logits = self.sustain_head(features)
+        intensity_pred = self.intensity_head(features)
+        return onset_logits, sustain_logits, intensity_pred
 
 
 # ---------------------------------------------------------------------------
@@ -589,370 +362,70 @@ class StepChartModel(nn.Module):
 
 class StepChartLoss(nn.Module):
     """
-    Combined loss:
-        - per-arrow BCEWithLogits with per-arrow pos_weight on soft
-          (Gaussian-smoothed) targets
-            arrow_logits: [B, T, 4], arrow_soft: [B, T, 4]
-        - diversity KL: per-chunk arrow distribution should match the target
-          arrow distribution; punishes mode collapse to one arrow
-        - 3-way cross-entropy on type head, masked to frames with an onset
-            type_logits: [B, T, 3], type_target: [B, T] long (-100 where no note)
-        - Smooth-L1 on duration head, masked to hold_start frames only
-            duration_pred: [B, T, 1], duration_target: [B, T] float (0 where no hold)
+    Combined v7 loss:
+        - focal BCE on onset_logits against Gaussian-smoothed any-onset target
+        - BCE on sustain_logits against dense in-any-hold target
+        - MSE on intensity_pred against jump-intensity target (smeared)
     """
-
-    HOLD_START_CLASS = 2  # type target class index for hold_start
-    # Duration loss is supervised on hold_start frames AND a small ±N-frame
-    # window around them (using the same target). This 5×s the gradient
-    # signal on a head that otherwise sees ~0.09% of frames per batch.
-    DURATION_WINDOW = 2  # frames either side of hold_start
 
     def __init__(
         self,
-        pos_weight=10.0,
-        type_weight: float = 1.0,
-        duration_weight: float = 1.0,
-        type_class_weights: Optional[torch.Tensor] = None,
-        focal_gamma: float = 0.0,
-        type_focal_gamma: float = 0.0,
-        beat_weight: float = 0.0,
-        beat_pos_weight: float = 10.0,
-        diversity_weight: float = 0.2,
-        commit_weight: float = 0.5,
-        jack_weight: float = 0.3,
-        jack_strides: Tuple[int, ...] = (3, 6, 9),
-        jack_stride_decay: float = 0.5,
-        jump_cofire_weight: float = 0.5,
-        hold_weight: float = 0.3,
-        hold_pos_weight: Optional[torch.Tensor] = None,
+        onset_pos_weight: float = 10.0,
+        sustain_pos_weight: float = 5.0,
+        focal_gamma: float = 2.0,
+        sustain_weight: float = 0.5,
+        intensity_weight: float = 0.5,
     ):
         super().__init__()
-        # Per-arrow pos_weight: scalar broadcasts across the 4 arrows; a
-        # length-4 tensor sets a distinct weight per arrow (recommended —
-        # outer arrows L/R fire ~2× as often as D/U in DDR data, so a uniform
-        # scalar over-weights D/U positives).
-        pw = torch.as_tensor(pos_weight, dtype=torch.float32)
-        if pw.ndim == 0:
-            pw = pw.expand(4).clone()
-        assert pw.numel() == 4, f"pos_weight must be scalar or length-4, got {pw.shape}"
-        self.register_buffer('pos_weight', pw)
-        self.register_buffer('beat_pos_weight', torch.tensor(float(beat_pos_weight)))
-        # Hold-head per-arrow BCE pos_weight. Defaults to a uniform 5.0 when
-        # not supplied (training derives this from per-arrow in-hold rate).
-        if hold_pos_weight is None:
-            hpw = torch.full((4,), 5.0, dtype=torch.float32)
-        else:
-            hpw = torch.as_tensor(hold_pos_weight, dtype=torch.float32)
-            if hpw.ndim == 0:
-                hpw = hpw.expand(4).clone()
-            assert hpw.numel() == 4, (
-                f"hold_pos_weight must be scalar or length-4, got {hpw.shape}"
-            )
-        self.register_buffer('hold_pos_weight', hpw)
-        self.type_weight = type_weight
-        self.duration_weight = duration_weight
-        self.beat_weight = float(beat_weight)
-        self.hold_weight = float(hold_weight)
-        self.diversity_weight = float(diversity_weight)
-        self.commit_weight = float(commit_weight)
-        self.jump_cofire_weight = float(jump_cofire_weight)
-        # Anti-jack penalty: discourages same-arrow argmax on pairs of
-        # co-active onset frames separated by any of `jack_strides` frames.
-        # Stride 3 is just outside the Gaussian onset-smoothing radius (~2
-        # frames at sigma=1.5) so we penalize distinct predicted events, not
-        # the same event spread across adjacent frames. Strides 6/9 catch
-        # 8th/16th-note jacks at 120–180 BPM that the σ=1.5 kernel masks at
-        # stride 3 alone. Per-stride contributions are weighted by
-        # `jack_stride_decay^k` (k=0,1,…) and averaged.
-        self.jack_weight = float(jack_weight)
-        if isinstance(jack_strides, int):
-            jack_strides = (int(jack_strides),)
-        self.jack_strides = tuple(int(s) for s in jack_strides)
-        self.jack_stride_decay = float(jack_stride_decay)
+        self.register_buffer(
+            'onset_pos_weight',
+            torch.tensor(float(onset_pos_weight), dtype=torch.float32),
+        )
+        self.register_buffer(
+            'sustain_pos_weight',
+            torch.tensor(float(sustain_pos_weight), dtype=torch.float32),
+        )
         self.focal_gamma = float(focal_gamma)
-        # Focal modulation on the type CE: down-weights confidently-correct
-        # frames so the rare jump/hold classes contribute relatively more
-        # gradient. With type_class_weights alone, easy taps still dominate
-        # the loss because there are 90× more of them than rare classes;
-        # focal weighting fixes that without changing the static weights.
-        self.type_focal_gamma = float(type_focal_gamma)
-        # Per-class CE weights for the type head ({tap, jump, hold_start}).
-        # Without these, the head collapses to "always predict tap" because
-        # taps dominate the imbalanced supervision. Registered as a buffer
-        # so it moves with .to(device) and survives state-dict round-trips.
-        if type_class_weights is None:
-            type_class_weights = torch.ones(3, dtype=torch.float32)
-        else:
-            type_class_weights = torch.as_tensor(
-                type_class_weights, dtype=torch.float32
-            )
-            assert type_class_weights.numel() == 3
-        self.register_buffer('type_class_weights', type_class_weights)
+        self.sustain_weight = float(sustain_weight)
+        self.intensity_weight = float(intensity_weight)
 
     def forward(
         self,
-        arrow_logits: torch.Tensor,    # [B, T, 4]
-        type_logits: torch.Tensor,     # [B, T, 3]
-        duration_pred: torch.Tensor,   # [B, T, 1]
-        arrow_soft: torch.Tensor,      # [B, T, 4] float in [0,1]
-        type_target: torch.Tensor,     # [B, T] long, -100 where no note
-        duration_target: torch.Tensor, # [B, T] float, dense remaining-beats target
-        beat_logits: Optional[torch.Tensor] = None,  # [B, T, 1] pre-sigmoid
-        beat_soft: Optional[torch.Tensor] = None,    # [B, T, 1] float in [0,1]
-        hold_logits: Optional[torch.Tensor] = None,  # [B, T, 4] pre-sigmoid
-        in_hold_target: Optional[torch.Tensor] = None,  # [B, T, 4] float in [0,1]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Per-arrow BCE. pos_weight is broadcast over [B, T, 4] from its [4]
-        # buffer — F.bce_with_logits handles the broadcast.
+        onset_logits: torch.Tensor,    # [B, T, 1]
+        sustain_logits: torch.Tensor,  # [B, T, 1]
+        intensity_pred: torch.Tensor,  # [B, T, 1]
+        onset_soft: torch.Tensor,      # [B, T, 1]
+        sustain_target: torch.Tensor,  # [B, T, 1]
+        intensity_target: torch.Tensor,  # [B, T, 1]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Focal BCE on onset.
         if self.focal_gamma > 0.0:
             bce = F.binary_cross_entropy_with_logits(
-                arrow_logits, arrow_soft, pos_weight=self.pos_weight,
+                onset_logits, onset_soft,
+                pos_weight=self.onset_pos_weight,
                 reduction='none',
             )
             with torch.no_grad():
-                p = torch.sigmoid(arrow_logits)
-                p_t = arrow_soft * p + (1.0 - arrow_soft) * (1.0 - p)
+                p = torch.sigmoid(onset_logits)
+                p_t = onset_soft * p + (1.0 - onset_soft) * (1.0 - p)
                 focal_w = (1.0 - p_t).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
-            arrow_loss = (focal_w * bce).mean()
+            onset_loss = (focal_w * bce).mean()
         else:
-            arrow_loss = F.binary_cross_entropy_with_logits(
-                arrow_logits, arrow_soft, pos_weight=self.pos_weight,
+            onset_loss = F.binary_cross_entropy_with_logits(
+                onset_logits, onset_soft,
+                pos_weight=self.onset_pos_weight,
             )
 
-        # Jump co-fire term: rewards the joint event "≥2 arrows fire at the
-        # same frame" that the per-arrow BCE marginal can't see. P(L)·P(R)
-        # caps out at the product of marginals, so independent BCE never
-        # directly pulls the model toward firing both arrows together — this
-        # term adds an extra negative-log-prob on the firing arrows of each
-        # ground-truth jump frame, mechanically equivalent to "extra BCE on
-        # positive arrows of jump frames".
-        if self.jump_cofire_weight > 0.0:
-            with torch.no_grad():
-                jump_mask = (arrow_soft >= 0.5).sum(-1) >= 2  # [B, T]
-            if jump_mask.any():
-                jp_log_probs = F.logsigmoid(arrow_logits[jump_mask])         # [N, 4]
-                jp_hard = (arrow_soft[jump_mask] >= 0.5).float()             # [N, 4]
-                jump_cofire_loss = -(jp_log_probs * jp_hard).sum(-1).mean()
-                arrow_loss = arrow_loss + self.jump_cofire_weight * jump_cofire_loss
-
-        # Per-frame commit CE: on frames where exactly one arrow fires, treat
-        # the 4 arrow logits as a 4-way softmax and CE against the firing
-        # arrow index. Per-arrow BCE alone is satisfied by predicting the
-        # marginal at every onset (no per-frame commitment required), which
-        # is the local minimum that pins stream coherence. Softmax CE forces
-        # the head to *pick* an arrow per onset frame.
-        if self.commit_weight > 0.0:
-            with torch.no_grad():
-                arrow_hard = (arrow_soft >= 0.5).float()
-                n_fire = arrow_hard.sum(dim=-1)
-                single_mask = (n_fire == 1.0)
-            if single_mask.any():
-                target_idx = arrow_hard.argmax(dim=-1)
-                commit_ce = F.cross_entropy(
-                    arrow_logits[single_mask],
-                    target_idx[single_mask],
-                )
-            else:
-                commit_ce = arrow_logits.sum() * 0.0
-            arrow_loss = arrow_loss + self.commit_weight * commit_ce
-
-        # Anti-jack penalty: at pairs of co-active onset frames separated by
-        # any of `self.jack_strides`, penalize the inner product of
-        # softmax(arrow_logits) — i.e. the probability that the model picks
-        # the *same* arrow at both frames. Anchored on ground-truth onsets
-        # (smoothed peak >= 0.5) and gated by the model's predicted onset
-        # confidence so we only penalize frames the model itself is
-        # committing to as events.
-        #
-        # Strides 6/9 catch 8th/16th-note jacks at 120–180 BPM that the
-        # σ=1.5 onset-smoothing kernel masks at stride 3 alone. Per-stride
-        # contributions are weighted by `jack_stride_decay^k` and averaged.
-        #
-        # When the labels actually contain a jack (L→L), the per-frame commit
-        # CE above already pulls the model toward L at both frames, so the
-        # jack penalty trades off against — but does not override — real
-        # supervision. Empirically this only suppresses *unsupervised* jacks
-        # that emerge from marginal-matching on the per-arrow head.
-        if self.jack_weight > 0.0 and self.jack_strides:
-            with torch.no_grad():
-                soft_any = arrow_soft.max(dim=-1).values  # [B, T]
-                pred_any = torch.sigmoid(arrow_logits).max(dim=-1).values
-            jack_components = []
-            jack_weights = []
-            T_dim = arrow_logits.size(1)
-            for k, stride in enumerate(self.jack_strides):
-                if stride <= 0 or stride >= T_dim:
-                    continue
-                with torch.no_grad():
-                    gt_pair = (
-                        (soft_any[:, :-stride] >= 0.5)
-                        & (soft_any[:, stride:] >= 0.5)
-                    ).float()                                    # [B, T-s]
-                    pred_gate = pred_any[:, :-stride] * pred_any[:, stride:]
-                    gate = gt_pair * pred_gate
-                    gate_norm = gate.sum().clamp_min(1.0)
-                prev_probs = F.softmax(arrow_logits[:, :-stride], dim=-1)
-                cur_probs = F.softmax(arrow_logits[:, stride:], dim=-1)
-                same_arrow_prob = (prev_probs * cur_probs).sum(dim=-1)  # [B, T-s]
-                stride_loss = (gate * same_arrow_prob).sum() / gate_norm
-                w = self.jack_stride_decay ** k
-                jack_components.append(w * stride_loss)
-                jack_weights.append(w)
-            if jack_components:
-                w_sum = sum(jack_weights)
-                jack_loss = sum(jack_components) / max(w_sum, 1e-8)
-                arrow_loss = arrow_loss + self.jack_weight * jack_loss
-
-        # Diversity regularizer: KL(target_dist || pred_dist) on per-chunk
-        # average arrow probabilities. Punishes "always L/R" collapse —
-        # if the target chunk is balanced across 4 arrows but predictions
-        # concentrate on two, the KL is high. Skipped on chunks where the
-        # ground truth has no onsets at all (denominator is zero).
-        with torch.no_grad():
-            true_norm = arrow_soft.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
-            true_dist = arrow_soft.sum(dim=1, keepdim=True) / true_norm   # [B, 1, 4]
-            target_total = arrow_soft.sum(dim=(1, 2))                     # [B]
-        pred_probs = torch.sigmoid(arrow_logits)                          # [B, T, 4]
-        pred_norm = pred_probs.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
-        pred_dist = pred_probs.sum(dim=1, keepdim=True) / pred_norm       # [B, 1, 4]
-        eps = 1e-6
-        kl_per_chunk = (
-            true_dist * (true_dist.clamp_min(eps).log() - pred_dist.clamp_min(eps).log())
-        ).sum(dim=-1).squeeze(1)                                          # [B]
-        valid_chunks = (target_total > 0).float()
-        if valid_chunks.sum() > 0:
-            diversity_loss = (kl_per_chunk * valid_chunks).sum() / valid_chunks.sum()
-        else:
-            diversity_loss = torch.zeros((), device=arrow_logits.device)
-
-        B, T, C = type_logits.shape
-        type_flat = type_logits.reshape(-1, C)
-        target_flat = type_target.reshape(-1)
-        if self.type_focal_gamma > 0.0:
-            # Per-frame CE so we can reweight by (1 - p_t)^gamma. The
-            # static class weights are already baked into ce_per_frame.
-            ce_per_frame = F.cross_entropy(
-                type_flat, target_flat,
-                weight=self.type_class_weights,
-                ignore_index=-100,
-                reduction='none',
-            )
-            valid = target_flat != -100
-            if valid.any():
-                with torch.no_grad():
-                    log_p = F.log_softmax(type_flat[valid], dim=-1)
-                    p_t = log_p.gather(
-                        1, target_flat[valid].unsqueeze(-1)
-                    ).squeeze(-1).exp()
-                    focal_w = (1.0 - p_t).clamp_(min=0.0, max=1.0).pow(
-                        self.type_focal_gamma
-                    )
-                # `cross_entropy(reduction='none', ignore_index=-100)` returns 0
-                # at ignored positions, so the unmasked mean is correct.
-                ce_valid = ce_per_frame[valid]
-                type_loss = (focal_w * ce_valid).mean()
-            else:
-                type_loss = ce_per_frame.sum() * 0.0
-        else:
-            # Guard against fully-masked batches. MixUp sets every frame's
-            # type target to -100, and `F.cross_entropy(reduction='mean',
-            # ignore_index=-100)` returns NaN when zero frames are valid
-            # (sum / count = 0 / 0). The focal branch above handles this
-            # explicitly; we need the same guard here. Without it, the
-            # mean-over-epoch type loss reports NaN and GradScaler silently
-            # skips the affected batches.
-            valid = target_flat != -100
-            if valid.any():
-                type_loss = F.cross_entropy(
-                    type_flat, target_flat,
-                    weight=self.type_class_weights,
-                    ignore_index=-100,
-                )
-            else:
-                type_loss = type_flat.sum() * 0.0
-
-        # Duration loss: log-space smooth-L1 on a ±DURATION_WINDOW window
-        # around each hold_start frame. The dense `remaining_beats` target
-        # the dataloader produces is *total_dur* exactly at the hold_start
-        # frame (taper starts at 1.0), so we mask by `type_target == hold`
-        # and supervise on those frames + ±W neighbors using the value at
-        # the hold_start frame. (Earlier v5 iterations supervised every
-        # in-hold frame with the per-frame remaining value, but eval reads
-        # the head at hold_start — and with no positional signal in the
-        # head's input, dense supervision pulled predictions toward the
-        # span mean ≈ total/2, which doubled dur_mae. The hold_head still
-        # consumes the dense `in_hold_target` via BCE — that's where the
-        # extra signal goes.)
-        hold_start_mask = (type_target == self.HOLD_START_CLASS)  # [B, T]
-        if hold_start_mask.any():
-            window = self.DURATION_WINDOW
-            base = duration_target * hold_start_mask.float()
-            window_mask = hold_start_mask.clone()
-            window_target = base.clone()
-            for offset in range(1, window + 1):
-                # Right shift: copy hold_start contributions to t+offset
-                window_mask[:, offset:] |= hold_start_mask[:, :-offset]
-                window_target[:, offset:] = torch.where(
-                    hold_start_mask[:, :-offset],
-                    base[:, :-offset],
-                    window_target[:, offset:],
-                )
-                # Left shift: copy to t-offset
-                window_mask[:, :-offset] |= hold_start_mask[:, offset:]
-                window_target[:, :-offset] = torch.where(
-                    hold_start_mask[:, offset:],
-                    base[:, offset:],
-                    window_target[:, :-offset],
-                )
-            pred_log = duration_pred[:, :, 0][window_mask]
-            true_log = StepChartModel.encode_duration(window_target[window_mask])
-            dur_loss = F.smooth_l1_loss(pred_log, true_log)
-        else:
-            dur_loss = torch.tensor(0.0, device=arrow_logits.device)
-
-        # Auxiliary beat-frame BCE. The beat target is dense and structured
-        # (1-3% of frames depending on tempo), so a moderate pos_weight is
-        # sufficient — no focal needed. Skipped if beat targets weren't
-        # supplied (e.g., legacy datasets without `beats`).
-        if (
-            self.beat_weight > 0.0
-            and beat_logits is not None
-            and beat_soft is not None
-        ):
-            beat_loss = F.binary_cross_entropy_with_logits(
-                beat_logits, beat_soft, pos_weight=self.beat_pos_weight,
-            )
-        else:
-            beat_loss = torch.zeros((), device=arrow_logits.device)
-
-        # Per-arrow hold BCE on the dense in_hold target. Per-arrow
-        # pos_weight compensates for the ~3% per-arrow positive rate so the
-        # head doesn't collapse to "predict no hold". This is the densest
-        # hold-related supervision in the model — feeds the conditioning of
-        # the type/duration heads as well.
-        if (
-            self.hold_weight > 0.0
-            and hold_logits is not None
-            and in_hold_target is not None
-        ):
-            hold_loss = F.binary_cross_entropy_with_logits(
-                hold_logits, in_hold_target, pos_weight=self.hold_pos_weight,
-            )
-        else:
-            hold_loss = torch.zeros((), device=arrow_logits.device)
-
-        total = (arrow_loss
-                 + self.type_weight * type_loss
-                 + self.duration_weight * dur_loss
-                 + self.beat_weight * beat_loss
-                 + self.hold_weight * hold_loss
-                 + self.diversity_weight * diversity_loss)
-        return (
-            total,
-            arrow_loss.detach(),
-            type_loss.detach(),
-            dur_loss.detach(),
-            beat_loss.detach(),
-            diversity_loss.detach(),
-            hold_loss.detach(),
+        sustain_loss = F.binary_cross_entropy_with_logits(
+            sustain_logits, sustain_target,
+            pos_weight=self.sustain_pos_weight,
         )
+
+        intensity_loss = F.mse_loss(intensity_pred, intensity_target)
+
+        total = (
+            onset_loss
+            + self.sustain_weight * sustain_loss
+            + self.intensity_weight * intensity_loss
+        )
+        return total, onset_loss.detach(), sustain_loss.detach(), intensity_loss.detach()
