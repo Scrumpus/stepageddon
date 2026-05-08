@@ -913,11 +913,13 @@ class MLChartGenerator:
             remaining = max(0, target_notes - len(holds))
             note_events = holds + taps[:remaining]
 
-        # Beat-snap: anchor each event to the nearest librosa beat and try
-        # both binary (16th) and ternary (12th) grids local to that beat.
-        # Pick whichever fits closer. A small bias against the triplet grid
-        # keeps incidental near-12th positions from getting mislabeled in
-        # otherwise-binary songs.
+        # Beat-snap: anchor each event to the nearest librosa beat, enumerate
+        # candidate cells {4th, 8th, 16th, 12th} within that beat, and pick
+        # the one with the smallest effective distance (real distance plus a
+        # priority penalty 4th < 8th < 16th < 12th). If the chosen cell time
+        # collides with a recently-snapped event's cell, escalate to the next
+        # candidate so the two events spread across subdivisions instead of
+        # collapsing onto the same grid line.
         if self.snap_to_beats and len(beat_times) > 1:
             bts = np.asarray(beat_times, dtype=np.float64)
             intervals = np.diff(bts)
@@ -927,64 +929,74 @@ class MLChartGenerator:
             if intervals.size > 1:
                 local_interval[1:-1] = 0.5 * (intervals[:-1] + intervals[1:])
 
-            # Slot → subdivision lookup per grid divisor.
-            sub_by_slot_4 = (
-                BeatSubdivision.QUARTER, BeatSubdivision.SIXTEENTH,
-                BeatSubdivision.EIGHTH, BeatSubdivision.SIXTEENTH,
-            )
-            sub_by_slot_3 = (
-                BeatSubdivision.QUARTER, BeatSubdivision.TWELFTH,
-                BeatSubdivision.TWELFTH,
-            )
+            # (fraction-within-beat, subdivision label, priority index).
+            BEAT_CELLS = [
+                (0.0,       BeatSubdivision.QUARTER,    0),
+                (0.5,       BeatSubdivision.EIGHTH,     1),
+                (0.25,      BeatSubdivision.SIXTEENTH,  2),
+                (0.75,      BeatSubdivision.SIXTEENTH,  2),
+                (1.0 / 3.0, BeatSubdivision.TWELFTH,    3),
+                (2.0 / 3.0, BeatSubdivision.TWELFTH,    3),
+            ]
+            # Penalty per priority step, scaled by local 16th cell width.
+            # 0.20 keeps a clean triplet (real_dist≈0) winning over a far
+            # 16th, while letting marginal-16th events stay binary.
+            PRIORITY_EPS_FRAC = 0.20
+            COLLISION_TOL = 1e-3  # seconds
+
+            note_events.sort(key=lambda e: e['time'])
+            recent_claims: List[float] = []
 
             for event in note_events:
                 t = float(event['time'])
                 idx = int(np.searchsorted(bts, t))
-                candidates = []
+                beat_idxs: List[int] = []
                 if idx > 0:
-                    candidates.append(idx - 1)
+                    beat_idxs.append(idx - 1)
                 if idx < bts.size:
-                    candidates.append(idx)
+                    beat_idxs.append(idx)
+                if not beat_idxs:
+                    continue
 
-                best_snapped = t
-                best_sub: Optional[BeatSubdivision] = None
-                best_dist = float('inf')
-                best_step_16 = float(local_interval[candidates[0]]) / 4.0
-                for c in candidates:
+                # Drop claims older than one beat from the current event so
+                # collision-avoidance stays a local effect.
+                step_16_local = float(local_interval[beat_idxs[0]]) / 4.0
+                cap = 0.5 * step_16_local
+                cutoff = t - float(local_interval[beat_idxs[0]])
+                recent_claims = [c for c in recent_claims if c >= cutoff]
+
+                # Build candidate list across nearby beats.
+                cands: List[Tuple[float, float, BeatSubdivision]] = []
+                for c in beat_idxs:
                     beat_t = float(bts[c])
                     interval = float(local_interval[c])
-                    step16 = interval / 4.0
-                    step12 = interval / 3.0
+                    eps = (interval / 4.0) * PRIORITY_EPS_FRAC
+                    for frac, sub, prio in BEAT_CELLS:
+                        cell_t = beat_t + frac * interval
+                        real = abs(t - cell_t)
+                        if real > cap:
+                            continue
+                        eff = real + eps * prio
+                        cands.append((eff, cell_t, sub))
 
-                    slot16 = int(round((t - beat_t) / step16))
-                    snap16 = beat_t + slot16 * step16
-                    dist16 = abs(t - snap16)
-                    sub16 = sub_by_slot_4[slot16 % 4]
+                if not cands:
+                    continue
 
-                    slot12 = int(round((t - beat_t) / step12))
-                    snap12 = beat_t + slot12 * step12
-                    dist12 = abs(t - snap12)
-                    sub12 = sub_by_slot_3[slot12 % 3]
+                cands.sort(key=lambda x: x[0])
 
-                    # Prefer 16th unless 12th is meaningfully closer.
-                    triplet_bias = 0.20 * step16
-                    if dist16 <= dist12 + triplet_bias:
-                        snapped, sub, dist, step_ref = snap16, sub16, dist16, step16
-                    else:
-                        snapped, sub, dist, step_ref = snap12, sub12, dist12, step16
+                chosen: Optional[Tuple[float, float, BeatSubdivision]] = None
+                for cand in cands:
+                    cell_t = cand[1]
+                    if any(abs(cell_t - r) < COLLISION_TOL for r in recent_claims):
+                        continue
+                    chosen = cand
+                    break
+                if chosen is None:
+                    chosen = cands[0]  # all in-range cells claimed; accept dup
 
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_snapped = snapped
-                        best_sub = sub
-                        best_step_16 = step_ref
-
-                # Cap snap radius at half a 16th of the local interval; beyond
-                # that, leave the event unsnapped — the subdivision fallback
-                # will guess from its raw position.
-                if best_dist <= 0.5 * best_step_16 and best_sub is not None:
-                    event['time'] = float(best_snapped)
-                    event['subdivision'] = best_sub
+                event['time'] = float(chosen[1])
+                event['subdivision'] = chosen[2]
+                recent_claims.append(chosen[1])
 
         # Sort and enforce min-gap.
         note_events.sort(key=lambda e: e['time'])
