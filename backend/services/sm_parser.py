@@ -120,8 +120,11 @@ def _beat_subdivision(beat) -> BeatSubdivision:
     frac = Fraction(beat).limit_denominator(192) % 1
     if frac == 0:
         return BeatSubdivision.QUARTER
-    if frac.denominator <= 2:
+    if frac.denominator == 2:
         return BeatSubdivision.EIGHTH
+    # Triplets: denominators 3, 6, 12 (frac 1/3, 2/3, 1/6, 5/6, 1/12, etc.)
+    if frac.denominator % 3 == 0:
+        return BeatSubdivision.TWELFTH
     return BeatSubdivision.SIXTEENTH
 
 

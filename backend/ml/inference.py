@@ -913,19 +913,78 @@ class MLChartGenerator:
             remaining = max(0, target_notes - len(holds))
             note_events = holds + taps[:remaining]
 
-        # Beat-snap.
+        # Beat-snap: anchor each event to the nearest librosa beat and try
+        # both binary (16th) and ternary (12th) grids local to that beat.
+        # Pick whichever fits closer. A small bias against the triplet grid
+        # keeps incidental near-12th positions from getting mislabeled in
+        # otherwise-binary songs.
         if self.snap_to_beats and len(beat_times) > 1:
-            beat_interval = 60.0 / tempo
-            grid = []
-            gt = beat_times[0] if len(beat_times) > 0 else 0.0
-            while gt <= duration:
-                grid.append(gt)
-                gt += beat_interval / 4
-            grid = np.array(grid)
+            bts = np.asarray(beat_times, dtype=np.float64)
+            intervals = np.diff(bts)
+            local_interval = np.empty_like(bts)
+            local_interval[0] = intervals[0]
+            local_interval[-1] = intervals[-1]
+            if intervals.size > 1:
+                local_interval[1:-1] = 0.5 * (intervals[:-1] + intervals[1:])
+
+            # Slot → subdivision lookup per grid divisor.
+            sub_by_slot_4 = (
+                BeatSubdivision.QUARTER, BeatSubdivision.SIXTEENTH,
+                BeatSubdivision.EIGHTH, BeatSubdivision.SIXTEENTH,
+            )
+            sub_by_slot_3 = (
+                BeatSubdivision.QUARTER, BeatSubdivision.TWELFTH,
+                BeatSubdivision.TWELFTH,
+            )
+
             for event in note_events:
-                nearest_idx = int(np.argmin(np.abs(grid - event['time'])))
-                event['time'] = float(grid[nearest_idx])
-                event['grid_idx'] = nearest_idx
+                t = float(event['time'])
+                idx = int(np.searchsorted(bts, t))
+                candidates = []
+                if idx > 0:
+                    candidates.append(idx - 1)
+                if idx < bts.size:
+                    candidates.append(idx)
+
+                best_snapped = t
+                best_sub: Optional[BeatSubdivision] = None
+                best_dist = float('inf')
+                best_step_16 = float(local_interval[candidates[0]]) / 4.0
+                for c in candidates:
+                    beat_t = float(bts[c])
+                    interval = float(local_interval[c])
+                    step16 = interval / 4.0
+                    step12 = interval / 3.0
+
+                    slot16 = int(round((t - beat_t) / step16))
+                    snap16 = beat_t + slot16 * step16
+                    dist16 = abs(t - snap16)
+                    sub16 = sub_by_slot_4[slot16 % 4]
+
+                    slot12 = int(round((t - beat_t) / step12))
+                    snap12 = beat_t + slot12 * step12
+                    dist12 = abs(t - snap12)
+                    sub12 = sub_by_slot_3[slot12 % 3]
+
+                    # Prefer 16th unless 12th is meaningfully closer.
+                    triplet_bias = 0.20 * step16
+                    if dist16 <= dist12 + triplet_bias:
+                        snapped, sub, dist, step_ref = snap16, sub16, dist16, step16
+                    else:
+                        snapped, sub, dist, step_ref = snap12, sub12, dist12, step16
+
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_snapped = snapped
+                        best_sub = sub
+                        best_step_16 = step_ref
+
+                # Cap snap radius at half a 16th of the local interval; beyond
+                # that, leave the event unsnapped — the subdivision fallback
+                # will guess from its raw position.
+                if best_dist <= 0.5 * best_step_16 and best_sub is not None:
+                    event['time'] = float(best_snapped)
+                    event['subdivision'] = best_sub
 
         # Sort and enforce min-gap.
         note_events.sort(key=lambda e: e['time'])
@@ -974,8 +1033,8 @@ class MLChartGenerator:
 
         for i, event in enumerate(note_events):
             t = round(event['time'], 3)
-            subdivision = self._subdivision_from_grid(
-                event.get('grid_idx'), t, tempo, beat_times,
+            subdivision = event.get('subdivision') or self._subdivision_from_grid(
+                t, tempo, beat_times,
             )
             frame_idx = int(round(t * FRAMES_PER_SECOND))
             frame_idx = max(0, min(frame_idx, T - 1))
@@ -1034,29 +1093,30 @@ class MLChartGenerator:
 
         return steps
 
-    _SUBDIVISION_BY_SLOT = (
-        BeatSubdivision.QUARTER,
-        BeatSubdivision.SIXTEENTH,
-        BeatSubdivision.EIGHTH,
-        BeatSubdivision.SIXTEENTH,
-    )
-
     def _subdivision_from_grid(
         self,
-        grid_idx: Optional[int],
         time: float,
         tempo: float,
         beat_times: np.ndarray,
     ) -> BeatSubdivision:
-        if grid_idx is not None:
-            return self._SUBDIVISION_BY_SLOT[grid_idx % 4]
-
+        """Positional fallback for events that didn't snap to a beat-anchored
+        grid cell (too far from any beat or beat tracking unavailable)."""
         if len(beat_times) == 0 or tempo <= 0:
             return BeatSubdivision.QUARTER
 
         beat_interval = 60.0 / tempo
         anchor = float(beat_times[0])
         beat_position = ((time - anchor) % beat_interval) / beat_interval
+
+        # Triplet positions (1/3, 2/3) win when within 1/24 of a beat. The
+        # 1/24 band sits exactly halfway between the 16th grid (1/4, 3/4)
+        # and the 12th grid (1/3, 2/3).
+        TRIPLET_BAND = 1.0 / 24.0
+        if (
+            abs(beat_position - 1.0 / 3.0) < TRIPLET_BAND
+            or abs(beat_position - 2.0 / 3.0) < TRIPLET_BAND
+        ):
+            return BeatSubdivision.TWELFTH
 
         if beat_position < 0.125 or beat_position > 0.875:
             return BeatSubdivision.QUARTER

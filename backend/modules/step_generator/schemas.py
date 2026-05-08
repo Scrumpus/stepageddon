@@ -49,6 +49,7 @@ class BeatSubdivision(str, Enum):
     """Beat subdivision for note coloring (DDR-style)."""
     QUARTER = "4th"
     EIGHTH = "8th"
+    TWELFTH = "12th"
     SIXTEENTH = "16th"
 
 
