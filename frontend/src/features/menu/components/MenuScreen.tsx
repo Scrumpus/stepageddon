@@ -26,7 +26,7 @@ function MenuScreen() {
         {/* Title */}
         <div className="text-center mb-4">
           <h1 className="text-6xl font-bold mb-4 text-game-primary">
-            Stepageddon
+            
           </h1>
         </div>
 

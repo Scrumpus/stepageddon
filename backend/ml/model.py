@@ -364,7 +364,7 @@ class StepChartLoss(nn.Module):
     """
     Combined v7 loss:
         - focal BCE on onset_logits against Gaussian-smoothed any-onset target
-        - BCE on sustain_logits against dense in-any-hold target
+        - focal BCE on sustain_logits against dense in-any-hold target
         - MSE on intensity_pred against jump-intensity target (smeared)
     """
 
@@ -373,7 +373,7 @@ class StepChartLoss(nn.Module):
         onset_pos_weight: float = 10.0,
         sustain_pos_weight: float = 5.0,
         focal_gamma: float = 2.0,
-        sustain_weight: float = 0.5,
+        sustain_weight: float = 1.0,
         intensity_weight: float = 0.5,
     ):
         super().__init__()
@@ -416,10 +416,22 @@ class StepChartLoss(nn.Module):
                 pos_weight=self.onset_pos_weight,
             )
 
-        sustain_loss = F.binary_cross_entropy_with_logits(
-            sustain_logits, sustain_target,
-            pos_weight=self.sustain_pos_weight,
-        )
+        if self.focal_gamma > 0.0:
+            bce_s = F.binary_cross_entropy_with_logits(
+                sustain_logits, sustain_target,
+                pos_weight=self.sustain_pos_weight,
+                reduction='none',
+            )
+            with torch.no_grad():
+                p_s = torch.sigmoid(sustain_logits)
+                p_t_s = sustain_target * p_s + (1.0 - sustain_target) * (1.0 - p_s)
+                focal_w_s = (1.0 - p_t_s).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
+            sustain_loss = (focal_w_s * bce_s).mean()
+        else:
+            sustain_loss = F.binary_cross_entropy_with_logits(
+                sustain_logits, sustain_target,
+                pos_weight=self.sustain_pos_weight,
+            )
 
         intensity_loss = F.mse_loss(intensity_pred, intensity_target)
 

@@ -412,6 +412,26 @@ def _f1_at_threshold(
     return prec, rec, f1
 
 
+def _hysteresis_segments(p: np.ndarray, up: float, down: float) -> np.ndarray:
+    """Forward-pass hysteresis. Latches True when p>=up, releases when p<down.
+
+    Frames with down <= p < up carry the prior state (False at start of array).
+    Mirrors the inference-time sustain decoder so val F1 reflects deployed behavior.
+    """
+    if p.size == 0:
+        return np.zeros(0, dtype=bool)
+    entry = p >= up
+    exit_ = p < down
+    events = np.where(entry, 1, np.where(exit_, 0, -1))
+    known = events != -1
+    last_known_idx = np.where(known, np.arange(events.size), -1)
+    np.maximum.accumulate(last_known_idx, out=last_known_idx)
+    out = np.zeros(events.size, dtype=bool)
+    has_prior = last_known_idx >= 0
+    out[has_prior] = events[last_known_idx[has_prior]] == 1
+    return out
+
+
 def _binary_auc(scores: np.ndarray, labels: np.ndarray) -> float:
     """ROC AUC via the rank-sum identity. Returns 0.5 if class is degenerate."""
     pos = labels > 0.5
@@ -440,8 +460,8 @@ def validate(
 
     all_onset_pred: List[np.ndarray] = []
     all_onset_true: List[np.ndarray] = []
-    all_sustain_pred: List[np.ndarray] = []
-    all_sustain_true: List[np.ndarray] = []
+    sustain_pred_chunks: List[np.ndarray] = []
+    sustain_true_chunks: List[np.ndarray] = []
     all_intensity_pred: List[np.ndarray] = []
     all_intensity_true: List[np.ndarray] = []
 
@@ -480,18 +500,17 @@ def validate(
             torch.sigmoid(onset_logits.float()).cpu().numpy().reshape(-1)
         )
         all_onset_true.append(onset_soft.cpu().numpy().reshape(-1))
-        all_sustain_pred.append(
-            torch.sigmoid(sustain_logits.float()).cpu().numpy().reshape(-1)
-        )
-        all_sustain_true.append(sustain_target.cpu().numpy().reshape(-1))
+        sp_bt = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]  # [B, T]
+        st_bt = sustain_target.cpu().numpy()[:, :, 0] >= 0.5                  # [B, T]
+        for b in range(sp_bt.shape[0]):
+            sustain_pred_chunks.append(sp_bt[b])
+            sustain_true_chunks.append(st_bt[b])
         all_intensity_pred.append(intensity_pred.float().cpu().numpy().reshape(-1))
         all_intensity_true.append(intensity_target.cpu().numpy().reshape(-1))
 
     onset_pred = np.concatenate(all_onset_pred)
     onset_true_soft = np.concatenate(all_onset_true)
     onset_true_hard = (onset_true_soft >= 0.5).astype(np.float32)
-    sustain_pred = np.concatenate(all_sustain_pred)
-    sustain_true = (np.concatenate(all_sustain_true) >= 0.5).astype(np.float32)
     intensity_pred_all = np.concatenate(all_intensity_pred)
     intensity_true_all = np.concatenate(all_intensity_true)
 
@@ -515,21 +534,27 @@ def validate(
     onset_f1, onset_thr, onset_p, onset_r = _sweep(tol_frames)
     onset_f1_50ms, _, _, _ = _sweep(5)
 
-    # Sustain F1 / IoU at the best per-frame threshold.
+    # Sustain F1 / IoU under the inference-time hysteresis decoder:
+    #   up = thr, down = max(0, thr - 0.1). Sweep `up` to pick the threshold
+    #   the inference loader will read back from `best_sustain_threshold`.
     sustain_best = (0.0, 0.5, 0.0)  # f1, thr, iou
     for thr in thresholds:
-        pred = (sustain_pred >= thr).astype(np.float32)
-        tp = float((pred * sustain_true).sum())
-        fp = float((pred * (1.0 - sustain_true)).sum())
-        fn = float(((1.0 - pred) * sustain_true).sum())
+        up = float(thr)
+        down = max(0.0, up - 0.1)
+        tp = fp = fn = 0
+        for sp_chunk, st_chunk in zip(sustain_pred_chunks, sustain_true_chunks):
+            pred = _hysteresis_segments(sp_chunk, up, down)
+            tp += int(np.logical_and(pred, st_chunk).sum())
+            fp += int(np.logical_and(pred, np.logical_not(st_chunk)).sum())
+            fn += int(np.logical_and(np.logical_not(pred), st_chunk).sum())
         if tp + fp + fn == 0:
             continue
-        prec = tp / max(tp + fp, 1.0)
-        rec = tp / max(tp + fn, 1.0)
+        prec = tp / max(tp + fp, 1)
+        rec = tp / max(tp + fn, 1)
         f1 = 2 * prec * rec / max(prec + rec, 1e-8)
-        iou = tp / max(tp + fp + fn, 1.0)
+        iou = tp / max(tp + fp + fn, 1)
         if f1 > sustain_best[0]:
-            sustain_best = (float(f1), float(thr), float(iou))
+            sustain_best = (float(f1), float(up), float(iou))
     sustain_f1, sustain_thr, sustain_iou = sustain_best
 
     # Intensity AUC: discriminate "jump-ish frame" (target > 0.5) vs.
@@ -632,7 +657,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--tol-frames', type=int, default=3)
     parser.add_argument('--log-interval', type=int, default=50)
     parser.add_argument('--focal-gamma', type=float, default=2.0)
-    parser.add_argument('--sustain-weight', type=float, default=0.5)
+    parser.add_argument('--sustain-weight', type=float, default=1.0)
     parser.add_argument('--intensity-weight', type=float, default=0.5)
     parser.add_argument('--onset-pos-weight', type=float, default=None,
                         help='Override onset BCE pos_weight; default sqrt((1-p)/p) capped at 50')
