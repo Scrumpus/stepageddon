@@ -12,7 +12,7 @@ import logging
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -107,24 +107,44 @@ class FootStateArrowAssigner:
         self.last_foot = 'right'
         self.left_pos = Direction.LEFT
         self.right_pos = Direction.RIGHT
-        self.held_foot: Optional[str] = None
-        self.hold_end_time: float = 0.0
+        # Per-arrow active hold map: arrow -> end_time. Replaces the v6
+        # singleton (held_foot, hold_end_time) so jumpholds and back-to-back
+        # holds don't overwrite each other's state.
+        self.active_holds: Dict[Direction, float] = {}
         self._step_count = 0
         self._stream_pattern: Optional[List[int]] = None
         self._stream_idx: int = 0
         self._last_arrow: Optional[Direction] = None
 
+    def _purge_holds(self, time: float) -> None:
+        if not self.active_holds:
+            return
+        self.active_holds = {
+            a: e for a, e in self.active_holds.items() if e > time
+        }
+
+    def _held_arrows(self, time: float) -> Set[Direction]:
+        self._purge_holds(time)
+        return set(self.active_holds.keys())
+
+    def _held_feet(self, time: float) -> Set[str]:
+        feet: Set[str] = set()
+        for a in self._held_arrows(time):
+            if a in self.LEFT_FOOT_PANELS:
+                feet.add('left')
+            if a in self.RIGHT_FOOT_PANELS:
+                feet.add('right')
+        return feet
+
     def _pick_foot(self, time: float) -> str:
-        if self.held_foot and time >= self.hold_end_time:
-            self.held_foot = None
-        if self.held_foot == 'left':
+        held_feet = self._held_feet(time)
+        # Prefer a free foot. If both held (jumphold + tap case), fall back
+        # to alternation; the tap is non-claiming so this is harmless.
+        if 'left' in held_feet and 'right' not in held_feet:
             return 'right'
-        elif self.held_foot == 'right':
+        if 'right' in held_feet and 'left' not in held_feet:
             return 'left'
-        elif self.last_foot == 'left':
-            return 'right'
-        else:
-            return 'left'
+        return 'right' if self.last_foot == 'left' else 'left'
 
     def _panels_for_foot(self, foot: str) -> List[Direction]:
         return self.LEFT_FOOT_PANELS if foot == 'left' else self.RIGHT_FOOT_PANELS
@@ -158,7 +178,7 @@ class FootStateArrowAssigner:
             self._last_arrow is not None
             and self.jack_rate > 0.0
             and self.rng.random() < self.jack_rate
-            and self.held_foot is None
+            and not self._held_feet(time)
         ):
             self._step_count += 1
             arrow = self._last_arrow
@@ -202,10 +222,7 @@ class FootStateArrowAssigner:
 
     def assign_jump(self, time: float, energy: float = 0.5,
                      brightness: float = 0.5) -> List[Direction]:
-        if self.held_foot and time >= self.hold_end_time:
-            self.held_foot = None
-
-        if self.held_foot:
+        if self._held_feet(time):
             return [self.assign_single(time, energy, brightness)]
 
         if energy > 0.7:
@@ -226,18 +243,28 @@ class FootStateArrowAssigner:
 
     def start_hold(self, time: float, duration: float,
                     energy: float = 0.5, brightness: float = 0.5) -> Direction:
+        self._purge_holds(time)
         arrow = self.assign_single(time, energy, brightness)
-        self.held_foot = self.last_foot
-        self.hold_end_time = time + duration
+        # Same-arrow collision guard: if assign_single landed on an already-
+        # held arrow (e.g. via crossover or jack with stale state), swap to
+        # any free panel. With the concurrency cap upstream, a free panel is
+        # guaranteed to exist.
+        if arrow in self.active_holds:
+            free = [p for p in self.ALL_PANELS if p not in self.active_holds]
+            if free:
+                arrow = free[0]
+                foot = 'left' if arrow in self.LEFT_FOOT_PANELS else 'right'
+                self._update_foot(foot, arrow)
+        self.active_holds[arrow] = time + duration
         return arrow
 
     def maybe_start_stream(self, energy: float, remaining_events: int,
-                            max_stream_length: int) -> bool:
+                            max_stream_length: int, time: float = 0.0) -> bool:
         if 'stream' not in self.allowed_patterns or max_stream_length == 0:
             return False
         if self._stream_pattern is not None:
             return False
-        if self.held_foot is not None:
+        if self._held_feet(time):
             return False
 
         # stream_preference is the per-profile bias; energy modulates it so
@@ -910,6 +937,30 @@ class MLChartGenerator:
                 last_time = event['time']
         note_events = filtered
 
+        # Concurrency cap: at any instant the chart shows at most
+        # MAX_CONCURRENT_ARROWS arrows (active hold bodies + new taps/jumps).
+        # A jump/jumphold counts as 2. If a new event would exceed the cap,
+        # demote arity (jump→single, jumphold→single hold). If even a single
+        # arrow won't fit (holds already saturate), drop the event.
+        MAX_CONCURRENT_ARROWS = 2
+        active_until: List[float] = []
+        kept: List[dict] = []
+        for event in note_events:
+            active_until = [end for end in active_until if end > event['time']]
+            free_slots = MAX_CONCURRENT_ARROWS - len(active_until)
+            if free_slots <= 0:
+                continue  # 2 holds already on screen → drop tap/jump/hold
+            arity = int(event.get('num_arrows', 1))
+            if arity > free_slots:
+                arity = free_slots
+                event['num_arrows'] = arity
+            if event['type'] == 'hold':
+                end_time = event['time'] + event['hold_duration']
+                for _ in range(arity):
+                    active_until.append(end_time)
+            kept.append(event)
+        note_events = kept
+
         # Arrow assignment.
         assigner = FootStateArrowAssigner(
             seed=audio_seed,
@@ -945,19 +996,19 @@ class MLChartGenerator:
                     energy=energy,
                     remaining_events=len(note_events) - i,
                     max_stream_length=max_stream_length,
+                    time=t,
                 )
 
             target_arity = 2 if event.get('num_arrows', 1) >= 2 else 1
 
             if event['type'] == 'hold':
                 if target_arity >= 2:
-                    # Jumphold: assign two arrows, lock the foot of the first.
+                    # Jumphold: assign two arrows, register both as active holds.
                     arrows = assigner.assign_jump(t, energy, brightness)
                     if arrows:
-                        # Treat the hold as starting on assigner.last_arrow
-                        # so subsequent foot logic respects the held foot.
-                        assigner.held_foot = assigner.last_foot
-                        assigner.hold_end_time = t + event['hold_duration']
+                        end_time = t + event['hold_duration']
+                        for a in arrows:
+                            assigner.active_holds[a] = end_time
                 else:
                     arrows = [assigner.start_hold(
                         t, event['hold_duration'], energy, brightness,
