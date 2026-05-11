@@ -42,17 +42,26 @@ def _build_sustain_target(
     labels: np.ndarray,
     durations_seconds: np.ndarray,
     fps: float,
+    boundary_ramp: int = 2,
 ) -> np.ndarray:
     """Per-frame "any arrow currently held" indicator over the full song.
+
+    Hold boundaries are inherently ambiguous to within a frame or two, so the
+    target ramps linearly to/from 1.0 just outside each segment instead of
+    flipping hard. The hysteresis-based eval decoder expects exactly this
+    kind of soft boundary; hard 0/1 labels punished the model for 1-frame
+    boundary jitter and depressed val IoU/F1.
 
     Args:
         arrow_labels: [T, 4] uint8 — per-arrow onset indicator.
         labels: [T] uint8 — frame-level note class. Hold starts have value 3.
         durations_seconds: [T] float32 — total hold duration in seconds at
             hold_start frames, 0 elsewhere.
+        boundary_ramp: number of frames on each side of a hold span to soften.
 
     Returns:
-        sustain: [T] float32, 1.0 inside any hold span on any arrow, else 0.
+        sustain: [T] float32 in [0, 1]. 1.0 inside any hold span on any arrow,
+            ramping down outside the span across `boundary_ramp` frames.
     """
     T = arrow_labels.shape[0]
     out = np.zeros(T, dtype=np.float32)
@@ -66,8 +75,17 @@ def _build_sustain_target(
         if dur_seconds <= 0.0:
             continue
         dur_frames = max(1, int(round(dur_seconds * fps)))
-        end = min(T, int(hs) + dur_frames)
-        out[int(hs):end] = 1.0
+        start = int(hs)
+        end = min(T, start + dur_frames)
+        out[start:end] = 1.0
+        for k in range(1, boundary_ramp + 1):
+            w = 1.0 - k / (boundary_ramp + 1)
+            left = start - k
+            if left >= 0:
+                out[left] = max(out[left], w)
+            right = end + k - 1
+            if right < T:
+                out[right] = max(out[right], w)
     return out
 
 
