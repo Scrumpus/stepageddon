@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
-from services import AudioProcessor, AudioDownloader
+from services import AudioProcessor, AudioDownloader, get_storage
 from services.chart_persistence import persist_user_song
 from ml import MLChartGenerator
 from core.config import settings
@@ -26,6 +26,8 @@ router = APIRouter()
 audio_processor = AudioProcessor()
 
 audio_downloader = AudioDownloader()
+
+storage = get_storage()
 
 logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
 # Style profiles live next to the training data the checkpoint was built from.
@@ -97,12 +99,7 @@ async def generate_steps_from_file(
         # Generate unique ID
         song_uuid = uuid.uuid4()
         song_id = str(song_uuid)
-
-        # Save uploaded file
-        file_path = os.path.join(
-            settings.AUDIO_STORAGE_PATH,
-            f"{song_id}{file_ext}"
-        )
+        audio_key = f"{song_id}{file_ext}"
 
         content = await file.read()
 
@@ -114,22 +111,20 @@ async def generate_steps_from_file(
                 detail=f"File too large. Max size: {settings.MAX_FILE_SIZE_MB}MB"
             )
 
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        logger.info(f"Saved file: {file_path}")
+        file_path = storage.write_bytes(audio_key, content)
+        logger.info(f"Saved file: {audio_key}")
 
         # Check duration
-        duration = audio_processor.get_duration(file_path)
+        duration = audio_processor.get_duration(str(file_path))
         if duration > settings.MAX_DURATION_SECONDS:
-            os.remove(file_path)
+            storage.delete(audio_key)
             raise HTTPException(
                 status_code=400,
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
 
         logger.info(f"Generating {difficulty} steps (style={style})...")
-        chart = ml_generator.generate_from_audio(file_path, difficulty, style=style)
+        chart = ml_generator.generate_from_audio(str(file_path), difficulty, style=style)
         steps = chart.to_json_dict()
 
         await persist_user_song(
@@ -137,7 +132,7 @@ async def generate_steps_from_file(
             song_id=song_uuid,
             title=file.filename,
             artist=None,
-            audio_relpath=f"{song_id}{file_ext}",
+            audio_relpath=audio_key,
             chart=chart,
             difficulty_name=difficulty,
             difficulty_level=0,
@@ -154,7 +149,7 @@ async def generate_steps_from_file(
                 "tempo": chart.tempo,
                 "source": "upload"
             },
-            "audio_url": f"/api/audio/{song_id}{file_ext}"
+            "audio_url": f"/api/audio/{audio_key}"
         }
 
         logger.info(f"✓ Generated {len(chart.steps)} steps for {song_id}")
@@ -191,20 +186,22 @@ async def generate_steps_from_url(
         # Generate unique ID
         song_uuid = uuid.uuid4()
         song_id = str(song_uuid)
-        file_path = os.path.join(settings.AUDIO_STORAGE_PATH, f"{song_id}.mp3")
+        audio_key = f"{song_id}.mp3"
+        file_path = storage.reserve_path(audio_key)
 
         # Download audio
         logger.info("Downloading audio...")
         download_result = await audio_downloader.download_from_url(
             request.url,
-            file_path
+            str(file_path),
         )
+        storage.commit(audio_key, file_path)
 
         metadata = download_result["metadata"]
 
         # Check duration
         if metadata["duration"] > settings.MAX_DURATION_SECONDS:
-            os.remove(file_path)
+            storage.delete(audio_key)
             raise HTTPException(
                 status_code=400,
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
@@ -214,7 +211,7 @@ async def generate_steps_from_url(
             f"Generating {request.difficulty} steps (style={request.style})..."
         )
         chart = ml_generator.generate_from_audio(
-            file_path, request.difficulty, style=request.style,
+            str(file_path), request.difficulty, style=request.style,
         )
         steps = chart.to_json_dict()
 
@@ -223,7 +220,7 @@ async def generate_steps_from_url(
             song_id=song_uuid,
             title=metadata["title"],
             artist=metadata.get("artist") or None,
-            audio_relpath=f"{song_id}.mp3",
+            audio_relpath=audio_key,
             chart=chart,
             difficulty_name=request.difficulty,
             difficulty_level=0,
@@ -243,7 +240,7 @@ async def generate_steps_from_url(
                 "source": metadata["source"],
                 "is_preview": download_result.get("is_preview", False)
             },
-            "audio_url": f"/api/audio/{song_id}.mp3"
+            "audio_url": f"/api/audio/{audio_key}"
         }
 
         logger.info(f"✓ Generated {len(chart.steps)} steps for {song_id}")
