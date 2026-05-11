@@ -4,18 +4,21 @@ Preprocessing script: converts .sm charts + audio into training data.
 Run this locally before training on Colab:
     python -m ml.prepare_data --charts-dir charts/ --output-dir ml/training_data/
 
-Output (format_version=2):
+Output (format_version=7):
     training_data/
-    ├── manifest.json    # {format_version, mel_mean, mel_std, entries: [...]}
-    ├── song_0001.npz    # one file per song: mel + one labels_<diff> per chart
+    ├── manifest.json    # {format_version, feat_mean[88], feat_std[88], entries: [...]}
+    ├── song_0001.npz    # one file per song: feats[T,88] + per-chart label arrays
     ├── song_0002.npz
     └── ...
 
-The mel is stored once per song in fixed scaled-dB [0, 1] space (NOT per-song
-min-max), so loudness is comparable across songs. Global whitening stats over
-the corpus are written into the manifest and applied at load time by the
-dataset, which means changing normalization later only requires retraining,
-not re-running prepare_data.
+`feats` channels (88 total, all aligned at ~100.23 fps):
+    [0..79]  — fixed-dB scaled mel (clipped to [DB_MIN, DB_MAX], mapped to [0,1])
+    [80]     — librosa.onset.onset_strength (per-song z-normed)
+    [81..87] — librosa.feature.spectral_contrast (7 bands; per-song z-normed)
+
+Per-chart label arrays still saved under `labels_<diff>`, `durations_<diff>`,
+`arrow_labels_<diff>` so style_profiles.py can derive per-chart stats from
+the same npz.
 """
 
 import argparse
@@ -39,13 +42,11 @@ from services.sm_parser import parse_sm_file
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-# On-disk format version. Bump on any breaking change to npz layout / manifest
-# schema. Dataset loaders error loudly on mismatch.
-# v4: adds song-level `beats` array (shape [T] uint8) for the auxiliary
-# beat-prediction head.
-# v5: adds per-chart `arrow_labels_<diff>` array (shape [T, 4] uint8) for the
-# arrow-aware onset head. labels_<diff> stays for the type head and back-compat.
-FORMAT_VERSION = 5
+# v7: hybrid plan. Replaces the per-arrow / per-type targets with a smaller
+# 88-channel `feats` tensor (mel + onset_strength + spec_contrast) plus the
+# original per-chart label arrays (still needed downstream for style profiles
+# and to derive onset/sustain/intensity targets in dataset.py).
+FORMAT_VERSION = 7
 
 # Audio processing constants
 SAMPLE_RATE = 22050
@@ -54,62 +55,92 @@ HOP_LENGTH = 220  # ~100 fps (22050 / 220 = 100.23 fps)
 N_FFT = 2048
 FRAMES_PER_SECOND = SAMPLE_RATE / HOP_LENGTH  # ~100.23
 
-# Fixed dB scaling for mel storage. We compute log-mel against an absolute
-# reference (ref=1.0) and clip to [DB_MIN, DB_MAX] dB, then map to [0, 1] for
-# float16 storage. This preserves cross-song loudness, unlike per-file min-max.
-# DB_RANGE is exposed so the dataset's gain-jitter augmentation can shift in
-# matching units.
+# Channel layout for the v7 feats tensor.
+N_ONSET_STRENGTH = 1
+N_SPECTRAL_CONTRAST = 7
+N_FEAT_CHANNELS = N_MELS + N_ONSET_STRENGTH + N_SPECTRAL_CONTRAST  # 88
+
+# Fixed dB scaling for mel storage. Same recipe as v5 — the only change is
+# that mel is now a sub-block inside `feats[:, :80]`.
 DB_MIN = -80.0
 DB_MAX = 20.0
-DB_RANGE = DB_MAX - DB_MIN  # 100 dB total span
+DB_RANGE = DB_MAX - DB_MIN
 
-# Label encoding (arrow-agnostic note types)
+# Label encoding (arrow-agnostic note types) — kept so style profile code can
+# read them without re-deriving from arrow_labels.
 LABEL_NONE = 0
 LABEL_TAP = 1
 LABEL_JUMP = 2         # 2+ simultaneous arrows
 LABEL_HOLD_START = 3
-N_NOTE_TYPES = 4        # total classes for type head (including NONE)
 
 
-class MelStatsAccumulator:
-    """Online float64 accumulator for global mean/std over scaled-dB mel values.
+class FeatStatsAccumulator:
+    """Online float64 per-channel mean/std accumulator over the 88 feats channels.
 
-    Used at preprocessing time to compute corpus-wide whitening stats without
-    holding the entire dataset in memory. Updated once per saved song so that
-    skipped songs (no charts, too short, etc.) don't influence the stats.
+    Updated once per saved song so skipped songs (no charts, too short, etc.)
+    don't influence the corpus stats.
     """
 
-    def __init__(self) -> None:
-        self.sum = 0.0
-        self.sum_sq = 0.0
-        self.count = 0
+    def __init__(self, n_channels: int = N_FEAT_CHANNELS) -> None:
+        self.n_channels = int(n_channels)
+        self.sum = np.zeros(self.n_channels, dtype=np.float64)
+        self.sum_sq = np.zeros(self.n_channels, dtype=np.float64)
+        self.count = 0  # number of frames seen (per-channel count is identical)
 
-    def update(self, arr: np.ndarray) -> None:
-        a = arr.astype(np.float64, copy=False)
-        self.sum += float(a.sum())
-        self.sum_sq += float(np.square(a).sum())
-        self.count += int(a.size)
+    def update(self, feats: np.ndarray) -> None:
+        a = feats.astype(np.float64, copy=False)
+        assert a.ndim == 2 and a.shape[1] == self.n_channels, (
+            f"FeatStatsAccumulator expected [T, {self.n_channels}], got {a.shape}"
+        )
+        self.sum += a.sum(axis=0)
+        self.sum_sq += np.square(a).sum(axis=0)
+        self.count += int(a.shape[0])
 
-    def finalize(self) -> Tuple[float, float]:
+    def finalize(self) -> Tuple[np.ndarray, np.ndarray]:
         if self.count == 0:
-            return 0.0, 1.0
+            return (
+                np.zeros(self.n_channels, dtype=np.float64),
+                np.ones(self.n_channels, dtype=np.float64),
+            )
         mean = self.sum / self.count
-        var = max(self.sum_sq / self.count - mean * mean, 1e-8)
-        return mean, math.sqrt(var)
+        var = self.sum_sq / self.count - mean * mean
+        var = np.maximum(var, 1e-8)
+        return mean, np.sqrt(var)
+
+
+def _per_song_znorm(x: np.ndarray) -> np.ndarray:
+    """Per-song zero-mean / unit-std along the time axis. Operates per channel.
+
+    Side channels (onset_strength, spectral_contrast) live on different scales
+    than mel and across different songs — z-norming per song before the
+    corpus-wide whitening keeps the input distribution stable across the
+    library, then `dataset.py` applies the global per-channel stats from the
+    manifest to give the model a true zero-mean unit-std input.
+    """
+    if x.ndim == 1:
+        x = x[:, None]
+    mean = x.mean(axis=0, keepdims=True)
+    std = x.std(axis=0, keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    return ((x - mean) / std).astype(np.float32)
 
 
 def extract_audio_features(
     audio_path: str,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+) -> Optional[np.ndarray]:
     """
-    Extract mel spectrogram + beat track from an audio file.
+    Extract the v7 feats tensor [T, 88] from an audio file.
 
-    Mel: fixed scaled-dB [0, 1] space (ref=1.0, clipped to [DB_MIN, DB_MAX]).
-    Beats: [T] uint8 binary array (1 at beat frames) at the same hop as mel.
-    The auxiliary beat head consumes this as a per-frame BCE target.
+    Layout:
+        feats[:, 0:80]   mel (fixed dB → [0,1], not z-normed yet — global
+                         whitening happens in dataset.py via manifest stats)
+        feats[:, 80:81]  librosa.onset.onset_strength, per-song z-normed
+        feats[:, 81:88]  librosa.feature.spectral_contrast (7 bands),
+                         per-song z-normed
 
     Returns:
-        (mel: [T, N_MELS] float16, beats: [T] uint8), or None on failure.
+        feats: [T, 88] float16 (mel sub-block in [0,1], side channels z-normed)
+        or None on failure.
     """
     try:
         y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
@@ -124,35 +155,79 @@ def extract_audio_features(
     mel = librosa.feature.melspectrogram(
         y=y, sr=sr, n_mels=N_MELS, hop_length=HOP_LENGTH, n_fft=N_FFT,
     )
-    # Absolute dB (no per-file ref=np.max). top_db=None disables librosa's
-    # adaptive floor; we apply our own fixed clip range below.
     mel_db = librosa.power_to_db(mel, ref=1.0, amin=1e-10, top_db=None)
     np.clip(mel_db, DB_MIN, DB_MAX, out=mel_db)
     mel_scaled = (mel_db - DB_MIN) / DB_RANGE  # -> [0, 1]
-    mel_arr = mel_scaled.T.astype(np.float16)  # [T, N_MELS]
+    mel_t = mel_scaled.T.astype(np.float32)  # [T, 80]
+    n_frames = mel_t.shape[0]
 
-    # Beat track at the same hop as the mel grid so beat_frames index directly
-    # into mel rows. Failures (very short / silent songs) fall back to an
-    # all-zero beat track — the BCE just sees no positives there.
-    n_frames = mel_arr.shape[0]
-    beats = np.zeros(n_frames, dtype=np.uint8)
+    # Onset strength envelope at the same hop as the mel grid.
     try:
-        _tempo, beat_frames = librosa.beat.beat_track(
+        onset_env = librosa.onset.onset_strength(
             y=y, sr=sr, hop_length=HOP_LENGTH,
         )
-        beat_frames = np.asarray(beat_frames, dtype=np.int64)
-        beat_frames = beat_frames[(beat_frames >= 0) & (beat_frames < n_frames)]
-        beats[beat_frames] = 1
     except Exception as e:
-        logger.warning(f"Beat track failed for {audio_path}: {e}")
+        logger.warning(f"onset_strength failed for {audio_path}: {e}")
+        onset_env = np.zeros(n_frames, dtype=np.float32)
+    onset_env = np.asarray(onset_env, dtype=np.float32)
+    onset_env = _align_length(onset_env, n_frames)
 
-    return mel_arr, beats
+    # Spectral contrast — 7 bands by default (n_bands=6 -> 7 channels).
+    try:
+        contrast = librosa.feature.spectral_contrast(
+            y=y, sr=sr, hop_length=HOP_LENGTH, n_fft=N_FFT,
+        )
+    except Exception as e:
+        logger.warning(f"spectral_contrast failed for {audio_path}: {e}")
+        contrast = np.zeros((N_SPECTRAL_CONTRAST, n_frames), dtype=np.float32)
+    contrast = np.asarray(contrast, dtype=np.float32)
+    if contrast.shape[0] != N_SPECTRAL_CONTRAST:
+        # Pad/truncate band axis defensively (older librosa versions may
+        # return a different default count).
+        if contrast.shape[0] < N_SPECTRAL_CONTRAST:
+            pad = np.zeros(
+                (N_SPECTRAL_CONTRAST - contrast.shape[0], contrast.shape[1]),
+                dtype=np.float32,
+            )
+            contrast = np.concatenate([contrast, pad], axis=0)
+        else:
+            contrast = contrast[:N_SPECTRAL_CONTRAST]
+    contrast_t = contrast.T  # [T_c, 7]
+    contrast_t = _align_length(contrast_t, n_frames)
+
+    onset_z = _per_song_znorm(onset_env)        # [T, 1]
+    contrast_z = _per_song_znorm(contrast_t)    # [T, 7]
+
+    feats = np.concatenate([mel_t, onset_z, contrast_z], axis=1)
+    assert feats.shape == (n_frames, N_FEAT_CHANNELS), (
+        f"feats shape {feats.shape} != expected ({n_frames}, {N_FEAT_CHANNELS})"
+    )
+    return feats.astype(np.float16)
 
 
-# Backwards-compat shim: older callers may still import the legacy name.
-def extract_mel_spectrogram(audio_path: str) -> Optional[np.ndarray]:
-    feats = extract_audio_features(audio_path)
-    return feats[0] if feats is not None else None
+def _align_length(arr: np.ndarray, n_frames: int) -> np.ndarray:
+    """Pad / truncate `arr` along axis 0 to match `n_frames`.
+
+    librosa side features can come back ±1 frame off from the mel grid because
+    of internal centering / framing differences; we just align to the mel
+    length so the channel concat works cleanly.
+    """
+    if arr.ndim == 1:
+        T = arr.shape[0]
+        if T == n_frames:
+            return arr
+        if T > n_frames:
+            return arr[:n_frames]
+        out = np.zeros(n_frames, dtype=arr.dtype)
+        out[:T] = arr
+        return out
+    T = arr.shape[0]
+    if T == n_frames:
+        return arr
+    if T > n_frames:
+        return arr[:n_frames]
+    pad = np.zeros((n_frames - T,) + arr.shape[1:], dtype=arr.dtype)
+    return np.concatenate([arr, pad], axis=0)
 
 
 def notes_to_frame_labels(notes, n_frames: int):
@@ -160,40 +235,32 @@ def notes_to_frame_labels(notes, n_frames: int):
     Convert note list to frame-aligned label, duration, and per-arrow arrays.
 
     Returns three aligned tensors:
-      - `labels` (arrow-agnostic note type) for the type head
-      - `durations` for the duration head
-      - `arrow_labels` (per-arrow binary) for the arrow head
-
-    The labels collapse: 1 tap → tap, 2+ taps → jump, 1 hold_head → hold_start,
-    2+ hold_heads → hold_start.
+      - `labels` (arrow-agnostic note type)
+      - `durations` (seconds at hold_start frames)
+      - `arrow_labels` (per-arrow binary)
 
     Hold durations come from greedy hold_head → hold_tail pairing on the same
-    column. Stored at the hold_start frame. The model predicts duration
-    directly instead of detecting a separate hold_end event.
+    column. Stored at the hold_start frame.
 
     `arrow_labels[t, a] = 1` iff a tap or hold_head landed on arrow `a` at
-    frame `t`. arrow indices are 0=L, 1=D, 2=U, 3=R (matches sm_parser's
-    Note.arrow column ids and inference's ARROW_DIRECTIONS).
+    frame `t`. Indices are 0=L, 1=D, 2=U, 3=R.
 
     Args:
         notes: List of Note objects from sm_parser
-        n_frames: Total number of mel frames
+        n_frames: Total number of feats frames
 
     Returns:
-        labels: [n_frames] uint8 array with values 0-3
-        durations: [n_frames] float32 array, hold duration in seconds at
-            hold_start frames, 0.0 elsewhere
-        arrow_labels: [n_frames, 4] uint8 array, per-arrow onset indicator
+        labels: [n_frames] uint8, values in {0,1,2,3}
+        durations: [n_frames] float32, seconds at hold_start frames, 0 elsewhere
+        arrow_labels: [n_frames, 4] uint8, per-arrow onset indicator
     """
     labels = np.zeros(n_frames, dtype=np.uint8)
     durations = np.zeros(n_frames, dtype=np.float32)
     tap_counts = np.zeros(n_frames, dtype=np.uint8)
     arrow_labels = np.zeros((n_frames, 4), dtype=np.uint8)
 
-    # First pass: pair hold_head → hold_tail per arrow to get durations.
-    # Collect hold_heads per column, then match with tails in time order.
-    hold_heads_by_col = {}  # arrow -> [(time, frame), ...]
-    hold_tails_by_col = {}  # arrow -> [(time, frame), ...]
+    hold_heads_by_col = {}
+    hold_tails_by_col = {}
     for note in notes:
         frame = int(round(note.time * FRAMES_PER_SECOND))
         if frame < 0 or frame >= n_frames:
@@ -203,8 +270,7 @@ def notes_to_frame_labels(notes, n_frames: int):
         elif note.note_type == 'hold_tail':
             hold_tails_by_col.setdefault(note.arrow, []).append((note.time, frame))
 
-    # Greedy pair: each head matches the next tail on the same column
-    hold_durations_at_frame = {}  # frame -> max duration (if multiple arrows)
+    hold_durations_at_frame = {}
     for col, heads in hold_heads_by_col.items():
         tails = hold_tails_by_col.get(col, [])
         heads.sort()
@@ -216,13 +282,11 @@ def notes_to_frame_labels(notes, n_frames: int):
             if ti < len(tails):
                 dur = tails[ti][0] - h_time
                 if dur > 0:
-                    # If multiple hold_heads land on the same frame, keep longest
                     hold_durations_at_frame[h_frame] = max(
                         hold_durations_at_frame.get(h_frame, 0.0), dur
                     )
                     ti += 1
 
-    # Second pass: assign labels and per-arrow indicators
     for note in notes:
         frame = int(round(note.time * FRAMES_PER_SECOND))
         if frame < 0 or frame >= n_frames:
@@ -241,7 +305,6 @@ def notes_to_frame_labels(notes, n_frames: int):
             if 0 <= note.arrow < 4:
                 arrow_labels[frame, note.arrow] = 1
 
-    # Upgrade tap → jump where 2+ arrows fired simultaneously
     jump_mask = tap_counts >= 2
     labels[jump_mask & (labels == LABEL_TAP)] = LABEL_JUMP
 
@@ -249,7 +312,6 @@ def notes_to_frame_labels(notes, n_frames: int):
 
 
 def find_audio_file(chart_dir: Path) -> Optional[Path]:
-    """Find the audio file in a chart directory."""
     for ext in ['.ogg', '.mp3', '.wav', '.flac']:
         candidates = list(chart_dir.glob(f'*{ext}'))
         if candidates:
@@ -261,17 +323,13 @@ def process_chart_directory(
     chart_dir: Path,
     output_dir: Path,
     index: int,
-    stats: MelStatsAccumulator,
+    stats: FeatStatsAccumulator,
 ) -> list:
     """
-    Process a single chart directory (one song).
-
-    Writes a single song-level npz containing the mel and one labels_<diff>
-    array per chart, eliminating the per-difficulty mel duplication of v1.
-    Updates `stats` with the song's mel values iff the song actually gets
-    saved.
-
-    Returns list of manifest entries (one per chart that survived filtering).
+    Process a single chart directory. Writes one song-level npz containing
+    `feats[T,88]` plus per-chart `labels_<diff>`, `durations_<diff>`,
+    `arrow_labels_<diff>` arrays (used downstream by dataset.py to derive
+    onset/sustain/intensity targets and by style_profiles.py for stats).
     """
     sm_files = list(chart_dir.glob('*.sm'))
     if not sm_files:
@@ -284,23 +342,17 @@ def process_chart_directory(
         logger.debug(f"No audio found in {chart_dir.name}")
         return []
 
-    # Parse .sm file
     sm = parse_sm_file(str(sm_file))
     if sm is None or not sm.charts:
         return []
 
-    # Extract mel spectrogram + beat track
     feats = extract_audio_features(str(audio_file))
     if feats is None:
         return []
-    mel, beats = feats
 
-    n_frames = mel.shape[0]
+    n_frames = feats.shape[0]
     primary_bpm = sm.primary_bpm
 
-    # Build per-chart label arrays first; only write the song file if at
-    # least one chart survives. Handle duplicate-difficulty collisions by
-    # suffixing _2, _3, ... so charts don't silently overwrite each other.
     arrays: dict = {}
     entries: list = []
     song_filename = f"song_{index:04d}.npz"
@@ -311,7 +363,6 @@ def process_chart_directory(
 
         labels, durations, arrow_labels = notes_to_frame_labels(chart.notes, n_frames)
 
-        # Skip charts with very few notes
         note_frames = (labels > 0).sum()
         if note_frames < 10:
             continue
@@ -350,12 +401,10 @@ def process_chart_directory(
 
     np.savez_compressed(
         output_dir / song_filename,
-        mel=mel,
-        beats=beats,
+        feats=feats,
         **arrays,
     )
-    # Stats over the float16 stored values, accumulated in float64.
-    stats.update(mel)
+    stats.update(feats.astype(np.float32))
 
     return entries
 
@@ -378,7 +427,6 @@ def main():
         logger.error(f"Charts directory not found: {charts_dir}")
         sys.exit(1)
 
-    # Get all chart directories
     chart_dirs = sorted([d for d in charts_dir.iterdir() if d.is_dir()])
     if args.limit:
         chart_dirs = chart_dirs[:args.limit]
@@ -386,7 +434,7 @@ def main():
     logger.info(f"Processing {len(chart_dirs)} chart directories...")
 
     entries: list = []
-    stats = MelStatsAccumulator()
+    stats = FeatStatsAccumulator()
     processed = 0
     errors = 0
 
@@ -404,21 +452,23 @@ def main():
             logger.info(f"Progress: {idx + 1}/{len(chart_dirs)} "
                          f"({processed} songs, {len(entries)} charts)")
 
-    mel_mean, mel_std = stats.finalize()
-    logger.info(f"Global mel stats: mean={mel_mean:.6f}, std={mel_std:.6f} "
-                 f"(over {stats.count:,} values)")
+    feat_mean, feat_std = stats.finalize()
+    logger.info(
+        f"Per-channel feat stats finalized over {stats.count:,} frames "
+        f"(mel mean range [{feat_mean[:80].min():.4f}, {feat_mean[:80].max():.4f}])"
+    )
 
-    # Save manifest (format_version=2 wraps entries with corpus-level metadata).
     manifest_path = output_dir / 'manifest.json'
     manifest = {
         'format_version': FORMAT_VERSION,
-        'mel_mean': mel_mean,
-        'mel_std': mel_std,
+        'feat_mean': feat_mean.tolist(),
+        'feat_std': feat_std.tolist(),
+        'n_in_channels': N_FEAT_CHANNELS,
+        'n_mels': N_MELS,
         'db_min': DB_MIN,
         'db_max': DB_MAX,
         'sample_rate': SAMPLE_RATE,
         'hop_length': HOP_LENGTH,
-        'n_mels': N_MELS,
         'entries': entries,
     }
     with open(manifest_path, 'w') as f:
@@ -431,7 +481,6 @@ def main():
     logger.info(f"  Output: {output_dir}")
     logger.info(f"  Manifest: {manifest_path}")
 
-    # Print difficulty distribution
     from collections import Counter
     diff_counts = Counter(e['difficulty'] for e in entries)
     logger.info(f"  Difficulty distribution: {dict(diff_counts)}")

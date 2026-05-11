@@ -28,7 +28,23 @@ audio_processor = AudioProcessor()
 audio_downloader = AudioDownloader()
 
 logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
-ml_generator = MLChartGenerator(model_path=settings.ML_MODEL_PATH, type_logit_adjust=0.0)
+# Style profiles live next to the training data the checkpoint was built from.
+# We probe a couple of conventional locations so the API doesn't hard-fail
+# when profiles haven't been generated yet — `style='auto'` then falls back
+# to default knobs (see MLChartGenerator._resolve_style).
+_style_profiles_path = getattr(settings, 'STYLE_PROFILES_PATH', None)
+if _style_profiles_path is None:
+    for _candidate in (
+        os.path.join(os.path.dirname(settings.ML_MODEL_PATH), 'style_profiles.json'),
+        os.path.join('ml', 'training_data', 'style_profiles.json'),
+    ):
+        if os.path.exists(_candidate):
+            _style_profiles_path = _candidate
+            break
+ml_generator = MLChartGenerator(
+    model_path=settings.ML_MODEL_PATH,
+    style_profiles_path=_style_profiles_path,
+)
 logger.info("ML chart generator loaded successfully")
 
 
@@ -36,6 +52,10 @@ class GenerateRequest(BaseModel):
     """Request model for URL-based generation"""
     url: str = Field(..., description="YouTube or Spotify URL")
     difficulty: str = Field("medium", description="Difficulty level")
+    style: str = Field(
+        "auto",
+        description="Style profile name (e.g. 'Stream-Heavy', 'Jump-Heavy') or 'auto'",
+    )
 
 
 class GenerateResponse(BaseModel):
@@ -50,6 +70,7 @@ class GenerateResponse(BaseModel):
 async def generate_steps_from_file(
     file: UploadFile = File(...),
     difficulty: str = Form("medium"),
+    style: str = Form("auto"),
     session: AsyncSession = Depends(get_session),
 ):
     """
@@ -58,6 +79,7 @@ async def generate_steps_from_file(
     Args:
         file: Audio file (MP3, WAV, OGG, FLAC)
         difficulty: beginner, easy, medium, hard, or challenge
+        style: Style profile name (e.g. 'Stream-Heavy') or 'auto'
     """
     try:
         logger.info(f"Received file upload: {file.filename}, difficulty: {difficulty}")
@@ -106,8 +128,8 @@ async def generate_steps_from_file(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
 
-        logger.info(f"Generating {difficulty} steps...")
-        chart = ml_generator.generate_from_audio(file_path, difficulty)
+        logger.info(f"Generating {difficulty} steps (style={style})...")
+        chart = ml_generator.generate_from_audio(file_path, difficulty, style=style)
         steps = chart.to_json_dict()
 
         await persist_user_song(
@@ -188,8 +210,12 @@ async def generate_steps_from_url(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
 
-        logger.info(f"Generating {request.difficulty} steps...")
-        chart = ml_generator.generate_from_audio(file_path, request.difficulty)
+        logger.info(
+            f"Generating {request.difficulty} steps (style={request.style})..."
+        )
+        chart = ml_generator.generate_from_audio(
+            file_path, request.difficulty, style=request.style,
+        )
         steps = chart.to_json_dict()
 
         await persist_user_song(
