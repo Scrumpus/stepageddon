@@ -6,17 +6,13 @@ Handles step chart generation requests
 import os
 import uuid
 import logging
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
 
 from services import AudioProcessor, AudioDownloader, get_storage
-from services.chart_persistence import persist_user_song
 from ml import MLChartGenerator
 from core.config import settings
-from db import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +69,6 @@ async def generate_steps_from_file(
     file: UploadFile = File(...),
     difficulty: str = Form("medium"),
     style: str = Form("auto"),
-    session: AsyncSession = Depends(get_session),
 ):
     """
     Generate step chart from uploaded audio file
@@ -97,8 +92,7 @@ async def generate_steps_from_file(
             )
 
         # Generate unique ID
-        song_uuid = uuid.uuid4()
-        song_id = str(song_uuid)
+        song_id = str(uuid.uuid4())
         audio_key = f"{song_id}{file_ext}"
 
         content = await file.read()
@@ -127,18 +121,6 @@ async def generate_steps_from_file(
         chart = ml_generator.generate_from_audio(str(file_path), difficulty, style=style)
         steps = chart.to_json_dict()
 
-        await persist_user_song(
-            session,
-            song_id=song_uuid,
-            title=file.filename,
-            artist=None,
-            audio_relpath=audio_key,
-            chart=chart,
-            difficulty_name=difficulty,
-            difficulty_level=0,
-            generator="ml",
-        )
-
         # Prepare response
         response = {
             "song_id": song_id,
@@ -165,7 +147,6 @@ async def generate_steps_from_file(
 @router.post("/generate-steps-url")
 async def generate_steps_from_url(
     request: GenerateRequest,
-    session: AsyncSession = Depends(get_session),
 ):
     """
     Generate step chart from URL (YouTube or Spotify)
@@ -184,8 +165,7 @@ async def generate_steps_from_url(
             )
 
         # Generate unique ID
-        song_uuid = uuid.uuid4()
-        song_id = str(song_uuid)
+        song_id = str(uuid.uuid4())
         audio_key = f"{song_id}.mp3"
         file_path = storage.reserve_path(audio_key)
 
@@ -214,18 +194,6 @@ async def generate_steps_from_url(
             str(file_path), request.difficulty, style=request.style,
         )
         steps = chart.to_json_dict()
-
-        await persist_user_song(
-            session,
-            song_id=song_uuid,
-            title=metadata["title"],
-            artist=metadata.get("artist") or None,
-            audio_relpath=audio_key,
-            chart=chart,
-            difficulty_name=request.difficulty,
-            difficulty_level=0,
-            generator="ml",
-        )
 
         # Prepare response
         response = {
