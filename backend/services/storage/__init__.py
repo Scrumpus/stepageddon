@@ -22,6 +22,9 @@ def get_storage() -> StorageBackend:
         return S3Storage(
             bucket=settings.S3_BUCKET,
             endpoint_url=settings.S3_ENDPOINT_URL or None,
+            region=settings.S3_REGION or "auto",
+            access_key_id=settings.S3_ACCESS_KEY_ID or None,
+            secret_access_key=settings.S3_SECRET_ACCESS_KEY or None,
         )
     raise ValueError(f"Unknown STORAGE_BACKEND: {backend!r}")
 
