@@ -7,7 +7,7 @@ Usage:
                                        [--dry-run]
 
 Idempotent: re-running updates rows in place via ON CONFLICT and skips
-asset copies that already exist.
+asset uploads that already exist in the configured storage backend.
 """
 
 from __future__ import annotations
@@ -25,16 +25,18 @@ import librosa
 from slugify import slugify
 from tqdm import tqdm
 
-from core.config import settings
 from db.session import AsyncSessionLocal
+from services import get_storage
 from services.chart_persistence import persist_ddr_song
 from services.sm_parser import ParsedSong, parse_sm
+from services.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROOT = "DDR 1st-A20 Plus"
 DEFAULT_GAME = "[01] DDR 1st Mix"
 ASSET_EXTS = {".ogg", ".mp3", ".wav", ".png", ".jpg", ".jpeg"}
+AUDIO_EXTS = (".ogg", ".mp3", ".wav", ".flac", ".m4a")
 
 GAME_INDEX_RE = re.compile(r"^\[(\d+)\]")
 
@@ -52,30 +54,29 @@ def find_chart_file(song_dir: Path) -> Optional[Path]:
     return None
 
 
-def copy_assets(song_dir: Path, dest_dir: Path) -> None:
-    dest_dir.mkdir(parents=True, exist_ok=True)
+def upload_asset(src: Path, key: str, storage: StorageBackend) -> None:
+    """Copy ``src`` into storage under ``key``. No-op if already present."""
+    if storage.exists(key):
+        return
+    dst = storage.reserve_path(key)
+    shutil.copy2(src, dst)
+    storage.commit(key, dst)
+
+
+def upload_assets(song_dir: Path, slug: str, storage: StorageBackend) -> None:
     for src in song_dir.iterdir():
-        if not src.is_file():
+        if not src.is_file() or src.suffix.lower() not in ASSET_EXTS:
             continue
-        if src.suffix.lower() not in ASSET_EXTS:
-            continue
-        dst = dest_dir / src.name
-        if not dst.exists():
-            shutil.copy2(src, dst)
+        upload_asset(src, f"{slug}/{src.name}", storage)
 
 
-def relpath_or_none(filename: Optional[str], dest_dir: Path) -> Optional[str]:
-    """Return the path relative to AUDIO_STORAGE_PATH if the file exists in dest_dir."""
+def key_or_none(
+    filename: Optional[str], slug: str, storage: StorageBackend
+) -> Optional[str]:
     if not filename:
         return None
-    candidate = dest_dir / filename
-    if not candidate.exists():
-        return None
-    storage_root = Path(settings.AUDIO_STORAGE_PATH).resolve()
-    try:
-        return str(candidate.resolve().relative_to(storage_root))
-    except ValueError:
-        return None
+    key = f"{slug}/{filename}"
+    return key if storage.exists(key) else None
 
 
 async def seed_one_song(
@@ -83,7 +84,7 @@ async def seed_one_song(
     song_dir: Path,
     game: str,
     game_index: Optional[int],
-    storage_root: Path,
+    storage: StorageBackend,
     dry_run: bool,
 ) -> bool:
     chart_file = find_chart_file(song_dir)
@@ -105,7 +106,6 @@ async def seed_one_song(
         return False
 
     slug = slugify(song_dir.name) or slugify(parsed.title) or song_dir.name.lower()
-    dest_dir = storage_root / "ddr" / slug
 
     if dry_run:
         logger.info(
@@ -125,44 +125,52 @@ async def seed_one_song(
             )
         return True
 
-    copy_assets(song_dir, dest_dir)
+    upload_assets(song_dir, slug, storage)
 
-    music_path = dest_dir / parsed.music_file
-    if not music_path.exists():
+    music_key = f"{slug}/{parsed.music_file}"
+    if not storage.exists(music_key):
         # .sm sometimes declares a wrong extension (e.g. .wav when only .ogg
-        # was shipped). Fall back to any audio file in the dest folder.
-        audio_exts = (".ogg", ".mp3", ".wav", ".flac", ".m4a")
-        candidates = [p for p in dest_dir.iterdir() if p.suffix.lower() in audio_exts]
+        # was shipped). Fall back to any audio file in the source folder.
+        candidates = [
+            p for p in song_dir.iterdir() if p.suffix.lower() in AUDIO_EXTS
+        ]
         if not candidates:
-            logger.error("No audio file found for %s in %s", parsed.title, dest_dir)
+            logger.error("No audio file found for %s in %s", parsed.title, song_dir)
             return False
-        music_path = candidates[0]
-        parsed.music_file = music_path.name
+        fallback = candidates[0]
+        fallback_key = f"{slug}/{fallback.name}"
+        upload_asset(fallback, fallback_key, storage)
+        parsed.music_file = fallback.name
+        music_key = fallback_key
         logger.warning(
-            "#MUSIC pointed at missing file; falling back to %s", music_path.name
+            "#MUSIC pointed at missing file; falling back to %s", fallback.name
         )
 
+    music_local = storage.reserve_path(music_key)
     try:
-        duration = float(librosa.get_duration(path=str(music_path)))
+        duration = float(librosa.get_duration(path=str(music_local)))
     except Exception as e:
-        logger.warning("Could not probe duration for %s (%s); falling back to 0", music_path, e)
+        logger.warning(
+            "Could not probe duration for %s (%s); falling back to 0", music_local, e
+        )
         duration = 0.0
 
-    audio_relpath = f"ddr/{slug}/{parsed.music_file}"
-    banner_relpath = relpath_or_none(parsed.banner, dest_dir)
-    bg_relpath = relpath_or_none(parsed.background, dest_dir)
-    jacket_relpath = relpath_or_none(parsed.jacket, dest_dir)
+    banner_relpath = key_or_none(parsed.banner, slug, storage)
+    bg_relpath = key_or_none(parsed.background, slug, storage)
+    jacket_relpath = key_or_none(parsed.jacket, slug, storage)
     if jacket_relpath is None:
         # Common DDR pack convention: "<song>-jacket.png" not declared in #JACKET
-        for f in dest_dir.glob("*-jacket.*"):
-            jacket_relpath = f"ddr/{slug}/{f.name}"
-            break
+        for f in song_dir.glob("*-jacket.*"):
+            candidate_key = f"{slug}/{f.name}"
+            if storage.exists(candidate_key):
+                jacket_relpath = candidate_key
+                break
 
     await persist_ddr_song(
         session,
         parsed=parsed,
         slug=slug,
-        audio_relpath=audio_relpath,
+        audio_relpath=music_key,
         banner_relpath=banner_relpath,
         jacket_relpath=jacket_relpath,
         bg_relpath=bg_relpath,
@@ -177,7 +185,7 @@ async def seed_game(
     session,
     root: Path,
     game: str,
-    storage_root: Path,
+    storage: StorageBackend,
     limit: Optional[int],
     dry_run: bool,
 ) -> int:
@@ -192,7 +200,7 @@ async def seed_game(
     count = 0
     for song_dir in tqdm(song_dirs, desc=game, unit="song"):
         ok = await seed_one_song(
-            session, song_dir, game, game_index, storage_root, dry_run
+            session, song_dir, game, game_index, storage, dry_run
         )
         if ok:
             count += 1
@@ -205,8 +213,7 @@ async def run(args: argparse.Namespace) -> int:
         logger.error("DDR root not found: %s", root)
         return 1
 
-    storage_root = Path(settings.AUDIO_STORAGE_PATH).resolve()
-    storage_root.mkdir(parents=True, exist_ok=True)
+    storage = get_storage()
 
     games: list[str]
     if args.game == "all":
@@ -216,12 +223,8 @@ async def run(args: argparse.Namespace) -> int:
 
     total = 0
     if args.dry_run:
-        # No DB needed for dry run.
-        class _NoSession:
-            async def __aenter__(self): return None
-            async def __aexit__(self, *a): return False
         for game in games:
-            total += await seed_game(None, root, game, storage_root, args.limit, True)
+            total += await seed_game(None, root, game, storage, args.limit, True)
         logger.info("✓ Dry run complete. Songs seen: %d", total)
         return 0
 
@@ -229,7 +232,7 @@ async def run(args: argparse.Namespace) -> int:
         for game in games:
             try:
                 total += await seed_game(
-                    session, root, game, storage_root, args.limit, False
+                    session, root, game, storage, args.limit, False
                 )
                 await session.commit()
             except Exception:
@@ -248,7 +251,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit songs per game")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Parse only; no DB writes, no asset copy")
+                        help="Parse only; no DB writes, no asset upload")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
