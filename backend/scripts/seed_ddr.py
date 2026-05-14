@@ -25,11 +25,11 @@ import librosa
 from slugify import slugify
 from tqdm import tqdm
 
-from db.session import AsyncSessionLocal
-from services import get_storage
-from services.chart_persistence import persist_ddr_song
-from services.sm_parser import ParsedSong, parse_sm
-from services.storage.base import StorageBackend
+from src.charts.service import persist_ddr_song
+from src.database import AsyncSessionLocal
+from src.songs.utils import ParsedSong, parse_sm
+from src.storage import get_storage
+from src.storage.client import StorageBackend
 
 logger = logging.getLogger(__name__)
 

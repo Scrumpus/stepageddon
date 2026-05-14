@@ -27,10 +27,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from db.session import AsyncSessionLocal
 from scripts.seed_ddr import DEFAULT_ROOT, seed_game
 from scripts.seed_playlist_from_game import build_playlist_for_game
-from services import get_storage
+from src.database import AsyncSessionLocal
+from src.storage import get_storage
 
 logger = logging.getLogger(__name__)
 

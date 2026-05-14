@@ -25,10 +25,10 @@ from ml.prepare_data import (
     DB_MIN, DB_MAX, DB_RANGE,
     N_FEAT_CHANNELS, N_SPECTRAL_CONTRAST,
 )
-from modules.step_generator.schemas import (
+from src.charts.schemas import (
     Chart, Step, StepType, Direction, BeatSubdivision,
 )
-from modules.step_generator.difficulty import get_difficulty_config
+from src.generation.constants import get_difficulty_config
 
 logger = logging.getLogger(__name__)
 
