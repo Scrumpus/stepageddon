@@ -21,8 +21,8 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from core.config import settings
-from services import get_storage
+from src.config import settings
+from src.storage import get_storage
 
 logger = logging.getLogger(__name__)
 

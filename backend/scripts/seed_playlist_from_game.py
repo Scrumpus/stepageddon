@@ -21,8 +21,9 @@ from typing import Optional
 
 from sqlalchemy import delete, select
 
-from db.models import Playlist, PlaylistSong, Song, SongSource
-from db.session import AsyncSessionLocal
+from src.database import AsyncSessionLocal
+from src.playlists.models import Playlist, PlaylistSong
+from src.songs.models import Song, SongSource
 
 logger = logging.getLogger(__name__)
 

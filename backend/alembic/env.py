@@ -5,9 +5,12 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from core.config import settings
-from db.base import Base
-from db import models  # noqa: F401  - register models on Base.metadata
+from src.config import settings
+from src.database import Base
+# Register all ORM classes on Base.metadata before Alembic snapshots it.
+import src.songs.models  # noqa: F401
+import src.charts.models  # noqa: F401
+import src.playlists.models  # noqa: F401
 
 config = context.config
 

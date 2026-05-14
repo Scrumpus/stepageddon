@@ -17,8 +17,8 @@ import sys
 
 from sqlalchemy import func, select, update
 
-from db.models import Song
-from db.session import AsyncSessionLocal
+from src.database import AsyncSessionLocal
+from src.songs.models import Song
 
 logger = logging.getLogger(__name__)
 
