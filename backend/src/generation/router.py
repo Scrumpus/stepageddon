@@ -40,7 +40,7 @@ _style_profiles_path = getattr(settings, 'STYLE_PROFILES_PATH', None)
 if _style_profiles_path is None:
     for _candidate in (
         os.path.join(os.path.dirname(settings.ML_MODEL_PATH), 'style_profiles.json'),
-        os.path.join('ml', 'training_data', 'style_profiles.json'),
+        os.path.join('ml', 'checkpoints', 'style_profiles.json'),
     ):
         if os.path.exists(_candidate):
             _style_profiles_path = _candidate
