@@ -3,19 +3,16 @@
  */
 
 import { api, getAudioUrl } from '@/lib/axios';
-import { DifficultyLevel } from '@/types/common.types';
 import { StepGenerationResponse } from '../types/menu.types';
 
 /**
- * Generate steps from uploaded audio file
+ * Generate charts for every difficulty from an uploaded audio file.
  */
 export async function generateStepsFromFile(
-  file: File,
-  difficulty: DifficultyLevel
+  file: File
 ): Promise<StepGenerationResponse> {
   const formData = new FormData();
   formData.append('file', file);
-  formData.append('difficulty', difficulty);
 
   const response = await api.post<StepGenerationResponse>(
     '/api/generate-steps',
@@ -31,18 +28,14 @@ export async function generateStepsFromFile(
 }
 
 /**
- * Generate steps from URL (YouTube or Spotify)
+ * Generate charts for every difficulty from a URL (YouTube or Spotify).
  */
 export async function generateStepsFromUrl(
-  url: string,
-  difficulty: DifficultyLevel
+  url: string
 ): Promise<StepGenerationResponse> {
   const response = await api.post<StepGenerationResponse>(
     '/api/generate-steps-url',
-    {
-      url,
-      difficulty,
-    }
+    { url }
   );
 
   return response.data;

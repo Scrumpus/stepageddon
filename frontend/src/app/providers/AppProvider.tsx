@@ -26,6 +26,10 @@ interface AppContextValue {
   setSongData: (data: SongInfo | null) => void;
   steps: Step[];
   setSteps: (steps: Step[]) => void;
+  // Charts for every difficulty produced by a single generation pass.
+  // When null, the DIFFICULTY_SELECT screen has nothing to render.
+  stepsByDifficulty: Partial<Record<DifficultyLevel, Step[]>> | null;
+  setStepsByDifficulty: (map: Partial<Record<DifficultyLevel, Step[]>> | null) => void;
   audioUrl: string | null;
   setAudioUrl: (url: string | null) => void;
 
@@ -64,6 +68,9 @@ function AppProvider({ children }: AppProviderProps) {
   // Song data
   const [songData, setSongData] = useState<SongInfo | null>(null);
   const [steps, setSteps] = useState<Step[]>([]);
+  const [stepsByDifficulty, setStepsByDifficulty] = useState<
+    Partial<Record<DifficultyLevel, Step[]>> | null
+  >(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
 
   // Loading state
@@ -84,6 +91,7 @@ function AppProvider({ children }: AppProviderProps) {
     setGameState(GameState.MENU);
     setSongData(null);
     setSteps([]);
+    setStepsByDifficulty(null);
     setAudioUrl(null);
     setGameResults(null);
 
@@ -114,6 +122,8 @@ function AppProvider({ children }: AppProviderProps) {
     setSongData,
     steps,
     setSteps,
+    stepsByDifficulty,
+    setStepsByDifficulty,
     audioUrl,
     setAudioUrl,
     loadingMessage,

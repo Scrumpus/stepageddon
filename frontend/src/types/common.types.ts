@@ -30,6 +30,7 @@ export type GameMode = 'single' | 'dual';
 export enum GameState {
   MENU = 'menu',
   LOADING = 'loading',
+  DIFFICULTY_SELECT = 'difficulty_select',
   READY = 'ready',
   PLAYING = 'playing',
   PAUSED = 'paused',

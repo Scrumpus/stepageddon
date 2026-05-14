@@ -52,22 +52,25 @@ ml_generator = MLChartGenerator(
 logger.info("ML chart generator loaded successfully")
 
 
+def _charts_payload(charts: dict) -> dict:
+    """Serialize a {difficulty: Chart} map to its JSON response shape."""
+    return {name: chart.to_json_dict() for name, chart in charts.items()}
+
+
 @router.post("/generate-steps")
 async def generate_steps_from_file(
     file: UploadFile = File(...),
-    difficulty: str = Form("medium"),
     style: str = Form("auto"),
 ):
     """
-    Generate step chart from uploaded audio file
+    Generate step charts for every difficulty from an uploaded audio file.
 
     Args:
         file: Audio file (MP3, WAV, OGG, FLAC)
-        difficulty: beginner, easy, medium, hard, or challenge
         style: Style profile name (e.g. 'Stream-Heavy') or 'auto'
     """
     try:
-        logger.info(f"Received file upload: {file.filename}, difficulty: {difficulty}")
+        logger.info(f"Received file upload: {file.filename}")
 
         allowed_extensions = [".mp3", ".wav", ".ogg", ".flac"]
         file_ext = os.path.splitext(file.filename)[1].lower()
@@ -101,23 +104,30 @@ async def generate_steps_from_file(
                 detail=f"Audio too long. Max duration: {settings.MAX_DURATION_SECONDS}s"
             )
 
-        logger.info(f"Generating {difficulty} steps (style={style})...")
-        chart = ml_generator.generate_from_audio(str(file_path), difficulty, style=style)
-        steps = chart.to_json_dict()
+        logger.info(f"Generating charts for all difficulties (style={style})...")
+        charts = ml_generator.generate_all_difficulties(str(file_path), style=style)
+
+        # All charts share the same tempo/duration (one audio analysis); pick
+        # any one for song_info.
+        any_chart = next(iter(charts.values()))
 
         response = {
             "song_id": song_id,
-            "steps": steps,
+            "charts": _charts_payload(charts),
             "song_info": {
                 "title": file.filename,
-                "duration": chart.duration,
-                "tempo": chart.tempo,
+                "duration": any_chart.duration,
+                "tempo": any_chart.tempo,
                 "source": "upload"
             },
             "audio_url": f"/api/audio/{audio_key}"
         }
 
-        logger.info(f"✓ Generated {len(chart.steps)} steps for {song_id}")
+        total_steps = sum(len(c.steps) for c in charts.values())
+        logger.info(
+            f"✓ Generated {total_steps} steps across {len(charts)} difficulties "
+            f"for {song_id}"
+        )
         return JSONResponse(content=response)
 
     except HTTPException:
@@ -132,13 +142,13 @@ async def generate_steps_from_url(
     request: GenerateRequest,
 ):
     """
-    Generate step chart from URL (YouTube or Spotify)
+    Generate step charts for every difficulty from a URL (YouTube or Spotify).
 
     Args:
-        request: URL and difficulty
+        request: URL + style
     """
     try:
-        logger.info(f"Received URL: {request.url}, difficulty: {request.difficulty}")
+        logger.info(f"Received URL: {request.url}")
 
         if not any(domain in request.url for domain in ["youtube.com", "youtu.be", "spotify.com"]):
             raise HTTPException(
@@ -169,21 +179,21 @@ async def generate_steps_from_url(
             )
 
         logger.info(
-            f"Generating {request.difficulty} steps (style={request.style})..."
+            f"Generating charts for all difficulties (style={request.style})..."
         )
-        chart = ml_generator.generate_from_audio(
-            str(file_path), request.difficulty, style=request.style,
+        charts = ml_generator.generate_all_difficulties(
+            str(file_path), style=request.style,
         )
-        steps = chart.to_json_dict()
+        any_chart = next(iter(charts.values()))
 
         response = {
             "song_id": song_id,
-            "steps": steps["steps"],
+            "charts": _charts_payload(charts),
             "song_info": {
                 "title": metadata["title"],
                 "artist": metadata.get("artist", "Unknown"),
-                "duration": chart.duration,
-                "tempo": chart.tempo,
+                "duration": any_chart.duration,
+                "tempo": any_chart.tempo,
                 "thumbnail": metadata.get("thumbnail", ""),
                 "source": metadata["source"],
                 "is_preview": download_result.get("is_preview", False)
@@ -191,7 +201,11 @@ async def generate_steps_from_url(
             "audio_url": f"/api/audio/{audio_key}"
         }
 
-        logger.info(f"✓ Generated {len(chart.steps)} steps for {song_id}")
+        total_steps = sum(len(c.steps) for c in charts.values())
+        logger.info(
+            f"✓ Generated {total_steps} steps across {len(charts)} difficulties "
+            f"for {song_id}"
+        )
         return JSONResponse(content=response)
 
     except HTTPException:

@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -41,6 +42,22 @@ APP_DIFFICULTY_MAP = {
     'hard': 3,
     'challenge': 4,
 }
+
+@dataclass
+class _AudioAnalysis:
+    """Per-song features that are reused across every difficulty in a
+    multi-difficulty generation. Created once by :meth:`MLChartGenerator._analyze_audio`
+    and consumed by :meth:`MLChartGenerator._chart_for_difficulty`."""
+
+    duration: float
+    feats_whitened: np.ndarray
+    tempo: float
+    beat_times: np.ndarray
+    rms_norm: np.ndarray
+    centroid_norm: np.ndarray
+    harm_rms: np.ndarray
+    audio_seed: int
+
 
 # Defaults for style-profile post-processing knobs. These are used when a
 # profile doesn't explicitly carry the field (e.g. a hand-edited profile, or
@@ -601,40 +618,29 @@ class MLChartGenerator:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def generate_from_audio(
-        self,
-        audio_path: str,
-        difficulty: str = 'medium',
-        target_density: Optional[float] = None,
-        style: Optional[str] = None,
-    ) -> Chart:
-        if self.model is None:
-            raise RuntimeError("No model loaded. Call load_model() first.")
+    def _analyze_audio(self, audio_path: str) -> "_AudioAnalysis":
+        """Load audio and compute everything that's shared across difficulties.
 
-        difficulty_id = APP_DIFFICULTY_MAP.get(difficulty, 2)
-
-        if target_density is None:
-            target_density = float(self.default_density_by_id[difficulty_id])
-        logger.info(f"Target density: {target_density:.2f} steps/sec")
+        Extracted from :meth:`generate_from_audio` so the multi-difficulty
+        path can run feature extraction / beat tracking / RMS / HPSS once
+        and reuse them across N inference passes.
+        """
+        if self.feat_mean is None or self.feat_std is None:
+            raise RuntimeError("Model loaded without feat_mean/feat_std. Retrain.")
 
         logger.info(f"Loading audio from {audio_path}...")
         y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
         duration = librosa.get_duration(y=y, sr=sr)
 
         feats = self._extract_feats(y, sr)
-        if self.feat_mean is None or self.feat_std is None:
-            raise RuntimeError("Model loaded without feat_mean/feat_std. Retrain.")
         feats_whitened = (feats - self.feat_mean) / self.feat_std
 
-        # Tempo / beats for snapping.
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
         if hasattr(tempo, '__len__'):
             tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
         tempo = float(tempo)
         beat_times = librosa.frames_to_time(beat_frames, sr=sr)
 
-        # RMS / spectral centroid for the FootStateArrowAssigner heuristics
-        # and for the jumphold gate.
         rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)[0]
         rms_norm = rms / (rms.max() + 1e-8)
         centroid = librosa.feature.spectral_centroid(
@@ -642,7 +648,6 @@ class MLChartGenerator:
         )[0]
         centroid_norm = centroid / (centroid.max() + 1e-8)
 
-        # HPSS harmonic energy curve — used to detect hold sustain decay.
         try:
             y_harm = librosa.effects.hpss(y)[0]
             harm_rms = librosa.feature.rms(y=y_harm, hop_length=HOP_LENGTH)[0]
@@ -659,18 +664,38 @@ class MLChartGenerator:
             16,
         )
 
-        logger.info(f"Running inference (difficulty={difficulty}, id={difficulty_id})...")
-        onset_p, sustain_p, intensity = self._predict_chunked(
-            feats_whitened, difficulty_id, target_density,
+        return _AudioAnalysis(
+            duration=duration,
+            feats_whitened=feats_whitened,
+            tempo=tempo,
+            beat_times=beat_times,
+            rms_norm=rms_norm,
+            centroid_norm=centroid_norm,
+            harm_rms=harm_rms,
+            audio_seed=audio_seed,
         )
 
-        diff_config = get_difficulty_config(difficulty)
-        logger.info("Post-processing predictions...")
+    def _chart_from_signals(
+        self,
+        analysis: "_AudioAnalysis",
+        difficulty: str,
+        onset_p: np.ndarray,
+        sustain_p: np.ndarray,
+        intensity: np.ndarray,
+        style: Optional[str] = None,
+    ) -> Chart:
+        """Build a Chart from already-computed per-difficulty signals.
 
-        # Resolve style profile based on the predicted dense signals.
+        Shared by the single-difficulty and batched-multi paths so
+        post-processing only lives in one place.
+        """
+        diff_config = get_difficulty_config(difficulty)
+
         T = onset_p.shape[0]
         onset_density_pred = float(onset_p.sum() / max(T / FRAMES_PER_SECOND, 1.0))
-        intensity_mean_pred = float(intensity[intensity > 0.0].mean()) if (intensity > 0.0).any() else 0.0
+        intensity_mean_pred = (
+            float(intensity[intensity > 0.0].mean()) if (intensity > 0.0).any() else 0.0
+        )
         resolved_style = style if style is not None else self.style
         knobs, resolved_name = self._resolve_style(
             resolved_style, onset_density_pred, intensity_mean_pred,
@@ -678,26 +703,103 @@ class MLChartGenerator:
 
         steps = self._postprocess(
             onset_p, sustain_p, intensity,
-            tempo, beat_times, duration, diff_config,
-            energy_curve=rms_norm, brightness_curve=centroid_norm,
-            harmonic_curve=harm_rms,
-            audio_seed=audio_seed,
+            analysis.tempo, analysis.beat_times, analysis.duration, diff_config,
+            energy_curve=analysis.rms_norm,
+            brightness_curve=analysis.centroid_norm,
+            harmonic_curve=analysis.harm_rms,
+            audio_seed=analysis.audio_seed,
             style_knobs=knobs,
         )
 
         chart = Chart(
             steps=steps,
             difficulty=difficulty,
-            tempo=tempo,
-            duration=duration,
+            tempo=analysis.tempo,
+            duration=analysis.duration,
         )
-
         logger.info(
-            f"Generated {len(steps)} steps "
+            f"Generated {len(steps)} {difficulty} steps "
             f"({len(chart.get_taps())} taps, {len(chart.get_holds())} holds) "
             f"style='{resolved_name}'"
         )
         return chart
+
+    def _chart_for_difficulty(
+        self,
+        analysis: "_AudioAnalysis",
+        difficulty: str,
+        target_density: Optional[float] = None,
+        style: Optional[str] = None,
+    ) -> Chart:
+        """Run inference + post-processing for one difficulty over a shared
+        :class:`_AudioAnalysis`."""
+        difficulty_id = APP_DIFFICULTY_MAP.get(difficulty, 2)
+        if target_density is None:
+            target_density = float(self.default_density_by_id[difficulty_id])
+        logger.info(
+            f"Running inference (difficulty={difficulty}, id={difficulty_id}, "
+            f"density={target_density:.2f} steps/sec)..."
+        )
+
+        onset_p, sustain_p, intensity = self._predict_chunked(
+            analysis.feats_whitened, difficulty_id, target_density,
+        )
+        return self._chart_from_signals(
+            analysis, difficulty, onset_p, sustain_p, intensity, style=style,
+        )
+
+    def generate_from_audio(
+        self,
+        audio_path: str,
+        difficulty: str = 'medium',
+        target_density: Optional[float] = None,
+        style: Optional[str] = None,
+    ) -> Chart:
+        if self.model is None:
+            raise RuntimeError("No model loaded. Call load_model() first.")
+        analysis = self._analyze_audio(audio_path)
+        return self._chart_for_difficulty(
+            analysis, difficulty, target_density=target_density, style=style,
+        )
+
+    def generate_all_difficulties(
+        self,
+        audio_path: str,
+        style: Optional[str] = None,
+        difficulties: Optional[List[str]] = None,
+    ) -> Dict[str, Chart]:
+        """Generate a chart for every difficulty over one shared audio analysis.
+
+        Audio load + feature extraction + beat/RMS/HPSS analysis runs once,
+        AND model inference runs once with all difficulties batched into a
+        single forward pass per chunk. Only post-processing (NMS, beat snap,
+        arrow assignment) is serial per difficulty.
+        """
+        if self.model is None:
+            raise RuntimeError("No model loaded. Call load_model() first.")
+        names = difficulties or list(APP_DIFFICULTY_MAP.keys())
+        analysis = self._analyze_audio(audio_path)
+
+        difficulty_ids = [APP_DIFFICULTY_MAP.get(n, 2) for n in names]
+        target_densities = [
+            float(self.default_density_by_id[did]) for did in difficulty_ids
+        ]
+        logger.info(
+            f"Running batched inference over {len(names)} difficulties: "
+            f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
+        )
+        onset_batch, sustain_batch, intensity_batch = self._predict_chunked_multi(
+            analysis.feats_whitened, difficulty_ids, target_densities,
+        )
+
+        charts: Dict[str, Chart] = {}
+        for i, name in enumerate(names):
+            charts[name] = self._chart_from_signals(
+                analysis, name,
+                onset_batch[i], sustain_batch[i], intensity_batch[i],
+                style=style,
+            )
+        return charts
 
     @torch.no_grad()
     def _predict_chunked(
@@ -762,6 +864,99 @@ class MLChartGenerator:
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)
+        onset_avg = onset_sum / counts
+        sustain_avg = sustain_sum / counts
+        intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
+        return onset_avg, sustain_avg, intensity_avg
+
+    @torch.no_grad()
+    def _predict_chunked_multi(
+        self,
+        feats: np.ndarray,
+        difficulty_ids: List[int],
+        target_densities: List[float],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Batched-multi version of :meth:`_predict_chunked`.
+
+        Runs all difficulties as one forward pass per chunk: the shared audio
+        features are broadcast across the batch dimension, while difficulty
+        and density vary per row. Returns three arrays of shape ``[B, T]``,
+        one row per requested difficulty.
+        """
+        B = len(difficulty_ids)
+        if B == 0:
+            raise ValueError("difficulty_ids must be non-empty")
+        if len(target_densities) != B:
+            raise ValueError(
+                f"target_densities length {len(target_densities)} != "
+                f"difficulty_ids length {B}"
+            )
+
+        T = feats.shape[0]
+        onset_sum = np.zeros((B, T), dtype=np.float32)
+        sustain_sum = np.zeros((B, T), dtype=np.float32)
+        intensity_sum = np.zeros((B, T), dtype=np.float32)
+        counts = np.zeros(T, dtype=np.float32)
+
+        stride = self.chunk_frames - self.overlap_frames
+        density_norms = [
+            (float(d) - DENSITY_MEAN) / DENSITY_STD for d in target_densities
+        ]
+
+        # Conditioning tensors are per-chunk-constant — build once.
+        diff_tensor = torch.tensor(
+            difficulty_ids, dtype=torch.long, device=self.device,
+        )
+        density_tensor = torch.tensor(
+            density_norms, dtype=torch.float32, device=self.device,
+        )
+
+        for start in range(0, T, stride):
+            end = min(start + self.chunk_frames, T)
+            chunk = feats[start:end]
+
+            if chunk.shape[0] < self.chunk_frames:
+                pad = np.zeros(
+                    (self.chunk_frames - chunk.shape[0], self.n_in_channels),
+                    dtype=np.float32,
+                )
+                chunk = np.concatenate([chunk, pad], axis=0)
+
+            # Expand the single chunk to a [B, chunk_frames, C] batch. The
+            # underlying storage is shared; `.contiguous()` materializes a real
+            # batched tensor so the model's BatchNorm sees independent rows.
+            feats_tensor = (
+                torch.from_numpy(chunk)
+                .to(self.device)
+                .unsqueeze(0)
+                .expand(B, -1, -1)
+                .contiguous()
+            )
+
+            start_seconds = float(start) / FRAMES_PER_SECOND
+            remaining_seconds = max(0.0, float(T - end) / FRAMES_PER_SECOND)
+            start_seconds_tensor = torch.full(
+                (B,), start_seconds, dtype=torch.float32, device=self.device,
+            )
+            remaining_seconds_tensor = torch.full(
+                (B,), remaining_seconds, dtype=torch.float32, device=self.device,
+            )
+
+            onset_logits, sustain_logits, intensity_pred = self.model(
+                feats_tensor, diff_tensor, density_tensor,
+                start_seconds_tensor, remaining_seconds_tensor,
+            )
+            onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[:, :, 0]
+            sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]
+            intensity_v = intensity_pred.float().cpu().numpy()[:, :, 0]
+
+            valid_len = min(end - start, self.chunk_frames)
+            onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
+            sustain_sum[:, start:start + valid_len] += sustain_p[:, :valid_len]
+            intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
+            counts[start:start + valid_len] += 1.0
+
+        counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)

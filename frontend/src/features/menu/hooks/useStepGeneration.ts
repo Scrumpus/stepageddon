@@ -1,33 +1,37 @@
 /**
- * Hook for handling step generation with loading states and error handling
+ * Hook for handling step generation with loading states and error handling.
+ *
+ * Generation now produces a chart for every difficulty in a single pass; the
+ * user picks which to play on the DIFFICULTY_SELECT screen that follows.
  */
 
 import { useState, useCallback } from 'react';
-import { GameState } from '@/types/common.types';
+import { DifficultyLevel, GameState } from '@/types/common.types';
 import { generateStepsFromFile, generateStepsFromUrl, getAudioUrl } from '../api';
 import { useApp } from '@/app/providers/AppProvider';
 import { Step } from '@/features/game/types/step.types';
 import { StepGenerationResponse } from '../types/menu.types';
 
 /**
- * Extract steps from API response (prefers new_steps format)
+ * Convert the response's `charts` map into a `{difficulty: Step[]}` map for
+ * AppProvider. Drops difficulties the backend didn't return.
  */
-function extractSteps(response: StepGenerationResponse): Step[] {
-  console.log({ response });
-  // Use new_steps if available
-  if (response.steps && Array.isArray(response.steps)) {
-    return response.steps as Step[];
+function chartsToStepsByDifficulty(
+  response: StepGenerationResponse,
+): Partial<Record<DifficultyLevel, Step[]>> {
+  const out: Partial<Record<DifficultyLevel, Step[]>> = {};
+  if (!response.charts) return out;
+  for (const [key, payload] of Object.entries(response.charts)) {
+    if (!payload || !Array.isArray(payload.steps)) continue;
+    out[key as DifficultyLevel] = payload.steps as Step[];
   }
-
-  // Fallback: shouldn't happen with new backend
-  console.warn('No new_steps found in response, steps may be empty');
-  return [];
+  return out;
 }
 
 export function useStepGeneration() {
   const {
-    difficulty,
     setSongData,
+    setStepsByDifficulty,
     setSteps,
     setAudioUrl,
     setGameState,
@@ -37,6 +41,32 @@ export function useStepGeneration() {
   } = useApp();
 
   const [isLoading, setIsLoading] = useState(false);
+
+  const finishGeneration = useCallback(
+    (result: StepGenerationResponse) => {
+      setLoadingProgress(100);
+      setLoadingMessage('Generation complete!');
+
+      setSongData(result.song_info);
+      setSteps([]); // cleared until user picks a difficulty
+      setStepsByDifficulty(chartsToStepsByDifficulty(result));
+      setAudioUrl(getAudioUrl(result.audio_url));
+
+      setTimeout(() => {
+        setGameState(GameState.DIFFICULTY_SELECT);
+        setIsLoading(false);
+      }, 500);
+    },
+    [
+      setAudioUrl,
+      setGameState,
+      setLoadingMessage,
+      setLoadingProgress,
+      setSongData,
+      setSteps,
+      setStepsByDifficulty,
+    ],
+  );
 
   /**
    * Handle file upload and step generation
@@ -49,39 +79,18 @@ export function useStepGeneration() {
         setLoadingMessage('Uploading audio...');
         setLoadingProgress(25);
 
-        const result = await generateStepsFromFile(file, difficulty);
-
-        setLoadingProgress(100);
-        setLoadingMessage('Generation complete!');
-
-        // Set data
-        setSongData(result.song_info);
-        setSteps(extractSteps(result));
-        setAudioUrl(getAudioUrl(result.audio_url));
-
-        // Move to ready screen
-        setTimeout(() => {
-          setGameState(GameState.READY);
-          setIsLoading(false);
-        }, 500);
+        const result = await generateStepsFromFile(file);
+        finishGeneration(result);
       } catch (error: any) {
         console.error('Upload failed:', error);
-        const errorMessage = error.response?.data?.detail || error.message || 'Failed to generate steps';
+        const errorMessage =
+          error.response?.data?.detail || error.message || 'Failed to generate steps';
         showToast(errorMessage, 'error');
         setGameState(GameState.MENU);
         setIsLoading(false);
       }
     },
-    [
-      difficulty,
-      setGameState,
-      setLoadingMessage,
-      setLoadingProgress,
-      setSongData,
-      setSteps,
-      setAudioUrl,
-      showToast,
-    ]
+    [finishGeneration, setGameState, setLoadingMessage, setLoadingProgress, showToast],
   );
 
   /**
@@ -101,39 +110,18 @@ export function useStepGeneration() {
           setLoadingProgress(50);
         }, 1000);
 
-        const result = await generateStepsFromUrl(url, difficulty);
-
-        setLoadingProgress(100);
-        setLoadingMessage('Generation complete!');
-
-        // Set data
-        setSongData(result.song_info);
-        setSteps(extractSteps(result));
-        setAudioUrl(getAudioUrl(result.audio_url));
-
-        // Move to ready screen
-        setTimeout(() => {
-          setGameState(GameState.READY);
-          setIsLoading(false);
-        }, 500);
+        const result = await generateStepsFromUrl(url);
+        finishGeneration(result);
       } catch (error: any) {
         console.error('URL processing failed:', error);
-        const errorMessage = error.response?.data?.detail || error.message || 'Failed to generate steps';
+        const errorMessage =
+          error.response?.data?.detail || error.message || 'Failed to generate steps';
         showToast(errorMessage, 'error');
         setGameState(GameState.MENU);
         setIsLoading(false);
       }
     },
-    [
-      difficulty,
-      setGameState,
-      setLoadingMessage,
-      setLoadingProgress,
-      setSongData,
-      setSteps,
-      setAudioUrl,
-      showToast,
-    ]
+    [finishGeneration, setGameState, setLoadingMessage, setLoadingProgress, showToast],
   );
 
   return {

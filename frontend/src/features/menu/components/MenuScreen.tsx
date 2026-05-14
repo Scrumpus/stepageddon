@@ -6,7 +6,6 @@ import { useState } from 'react';
 import { Disc3, ListMusic, Sparkles } from 'lucide-react';
 import { useApp } from '@/app/providers/AppProvider';
 import { useStepGeneration } from '../hooks';
-import DifficultySelector from './DifficultySelector';
 import FileUploader from './FileUploader';
 import UrlInput from './UrlInput';
 import ModeSelector from './ModeSelector';
@@ -16,7 +15,7 @@ import { SongsTab } from '@/features/songs/components';
 type Tab = 'playlists' | 'songs' | 'create';
 
 function MenuScreen() {
-  const { difficulty, setDifficulty, gameMode, setGameMode } = useApp();
+  const { gameMode, setGameMode } = useApp();
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [tab, setTab] = useState<Tab>('playlists');
 
@@ -63,10 +62,9 @@ function MenuScreen() {
           {tab === 'songs' && <SongsTab />}
           {tab === 'create' && (
             <div className="space-y-6">
-              <DifficultySelector
-                difficulty={difficulty}
-                onDifficultyChange={setDifficulty}
-              />
+              <p className="text-sm text-gray-400 text-center">
+                We'll generate charts for every difficulty — you pick which to play next.
+              </p>
 
               <div className="space-y-4">
                 <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />

@@ -45,9 +45,9 @@ export const DIFFICULTY_INFO: Record<DifficultyLevel, DifficultyInfo> = {
 } as const;
 
 /**
- * New step generator output format
+ * Per-difficulty chart payload returned by the generation endpoints.
  */
-export interface NewStepsResponse {
+export interface ChartPayload {
   steps: Step[];
   difficulty: string;
   tempo: number;
@@ -63,12 +63,13 @@ export interface NewStepsResponse {
 }
 
 /**
- * API response for step generation
+ * API response for step generation. Charts are emitted for every difficulty
+ * in a single pass; the user picks which to play after generation.
  */
 export interface StepGenerationResponse {
+  song_id: string;
   song_info: SongInfo;
-  steps: any[];                      // Legacy format (deprecated)
-  new_steps?: NewStepsResponse;      // New generator output
+  charts: Partial<Record<DifficultyLevel, ChartPayload>>;
   audio_url: string;
 }
 
