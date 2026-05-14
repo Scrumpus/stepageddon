@@ -27,10 +27,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from core.config import settings
 from db.session import AsyncSessionLocal
 from scripts.seed_ddr import DEFAULT_ROOT, seed_game
 from scripts.seed_playlist_from_game import build_playlist_for_game
+from services import get_storage
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,7 @@ async def run(args: argparse.Namespace) -> int:
         logger.error("DDR root not found: %s", root)
         return 1
 
-    storage_root = Path(settings.AUDIO_STORAGE_PATH).resolve()
-    storage_root.mkdir(parents=True, exist_ok=True)
+    storage = get_storage()
 
     games = sorted(d.name for d in root.iterdir() if d.is_dir())
     if not games:
@@ -73,7 +72,7 @@ async def run(args: argparse.Namespace) -> int:
                         session,
                         root=root,
                         game=game,
-                        storage_root=storage_root,
+                        storage=storage,
                         limit=args.limit_per_game,
                         dry_run=False,
                     )

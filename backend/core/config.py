@@ -19,9 +19,19 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", "8000"))
     
     # File Storage
-    AUDIO_STORAGE_PATH: str = os.getenv("AUDIO_STORAGE_PATH", "./audio_storage")
+    # STORAGE_BACKEND selects the storage implementation (see services/storage/).
+    # "local" reads/writes AUDIO_STORAGE_PATH. "s3" (future) uses S3_* settings.
+    STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
+    AUDIO_STORAGE_PATH: str = os.getenv("AUDIO_STORAGE_PATH", "~/stepageddon-data/audio")
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
     MAX_DURATION_SECONDS: int = int(os.getenv("MAX_DURATION_SECONDS", "600"))
+
+    # S3-compatible storage (used when STORAGE_BACKEND=s3; phase 2)
+    S3_BUCKET: str = os.getenv("S3_BUCKET", "")
+    S3_ENDPOINT_URL: str = os.getenv("S3_ENDPOINT_URL", "")
+    S3_REGION: str = os.getenv("S3_REGION", "auto")
+    S3_ACCESS_KEY_ID: str = os.getenv("S3_ACCESS_KEY_ID", "")
+    S3_SECRET_ACCESS_KEY: str = os.getenv("S3_SECRET_ACCESS_KEY", "")
 
     # Database
     DATABASE_URL: str = os.getenv(

@@ -657,7 +657,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--tol-frames', type=int, default=3)
     parser.add_argument('--log-interval', type=int, default=50)
     parser.add_argument('--focal-gamma', type=float, default=2.0)
-    parser.add_argument('--sustain-weight', type=float, default=1.0)
+    parser.add_argument('--sustain-weight', type=float, default=2.0)
     parser.add_argument('--intensity-weight', type=float, default=0.5)
     parser.add_argument('--onset-pos-weight', type=float, default=None,
                         help='Override onset BCE pos_weight; default sqrt((1-p)/p) capped at 50')
