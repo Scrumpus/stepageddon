@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ChevronDown, Disc3, Link2, ListMusic, Sparkles } from 'lucide-react';
-import { useApp } from '@/app/providers/AppProvider';
+import { useGameStore } from '@/app/store/useGameStore';
 import { useStepGeneration } from '../hooks';
 import FileUploader from './FileUploader';
 import UrlInput from './UrlInput';
@@ -12,7 +12,8 @@ import { SongsTab } from '@/features/songs/components';
 type Tab = 'playlists' | 'songs' | 'create';
 
 function MenuScreen() {
-  const { gameMode, setGameMode } = useApp();
+  const gameMode = useGameStore((s) => s.gameMode);
+  const setGameMode = useGameStore((s) => s.setGameMode);
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [tab, setTab] = useState<Tab>('playlists');
   const [showUrlFallback, setShowUrlFallback] = useState(false);

@@ -5,7 +5,8 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { GameState, GameMode } from '@/types/common.types';
-import { useApp } from '@/app/providers/AppProvider';
+import { useGameStore } from '@/app/store/useGameStore';
+import { useAudio } from '@/app/providers/AudioProvider';
 import {
   Judgment,
   HitAccuracy,
@@ -30,16 +31,13 @@ import PauseOverlay from './PauseOverlay';
 const EMPTY_HIT_ACCURACY: HitAccuracy = { perfect: 0, good: 0, ok: 0, miss: 0 };
 
 function GameScreen() {
-  const {
-    steps,
-    audioRef,
-    songData,
-    setGameResults,
-    setGameState: setAppGameState,
-    resetGame,
-    gameMode,
-    setGameMode,
-  } = useApp();
+  const steps = useGameStore((s) => s.steps);
+  const songData = useGameStore((s) => s.songData);
+  const gameMode = useGameStore((s) => s.gameMode);
+  const setGameMode = useGameStore((s) => s.setGameMode);
+  const resetGame = useGameStore((s) => s.resetGame);
+  const gameFinished = useGameStore((s) => s.gameFinished);
+  const { audioRef } = useAudio();
   const isDualMode = gameMode === 'dual';
 
   const [gameState, setGameState] = useState<GameState>(GameState.PLAYING);
@@ -51,8 +49,8 @@ function GameScreen() {
 
   // Mirror end-of-game stats into refs so finishGame can read them
   // synchronously without nesting setState updaters — updaters run during
-  // render and calling setGameResults (an AppProvider update) from inside
-  // one tripped React's "setState during render" warning.
+  // render and dispatching the finish action from inside one tripped
+  // React's "setState during render" warning.
   const scoreRef = useRef(0);
   const maxComboRef = useRef(0);
   const hitAccuracyRef = useRef<HitAccuracy>(EMPTY_HIT_ACCURACY);
@@ -117,15 +115,14 @@ function GameScreen() {
   const finishGame = useCallback(() => {
     const accuracy = hitAccuracyRef.current;
     const totalNotes = Object.values(accuracy).reduce((sum, val) => sum + val, 0);
-    setGameResults({
+    gameFinished({
       score: scoreRef.current,
       maxCombo: maxComboRef.current,
       hitAccuracy: accuracy,
       accuracy: calculateAccuracy(accuracy),
       totalNotes,
     });
-    setAppGameState(GameState.FINISHED);
-  }, [setGameResults, setAppGameState]);
+  }, [gameFinished]);
 
   const handleModeChange = useCallback((newMode: GameMode) => {
     setGameMode(newMode);

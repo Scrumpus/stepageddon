@@ -4,8 +4,8 @@
  */
 
 import { ArrowLeft, Music } from 'lucide-react';
-import { DifficultyLevel, GameState } from '@/types/common.types';
-import { useApp } from '@/app/providers/AppProvider';
+import { DifficultyLevel } from '@/types/common.types';
+import { useGameStore } from '@/app/store/useGameStore';
 import { DIFFICULTY_INFO } from '../types/menu.types';
 
 const DIFFICULTY_ORDER: DifficultyLevel[] = [
@@ -17,25 +17,17 @@ const DIFFICULTY_ORDER: DifficultyLevel[] = [
 ];
 
 function DifficultySelectScreen() {
-  const {
-    songData,
-    stepsByDifficulty,
-    setSteps,
-    setDifficulty,
-    setGameState,
-    resetGame,
-  } = useApp();
+  const songData = useGameStore((s) => s.songData);
+  const stepsByDifficulty = useGameStore((s) => s.stepsByDifficulty);
+  const difficultyPicked = useGameStore((s) => s.difficultyPicked);
+  const resetGame = useGameStore((s) => s.resetGame);
 
   if (!stepsByDifficulty) {
     return null;
   }
 
   const handlePick = (level: DifficultyLevel) => {
-    const steps = stepsByDifficulty[level];
-    if (!steps) return;
-    setDifficulty(level);
-    setSteps(steps);
-    setGameState(GameState.READY);
+    difficultyPicked(level);
   };
 
   return (

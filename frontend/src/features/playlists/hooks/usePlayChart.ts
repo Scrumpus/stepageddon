@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react';
-import { useApp } from '@/app/providers/AppProvider';
+import { useGameStore } from '@/app/store/useGameStore';
+import { useToastApi } from '@/app/providers/ToastProvider';
 import { GameState } from '@/types/common.types';
 import { getAudioUrl } from '@/lib/axios';
 import { getChart } from '../api';
@@ -7,19 +8,13 @@ import { ChartSummaryDTO, SongSummaryDTO } from '../types';
 
 /**
  * Loads a chart from the database and hands it off to the existing
- * LOADING → READY → PLAYING pipeline by populating AppContext the same
- * way `useStepGeneration` does.
+ * LOADING → READY → PLAYING pipeline.
  */
 export function usePlayChart() {
-  const {
-    setSongData,
-    setSteps,
-    setAudioUrl,
-    setGameState,
-    setLoadingMessage,
-    setLoadingProgress,
-    showToast,
-  } = useApp();
+  const chartLoadStarted = useGameStore((s) => s.chartLoadStarted);
+  const chartLoaded = useGameStore((s) => s.chartLoaded);
+  const setGameState = useGameStore((s) => s.setGameState);
+  const { showToast } = useToastApi();
 
   const [isLoading, setIsLoading] = useState(false);
 
@@ -27,24 +22,21 @@ export function usePlayChart() {
     async (song: SongSummaryDTO, chart: ChartSummaryDTO) => {
       try {
         setIsLoading(true);
-        setGameState(GameState.LOADING);
-        setLoadingMessage(`Loading ${song.title}…`);
-        setLoadingProgress(40);
+        chartLoadStarted({ message: `Loading ${song.title}…`, progress: 40 });
 
         const fullChart = await getChart(song.id, chart.difficulty_name);
 
-        setLoadingProgress(100);
-        setLoadingMessage('Ready!');
-
-        setSongData({
-          title: song.title,
-          artist: song.artist ?? undefined,
-          duration: song.duration,
-          tempo: song.tempo,
-          thumbnail: song.jacket_url ?? song.banner_url ?? undefined,
+        chartLoaded({
+          songData: {
+            title: song.title,
+            artist: song.artist ?? undefined,
+            duration: song.duration,
+            tempo: song.tempo,
+            thumbnail: song.jacket_url ?? song.banner_url ?? undefined,
+          },
+          steps: fullChart.steps,
+          audioUrl: getAudioUrl(song.audio_url),
         });
-        setSteps(fullChart.steps);
-        setAudioUrl(getAudioUrl(song.audio_url));
 
         setTimeout(() => {
           setGameState(GameState.READY);
@@ -58,15 +50,7 @@ export function usePlayChart() {
         setIsLoading(false);
       }
     },
-    [
-      setGameState,
-      setLoadingMessage,
-      setLoadingProgress,
-      setSongData,
-      setSteps,
-      setAudioUrl,
-      showToast,
-    ]
+    [chartLoadStarted, chartLoaded, setGameState, showToast],
   );
 
   return { playChart, isLoading };
