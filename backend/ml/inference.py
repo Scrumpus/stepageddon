@@ -64,7 +64,8 @@ class _AudioAnalysis:
 # the legacy "auto" path before clustering has run). Conservative values that
 # work on all difficulties.
 DEFAULT_STYLE_KNOBS: Dict[str, float] = {
-    'jump_threshold': 0.5,        # intensity ≥ this → jump
+    'jump_threshold': 0.05,       # min intensity for a peak to be jump-eligible
+    'target_jump_rate': 0.05,     # fraction of peaks to mark as jumps (top-K)
     'jumphold_rate': 0.0,         # 0 disables jumpholds
     'jumphold_rms_thr': 0.7,
     'jack_rate': 0.05,
@@ -319,11 +320,12 @@ def _profile_knobs(profile: Dict) -> Dict[str, float]:
     rm = profile.get('raw_means', {})
     knobs = dict(DEFAULT_STYLE_KNOBS)
 
-    # Jump threshold: profiles with a high observed jump_rate need a *lower*
-    # intensity threshold, since jumps are common in their style. Map the
-    # standardized jump_rate range [0..0.2] linearly to threshold [0.6..0.35].
+    # Top-K jump selection: the profile's observed jump_rate tells us what
+    # fraction of peaks should become jumps. We use the raw rate as a target
+    # and keep a small absolute intensity floor to filter out near-zero noise.
     jump_rate = float(rm.get('jump_rate', 0.05))
-    knobs['jump_threshold'] = float(np.clip(0.60 - 1.5 * jump_rate, 0.30, 0.65))
+    knobs['target_jump_rate'] = float(np.clip(jump_rate, 0.0, 0.40))
+    knobs['jump_threshold'] = 0.05
 
     # Jumphold: enable when both holds and jumps are common; rate scales with
     # min(hold_rate, jump_rate).
@@ -1042,20 +1044,49 @@ class MLChartGenerator:
 
         # Classify each peak.
         jump_threshold = float(style_knobs.get('jump_threshold', self.intensity_threshold_base))
+        target_jump_rate = float(style_knobs.get('target_jump_rate', 0.0))
         jumphold_rate = float(style_knobs.get('jumphold_rate', 0.0))
         jumphold_rms_thr = float(style_knobs.get('jumphold_rms_thr', 0.7))
 
         max_hold_frames = max(1, int(round(diff_config.max_hold_duration * FRAMES_PER_SECOND)))
         rng = random.Random(audio_seed ^ 0xA5A5A5A5)
 
+        # Top-K jump selection: rank peaks by predicted intensity, mark the top
+        # `target_jump_rate * N` (above the absolute floor) as jumps. Robust
+        # to the regression head's absolute scale — MSE on the sparse-jump
+        # target compresses predictions toward 0, so an absolute threshold
+        # would silence all jumps even though the relative ranking is sound.
+        if peaks and jumps_allowed and target_jump_rate > 0.0:
+            peak_intens = np.fromiter(
+                (float(intensity[f]) for f, _, _ in peaks),
+                dtype=np.float32, count=len(peaks),
+            )
+            eligible = np.where(peak_intens >= jump_threshold)[0]
+            target_k = int(round(target_jump_rate * len(peaks)))
+            if eligible.size > 0 and target_k > 0:
+                top = eligible[np.argsort(-peak_intens[eligible])[:target_k]]
+                jump_peak_indices: Set[int] = {int(i) for i in top}
+            else:
+                jump_peak_indices = set()
+            logger.info(
+                f"[jump debug] peaks={len(peaks)} intensity max={peak_intens.max():.3f} "
+                f"p90={np.percentile(peak_intens, 90):.3f} floor={jump_threshold:.3f} "
+                f"target_rate={target_jump_rate:.3f} → selected={len(jump_peak_indices)}"
+            )
+        else:
+            jump_peak_indices = set()
+            logger.info(
+                f"[jump debug] peaks={len(peaks)} jumps_allowed={jumps_allowed} "
+                f"target_rate={target_jump_rate:.3f} → selected=0"
+            )
+
         note_events = []
-        for frame, t, confidence in peaks:
+        for peak_idx, (frame, t, confidence) in enumerate(peaks):
             is_hold_start = (
                 holds_allowed
                 and sustain_p[frame] >= self.sustain_threshold_up
             )
-            intensity_val = float(intensity[frame])
-            is_jump = jumps_allowed and (intensity_val >= jump_threshold)
+            is_jump = peak_idx in jump_peak_indices
 
             if is_hold_start:
                 end_frame = self._find_hold_end(
