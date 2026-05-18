@@ -26,4 +26,5 @@ dependencies = [
     "tqdm>=4.66.0",
     "uvicorn>=0.38.0",
     "yt-dlp>=2025.12.8",
+    "ytmusicapi>=1.8.0",
 ]

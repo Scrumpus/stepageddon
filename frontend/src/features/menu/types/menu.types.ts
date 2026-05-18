@@ -81,3 +81,20 @@ export interface LoadingState {
   message: string;
   progress: number;
 }
+
+/**
+ * One search result from /api/search-songs (YouTube Music).
+ */
+export interface SongSearchResult {
+  videoId: string;
+  title: string;
+  artist: string;
+  album: string | null;
+  duration_seconds: number | null;
+  thumbnail: string;
+  url: string;
+}
+
+export interface SongSearchResponse {
+  results: SongSearchResult[];
+}
