@@ -1,7 +1,3 @@
-/**
- * Main menu screen
- */
-
 import { useState } from 'react';
 import { Disc3, ListMusic, Sparkles } from 'lucide-react';
 import { useApp } from '@/app/providers/AppProvider';
@@ -58,30 +54,28 @@ function MenuScreen() {
 
         {/* Main Card */}
         <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-6 sm:p-8 shadow-2xl border border-white/10">
-          {tab === 'playlists' && <PlaylistsTab />}
-          {tab === 'songs' && <SongsTab />}
-          {tab === 'create' && (
-            <div className="space-y-6">
-              <p className="text-sm text-gray-400 text-center">
-                We'll generate charts for every difficulty — you pick which to play next.
-              </p>
-
-              <div className="space-y-4">
-                <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />
-                <UrlInput source="spotify" onUrlSubmit={handleUrlSubmit} />
-              </div>
-
-              <div className="flex items-center gap-4">
-                <div className="flex-1 border-t border-white/10" />
-                <span className="text-xs text-gray-500 uppercase tracking-wider">
-                  or upload a file
-                </span>
-                <div className="flex-1 border-t border-white/10" />
-              </div>
-
-              <FileUploader onFileSelect={handleFileUpload} />
+          <div className={tab === 'playlists' ? '' : 'hidden'}>
+            <PlaylistsTab />
+          </div>
+          <div className={tab === 'songs' ? '' : 'hidden'}>
+            <SongsTab />
+          </div>
+          <div className={tab === 'create' ? 'space-y-6' : 'hidden'}>
+            <div className="space-y-4">
+              <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />
+              <UrlInput source="spotify" onUrlSubmit={handleUrlSubmit} />
             </div>
-          )}
+
+            <div className="flex items-center gap-4">
+              <div className="flex-1 border-t border-white/10" />
+              <span className="text-xs text-gray-500 uppercase tracking-wider">
+                or upload a file
+              </span>
+              <div className="flex-1 border-t border-white/10" />
+            </div>
+
+            <FileUploader onFileSelect={handleFileUpload} />
+          </div>
         </div>
       </div>
     </div>
