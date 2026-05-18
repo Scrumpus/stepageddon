@@ -30,7 +30,16 @@ import PauseOverlay from './PauseOverlay';
 const EMPTY_HIT_ACCURACY: HitAccuracy = { perfect: 0, good: 0, ok: 0, miss: 0 };
 
 function GameScreen() {
-  const { steps, audioRef, songData, setGameResults, resetGame, gameMode, setGameMode } = useApp();
+  const {
+    steps,
+    audioRef,
+    songData,
+    setGameResults,
+    setGameState: setAppGameState,
+    resetGame,
+    gameMode,
+    setGameMode,
+  } = useApp();
   const isDualMode = gameMode === 'dual';
 
   const [gameState, setGameState] = useState<GameState>(GameState.PLAYING);
@@ -39,6 +48,17 @@ function GameScreen() {
   const [combo, setCombo] = useState(0);
   const [_maxCombo, setMaxCombo] = useState(0);
   const [_hitAccuracy, setHitAccuracy] = useState<HitAccuracy>(EMPTY_HIT_ACCURACY);
+
+  // Mirror end-of-game stats into refs so finishGame can read them
+  // synchronously without nesting setState updaters — updaters run during
+  // render and calling setGameResults (an AppProvider update) from inside
+  // one tripped React's "setState during render" warning.
+  const scoreRef = useRef(0);
+  const maxComboRef = useRef(0);
+  const hitAccuracyRef = useRef<HitAccuracy>(EMPTY_HIT_ACCURACY);
+  useEffect(() => { scoreRef.current = score; }, [score]);
+  useEffect(() => { maxComboRef.current = _maxCombo; }, [_maxCombo]);
+  useEffect(() => { hitAccuracyRef.current = _hitAccuracy; }, [_hitAccuracy]);
   const [judgmentDisplay, setJudgmentDisplay] = useState<{
     judgment: Judgment;
     points: number;
@@ -95,25 +115,17 @@ function GameScreen() {
   }, [showJudgment2]);
 
   const finishGame = useCallback(() => {
-    setHitAccuracy((currentAccuracy) => {
-      setScore((currentScore) => {
-        setMaxCombo((currentMaxCombo) => {
-          const totalNotes = Object.values(currentAccuracy).reduce((sum, val) => sum + val, 0);
-          const accuracy = calculateAccuracy(currentAccuracy);
-          setGameResults({
-            score: currentScore,
-            maxCombo: currentMaxCombo,
-            hitAccuracy: currentAccuracy,
-            accuracy,
-            totalNotes,
-          });
-          return currentMaxCombo;
-        });
-        return currentScore;
-      });
-      return currentAccuracy;
+    const accuracy = hitAccuracyRef.current;
+    const totalNotes = Object.values(accuracy).reduce((sum, val) => sum + val, 0);
+    setGameResults({
+      score: scoreRef.current,
+      maxCombo: maxComboRef.current,
+      hitAccuracy: accuracy,
+      accuracy: calculateAccuracy(accuracy),
+      totalNotes,
     });
-  }, [setGameResults]);
+    setAppGameState(GameState.FINISHED);
+  }, [setGameResults, setAppGameState]);
 
   const handleModeChange = useCallback((newMode: GameMode) => {
     setGameMode(newMode);
