@@ -18,6 +18,7 @@ from src.charts.router import router as charts_router
 from src.playlists.router import router as playlists_router
 from src.generation.router import router as generation_router
 from src.audio.router import router as audio_router
+from src.search.router import router as search_router
 
 # Load environment variables
 load_dotenv()
@@ -101,6 +102,7 @@ app.include_router(audio_router, prefix="/api", tags=["audio"])
 app.include_router(songs_router, prefix="/api", tags=["songs"])
 app.include_router(charts_router, prefix="/api", tags=["charts"])
 app.include_router(playlists_router, prefix="/api", tags=["playlists"])
+app.include_router(search_router, prefix="/api", tags=["search"])
 
 
 # Global exception handler

@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import { Disc3, ListMusic, Sparkles } from 'lucide-react';
+import { ChevronDown, Disc3, Link2, ListMusic, Sparkles } from 'lucide-react';
 import { useApp } from '@/app/providers/AppProvider';
 import { useStepGeneration } from '../hooks';
 import FileUploader from './FileUploader';
 import UrlInput from './UrlInput';
+import SongSearchInput from './SongSearchInput';
 import ModeSelector from './ModeSelector';
 import { PlaylistsTab } from '@/features/playlists/components';
 import { SongsTab } from '@/features/songs/components';
@@ -14,6 +15,7 @@ function MenuScreen() {
   const { gameMode, setGameMode } = useApp();
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [tab, setTab] = useState<Tab>('playlists');
+  const [showUrlFallback, setShowUrlFallback] = useState(false);
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -61,9 +63,28 @@ function MenuScreen() {
             <SongsTab />
           </div>
           <div className={tab === 'create' ? 'space-y-6' : 'hidden'}>
-            <div className="space-y-4">
-              <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />
-              <UrlInput source="spotify" onUrlSubmit={handleUrlSubmit} />
+            <SongSearchInput onSelect={handleUrlSubmit} />
+
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowUrlFallback((v) => !v)}
+                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition-colors"
+              >
+                <Link2 className="w-3.5 h-3.5" />
+                Paste a link instead
+                <ChevronDown
+                  className={`w-3.5 h-3.5 transition-transform ${
+                    showUrlFallback ? 'rotate-180' : ''
+                  }`}
+                />
+              </button>
+              {showUrlFallback && (
+                <div className="space-y-4 mt-4">
+                  <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />
+                  <UrlInput source="spotify" onUrlSubmit={handleUrlSubmit} />
+                </div>
+              )}
             </div>
 
             <div className="flex items-center gap-4">
