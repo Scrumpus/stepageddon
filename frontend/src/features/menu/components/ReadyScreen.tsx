@@ -4,11 +4,14 @@
 
 import { Play, ArrowLeft, Music, Clock, Zap } from 'lucide-react';
 import { GameState } from '@/types/common.types';
-import { useApp } from '@/app/providers/AppProvider';
+import { useGameStore } from '@/app/store/useGameStore';
 import { DIFFICULTY_INFO } from '../types/menu.types';
 
 function ReadyScreen() {
-  const { songData, difficulty, setGameState, resetGame } = useApp();
+  const songData = useGameStore((s) => s.songData);
+  const difficulty = useGameStore((s) => s.difficulty);
+  const setGameState = useGameStore((s) => s.setGameState);
+  const resetGame = useGameStore((s) => s.resetGame);
 
   if (!songData) {
     return null;

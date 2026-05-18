@@ -6,78 +6,43 @@
  */
 
 import { useState, useCallback } from 'react';
-import { DifficultyLevel, GameState } from '@/types/common.types';
+import { GameState } from '@/types/common.types';
 import { generateStepsFromFile, generateStepsFromUrl, getAudioUrl } from '../api';
-import { useApp } from '@/app/providers/AppProvider';
-import { Step } from '@/features/game/types/step.types';
+import { useGameStore } from '@/app/store/useGameStore';
+import { useToastApi } from '@/app/providers/ToastProvider';
 import { StepGenerationResponse } from '../types/menu.types';
 
-/**
- * Convert the response's `charts` map into a `{difficulty: Step[]}` map for
- * AppProvider. Drops difficulties the backend didn't return.
- */
-function chartsToStepsByDifficulty(
-  response: StepGenerationResponse,
-): Partial<Record<DifficultyLevel, Step[]>> {
-  const out: Partial<Record<DifficultyLevel, Step[]>> = {};
-  if (!response.charts) return out;
-  for (const [key, payload] of Object.entries(response.charts)) {
-    if (!payload || !Array.isArray(payload.steps)) continue;
-    out[key as DifficultyLevel] = payload.steps as Step[];
-  }
-  return out;
-}
-
 export function useStepGeneration() {
-  const {
-    setSongData,
-    setStepsByDifficulty,
-    setSteps,
-    setAudioUrl,
-    setGameState,
-    setLoadingMessage,
-    setLoadingProgress,
-    showToast,
-  } = useApp();
+  const generationStarted = useGameStore((s) => s.generationStarted);
+  const generationCompleted = useGameStore((s) => s.generationCompleted);
+  const enterDifficultySelect = useGameStore((s) => s.enterDifficultySelect);
+  const setGameState = useGameStore((s) => s.setGameState);
+  const setLoadingMessage = useGameStore((s) => s.setLoadingMessage);
+  const setLoadingProgress = useGameStore((s) => s.setLoadingProgress);
+  const { showToast } = useToastApi();
 
   const [isLoading, setIsLoading] = useState(false);
 
   const finishGeneration = useCallback(
     (result: StepGenerationResponse) => {
-      setLoadingProgress(100);
-      setLoadingMessage('Generation complete!');
-
-      setSongData(result.song_info);
-      setSteps([]); // cleared until user picks a difficulty
-      setStepsByDifficulty(chartsToStepsByDifficulty(result));
-      setAudioUrl(getAudioUrl(result.audio_url));
+      generationCompleted({
+        ...result,
+        audio_url: getAudioUrl(result.audio_url),
+      });
 
       setTimeout(() => {
-        setGameState(GameState.DIFFICULTY_SELECT);
+        enterDifficultySelect();
         setIsLoading(false);
       }, 500);
     },
-    [
-      setAudioUrl,
-      setGameState,
-      setLoadingMessage,
-      setLoadingProgress,
-      setSongData,
-      setSteps,
-      setStepsByDifficulty,
-    ],
+    [generationCompleted, enterDifficultySelect],
   );
 
-  /**
-   * Handle file upload and step generation
-   */
   const handleFileUpload = useCallback(
     async (file: File) => {
       try {
         setIsLoading(true);
-        setGameState(GameState.LOADING);
-        setLoadingMessage('Uploading audio...');
-        setLoadingProgress(25);
+        generationStarted({ message: 'Uploading audio...', progress: 25 });
 
         const result = await generateStepsFromFile(file);
         finishGeneration(result);
@@ -90,21 +55,16 @@ export function useStepGeneration() {
         setIsLoading(false);
       }
     },
-    [finishGeneration, setGameState, setLoadingMessage, setLoadingProgress, showToast],
+    [finishGeneration, generationStarted, setGameState, showToast],
   );
 
-  /**
-   * Handle URL submission and step generation
-   */
   const handleUrlSubmit = useCallback(
     async (url: string) => {
       try {
         setIsLoading(true);
-        setGameState(GameState.LOADING);
-        setLoadingMessage('Downloading audio...');
-        setLoadingProgress(20);
+        generationStarted({ message: 'Downloading audio...', progress: 20 });
 
-        // Simulate progress updates
+        // Simulated progress mid-fetch
         setTimeout(() => {
           setLoadingMessage('Analyzing music...');
           setLoadingProgress(50);
@@ -121,7 +81,14 @@ export function useStepGeneration() {
         setIsLoading(false);
       }
     },
-    [finishGeneration, setGameState, setLoadingMessage, setLoadingProgress, showToast],
+    [
+      finishGeneration,
+      generationStarted,
+      setGameState,
+      setLoadingMessage,
+      setLoadingProgress,
+      showToast,
+    ],
   );
 
   return {

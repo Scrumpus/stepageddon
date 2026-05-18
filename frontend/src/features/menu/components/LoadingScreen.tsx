@@ -3,11 +3,12 @@
  */
 
 import { Loader2 } from 'lucide-react';
-import { useApp } from '@/app/providers/AppProvider';
+import { useGameStore } from '@/app/store/useGameStore';
 import ProgressBar from '@/components/ProgressBar';
 
 function LoadingScreen() {
-  const { loadingMessage, loadingProgress } = useApp();
+  const loadingMessage = useGameStore((s) => s.loadingMessage);
+  const loadingProgress = useGameStore((s) => s.loadingProgress);
 
   return (
     <div className="min-h-screen flex items-center justify-center">
