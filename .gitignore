@@ -26,7 +26,7 @@ dist-ssr/
 *.local
 
 # Chart data
-charts/
+backend/charts/
 
 # Environment
 .env
