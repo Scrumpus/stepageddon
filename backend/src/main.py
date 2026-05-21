@@ -10,9 +10,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from src.config import settings
 from src.database import engine
+from src.rate_limit import limiter
 from src.songs.router import router as songs_router
 from src.charts.router import router as charts_router
 from src.playlists.router import router as playlists_router
@@ -55,22 +59,35 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
-# Create FastAPI app
+_is_prod = settings.ENV == "production"
+
+# Create FastAPI app — hide OpenAPI surface in production to reduce
+# information disclosure to unauthenticated scanners.
 app = FastAPI(
     title="Beat Sync API",
     description="AI-powered DDR-style rhythm game backend",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
 )
 
-# Configure CORS
+# Configure CORS — restrict methods/headers to the actual API surface.
+# Wildcard methods + allow_credentials=True is a CSRF foot-gun.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+# Rate limiting — anonymous public endpoints (generation) need per-IP throttling.
+# Per-route limits are declared on the handlers via @limiter.limit(...).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 
 # Health check endpoint
@@ -105,14 +122,15 @@ app.include_router(playlists_router, prefix="/api", tags=["playlists"])
 app.include_router(search_router, prefix="/api", tags=["search"])
 
 
-# Global exception handler
+# Global exception handler — never leak exception detail to clients.
+# Full traceback goes to the server log.
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
-    )
+    body = {"error": "Internal server error"}
+    if not _is_prod:
+        body["detail"] = str(exc)
+    return JSONResponse(status_code=500, content=body)
 
 
 if __name__ == "__main__":
@@ -121,6 +139,6 @@ if __name__ == "__main__":
         "src.main:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=True,
+        reload=not _is_prod,
         log_level=settings.LOG_LEVEL.lower()
     )

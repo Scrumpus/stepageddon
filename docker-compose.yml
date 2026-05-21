@@ -1,19 +1,29 @@
 version: '3.8'
 
+# Production-ish stack for a single VPS. Every credential and origin is
+# env-driven; the compose file ships zero secrets and zero localhost defaults.
+# Required env (typically supplied via a `.env` file alongside this one):
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+#   CORS_ORIGINS (comma-separated, e.g. https://stepageddon.example.com)
+#   SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET (optional)
+#   STORAGE_BACKEND, S3_* (if using R2/S3)
+#   ENV (set to "production" for prod)
+#   VITE_API_URL (used as a build arg for the frontend)
+
 services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: stepageddon
-      POSTGRES_PASSWORD: stepageddon
-      POSTGRES_DB: stepageddon
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U stepageddon -d stepageddon"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -23,19 +33,34 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - ENV=${ENV:-development}
       - USE_AI_GENERATION=${USE_AI_GENERATION:-false}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
       - HOST=0.0.0.0
       - PORT=8000
-      - CORS_ORIGINS=http://localhost:80,http://localhost:3000
-      - DATABASE_URL=postgresql+asyncpg://stepageddon:stepageddon@postgres:5432/stepageddon
+      - CORS_ORIGINS=${CORS_ORIGINS:?CORS_ORIGINS must be set}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+      - AUDIO_STORAGE_PATH=/app/audio_storage
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+      - MAX_DURATION_SECONDS=${MAX_DURATION_SECONDS:-600}
+      - S3_BUCKET=${S3_BUCKET:-}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - S3_REGION=${S3_REGION:-auto}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}
+      - ML_MODEL_PATH=${ML_MODEL_PATH:-/app/ml/checkpoints/best_model_2.pt}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./backend/audio_storage:/app/audio_storage
+      # Model checkpoint mounted read-only so deploys can swap models
+      # without rebuilding the image.
+      - ./backend/ml/checkpoints:/app/ml/checkpoints:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -44,12 +69,20 @@ services:
       retries: 3
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:?VITE_API_URL must be set}
     ports:
       - "80:80"
     depends_on:
       - backend
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pgdata:
