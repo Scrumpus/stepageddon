@@ -1,15 +1,10 @@
 /**
- * API configuration
+ * API endpoint catalogue. The base URL lives in @/lib/axios so there's a
+ * single source of truth — import API_BASE_URL from there if you need it.
  */
 
-/**
- * API base URL from environment or default
- */
-export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+export { API_BASE_URL } from '@/lib/axios';
 
-/**
- * API endpoints
- */
 export const API_ENDPOINTS = {
   GENERATE_STEPS_FILE: '/api/generate-steps',
   GENERATE_STEPS_URL: '/api/generate-steps-url',

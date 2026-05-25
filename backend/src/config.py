@@ -3,12 +3,18 @@ Configuration settings for Beat Sync backend
 """
 
 import os
-from typing import List
-from pydantic_settings import BaseSettings
+from typing import Annotated, List
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode
 
 
 class Settings(BaseSettings):
     """Application settings"""
+
+    # Deployment environment: "development" | "production".
+    # Gates auto-reload, OpenAPI docs exposure, and exception-detail leakage.
+    ENV: str = os.getenv("ENV", "development")
 
     # API Keys
     SPOTIFY_CLIENT_ID: str = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -39,11 +45,19 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://stepageddon:stepageddon@localhost:5432/stepageddon",
     )
 
-    # CORS
-    CORS_ORIGINS: List[str] = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:3001,http://localhost:5173"
-    ).split(",")
+    # CORS — empty by default so misconfigured prod fails closed.
+    # Set CORS_ORIGINS="http://localhost:3000,http://localhost:5173" in your
+    # dev .env (see .env.example). NoDecode disables pydantic-settings'
+    # default JSON parsing for List[str] so a plain comma-separated string
+    # in the env is accepted.
+    CORS_ORIGINS: Annotated[List[str], NoDecode] = []
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_csv_origins(cls, v):
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return v
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

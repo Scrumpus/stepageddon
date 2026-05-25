@@ -2,6 +2,8 @@
 
 DDR-style browser game that let's you upload any song (url or file) and generates step chart. Built with React and FastAPI
 
+For production deployment instructions see [DEPLOY.md](./DEPLOY.md).
+
 ### Local Development
 
 #### Backend Setup
