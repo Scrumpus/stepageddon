@@ -87,7 +87,7 @@ Chart generation is handled by a trained PyTorch model loaded at app startup.
 
 - **Entry point**: `ml.inference.MLChartGenerator.generate_from_audio(audio_path, difficulty)` → `Chart`
 - **Module**: `backend/ml/` (model in `model.py`, inference in `inference.py`, training in `train.py`)
-- **Checkpoint path**: `settings.ML_MODEL_PATH` (defaults to `./ml/checkpoints/best_model_2.pt`)
+- **Checkpoint path**: `settings.ML_MODEL_PATH` (defaults to `./ml/checkpoints/best_model.pt`)
 - **Schemas**: `backend/modules/step_generator/` now contains only the shared Pydantic schemas (`Chart`, `Step`, `Direction`, `StepType`, `BeatSubdivision`, `DifficultyConfig`) and the difficulty presets (`DIFFICULTY_PRESETS`, `get_difficulty_config`) consumed by the ML inference path, persistence, and the `.sm` parser.
 - **JSON serialization**: `Chart.to_json_dict()` returns the API response shape.
 
@@ -234,7 +234,7 @@ Content-Type: application/json
 **Backend** (`.env` in `backend/`):
 ```env
 # Path to the trained step-chart model checkpoint
-ML_MODEL_PATH=./ml/checkpoints/best_model_2.pt
+ML_MODEL_PATH=./ml/checkpoints/best_model.pt
 
 # Optional - for Spotify support
 SPOTIFY_CLIENT_ID=...
@@ -267,7 +267,7 @@ Generation lives in `backend/ml/`. The model is trained offline; the API only ru
 
 ```python
 from ml import MLChartGenerator
-gen = MLChartGenerator(model_path="./ml/checkpoints/best_model_2.pt")
+gen = MLChartGenerator(model_path="./ml/checkpoints/best_model.pt")
 chart = gen.generate_from_audio("song.mp3", "medium")
 response = chart.to_json_dict()
 ```
