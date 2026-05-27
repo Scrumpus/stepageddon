@@ -65,6 +65,12 @@ class Settings(BaseSettings):
     # ML Model Settings
     ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
 
+    # YouTube cookies file (Netscape format) handed to yt-dlp to get past
+    # bot/age checks. Empty falls back to backend/cookies.txt if present.
+    # yt-dlp rewrites the jar on exit, so the client always copies this to a
+    # writable temp file first (the source is often a read-only mount).
+    YT_COOKIES_PATH: str = os.getenv("YT_COOKIES_PATH", "")
+
     class Config:
         env_file = ".env"
         extra = "ignore"
