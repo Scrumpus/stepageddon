@@ -1,5 +1,5 @@
 /**
- * Debounced YouTube Music search hook.
+ * Debounced song-search hook (Audius + Jamendo, merged via /api/search-songs).
  *
  * Modeled on features/songs/hooks/useSongSearch.ts. Skips network calls when
  * the trimmed query is empty.
@@ -25,7 +25,7 @@ const initial: State = {
   error: null,
 };
 
-export function useYouTubeMusicSearch() {
+export function useSongSearch() {
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [state, setState] = useState<State>(initial);

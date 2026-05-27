@@ -142,8 +142,6 @@ function GameScreen() {
     });
   }, []);
 
-  if (!songData) return null;
-
   const addScore = useCallback((points: number) => setScore((prev) => prev + points), []);
   const addScore2 = useCallback((points: number) => setScore2((prev) => prev + points), []);
 
@@ -170,8 +168,8 @@ function GameScreen() {
     audioRef,
     steps,
     gameState,
-    songDuration: songData.duration,
-    tempo: songData.tempo || 120,
+    songDuration: songData?.duration ?? Infinity,
+    tempo: songData?.tempo || 120,
     activeHolds: mergedHolds,
     onFinish: finishGame,
   });
@@ -282,6 +280,10 @@ function GameScreen() {
     gameState,
     shouldAutoPlay: true,
   });
+
+  // All hooks are above this line. The early return must stay below them so
+  // hook call order is identical on every render (react-hooks/rules-of-hooks).
+  if (!songData) return null;
 
   const arrowSpeed = getArrowSpeed(songData.tempo || 120);
   const tempo = songData.tempo || 120;

@@ -45,10 +45,11 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.AUDIO_STORAGE_PATH, exist_ok=True)
     logger.info(f"📁 Audio storage: {settings.AUDIO_STORAGE_PATH}")
 
-    if not settings.SPOTIFY_CLIENT_ID or not settings.SPOTIFY_CLIENT_SECRET:
-        logger.warning("⚠️  Spotify credentials not set - Spotify URLs won't work")
+    logger.info(f"✓ Audius enabled (app_name={settings.AUDIUS_APP_NAME})")
+    if settings.JAMENDO_CLIENT_ID:
+        logger.info("✓ Jamendo client_id configured")
     else:
-        logger.info("✓ Spotify credentials configured")
+        logger.warning("⚠️  JAMENDO_CLIENT_ID not set - Jamendo search/links disabled")
 
     logger.info("✓ Beat Sync Backend Ready!")
 
@@ -108,7 +109,8 @@ async def health_check():
         "status": "healthy",
         "services": {
             "api": "operational",
-            "spotify": "configured" if settings.SPOTIFY_CLIENT_ID else "not configured"
+            "audius": "enabled",
+            "jamendo": "configured" if settings.JAMENDO_CLIENT_ID else "not configured"
         }
     }
 

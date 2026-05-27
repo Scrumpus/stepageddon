@@ -72,13 +72,6 @@ function ReadyScreen() {
               </div>
             </div>
 
-            {songData.is_preview && (
-              <div className="mt-4 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
-                <p className="text-yellow-400 text-sm">
-                  ℹ️ This is a 30-second preview from Spotify
-                </p>
-              </div>
-            )}
           </div>
 
           {/* Instructions */}

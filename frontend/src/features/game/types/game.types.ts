@@ -92,8 +92,9 @@ export const VISUAL_CONFIG = {
 /**
  * Calculate arrow speed based on song tempo
  */
-export function getArrowSpeed(tempo: number): number {
-  // Scale speed with tempo: 120 BPM = ~400px/s, 180 BPM = ~550px/s
+export function getArrowSpeed(_tempo: number): number {
+  // NOTE: tempo scaling is not yet applied — speed is currently constant.
+  // (`_tempo` is accepted for API stability; see VISUAL_CONFIG.TEMPO_SPEED_FACTOR.)
   return VISUAL_CONFIG.BASE_SPEED;
 }
 

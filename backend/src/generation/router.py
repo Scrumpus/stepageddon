@@ -12,16 +12,16 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ml import MLChartGenerator
+from src.audius.client import AudiusClient
 from src.config import settings
 from src.generation.schemas import GenerateRequest
 from src.generation.service import download_audio
 from src.generation.utils import AudioProcessor
+from src.jamendo.client import JamendoClient
 from src.rate_limit import limiter
-from src.spotify.client import SpotifyClient
 from src.storage import get_storage
-from src.youtube.client import YouTubeClient
 
-_ALLOWED_URL_HOSTS = ("youtube.com", "youtu.be", "spotify.com")
+_ALLOWED_URL_HOSTS = ("audius.co", "jamendo.com")
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,8 @@ router = APIRouter()
 # crashes the app at startup if it's missing/incompatible (rather than at
 # first request).
 audio_processor = AudioProcessor()
-spotify_client = SpotifyClient()
-youtube_client = YouTubeClient()
+audius_client = AudiusClient()
+jamendo_client = JamendoClient()
 storage = get_storage()
 
 logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
@@ -161,11 +161,11 @@ def _validate_audio_url(url: str) -> None:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise HTTPException(status_code=400, detail="Invalid URL.")
     host = parsed.netloc.lower().split(":")[0]
-    # Match the bare host or any subdomain (e.g., www.youtube.com, music.youtube.com).
+    # Match the bare host or any subdomain (e.g., www.jamendo.com).
     if not any(host == h or host.endswith("." + h) for h in _ALLOWED_URL_HOSTS):
         raise HTTPException(
             status_code=400,
-            detail="Invalid URL. Please use YouTube or Spotify links.",
+            detail="Invalid URL. Please use Audius or Jamendo links.",
         )
 
 
@@ -191,8 +191,8 @@ async def generate_steps_from_url(
         download_result = await download_audio(
             body.url,
             str(file_path),
-            spotify_client=spotify_client,
-            youtube_client=youtube_client,
+            audius_client=audius_client,
+            jamendo_client=jamendo_client,
         )
         storage.commit(audio_key, file_path)
         committed = True

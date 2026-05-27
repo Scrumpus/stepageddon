@@ -99,7 +99,7 @@ If the checkpoint can't be loaded, app startup fails fast — there is no algori
 
 **Complete Flow**:
 ```
-Upload/URL → Router validates → AudioDownloader (if URL) → AudioProcessor analyzes
+Upload/URL → Router validates → download_audio (Audius/Jamendo, if URL) → AudioProcessor analyzes
 → MLChartGenerator predicts chart → Chart.to_json_dict() → Response with steps + audio URL
 ```
 
@@ -204,7 +204,7 @@ POST /api/generate-steps-url
 Content-Type: application/json
 
 {
-  "url": "https://youtube.com/watch?v=...",
+  "url": "https://audius.co/artist/track-name",
   "difficulty": "intermediate"
 }
 ```
@@ -236,9 +236,12 @@ Content-Type: application/json
 # Path to the trained step-chart model checkpoint
 ML_MODEL_PATH=./ml/checkpoints/best_model.pt
 
-# Optional - for Spotify support
-SPOTIFY_CLIENT_ID=...
-SPOTIFY_CLIENT_SECRET=...
+# Audio sources
+# Audius needs no key — just an app identifier sent on every request.
+AUDIUS_APP_NAME=stepageddon
+# Jamendo needs a free client_id (devportal.jamendo.com). Empty disables
+# Jamendo search/links gracefully.
+JAMENDO_CLIENT_ID=...
 
 # Server
 HOST=0.0.0.0
@@ -318,7 +321,7 @@ State changes via `setGameState()` in `App.jsx`. All screens receive state via p
 - **File limits**: 50MB max file size, 600s (10 min) max duration
 - **Supported formats**:
   - Upload: MP3, WAV, OGG, FLAC
-  - URLs: YouTube (via yt-dlp), Spotify (30-second previews via spotipy)
+  - URLs: Audius (full tracks, no key), Jamendo (full tracks, free `client_id`)
 - **Generation**: ML-only via `MLChartGenerator`; checkpoint loaded at startup from `ML_MODEL_PATH`
 - **Sample rate**: All audio loaded at 22050 Hz for consistency
 
@@ -336,10 +339,10 @@ State changes via `setGameState()` in `App.jsx`. All screens receive state via p
 - Happens with very long songs or complex analysis
 - Consider increasing timeout or implementing progress callbacks
 
-**YouTube download fails**
-- Update yt-dlp: `pip install --upgrade yt-dlp`
-- Some videos may be geo-restricted or age-restricted
-- Check backend logs for specific yt-dlp error
+**Audius/Jamendo download fails**
+- Jamendo: confirm `JAMENDO_CLIENT_ID` is set (devportal.jamendo.com); empty disables Jamendo
+- Audius: a track may be unstreamable/removed — try another result
+- Check backend logs for the specific source error (resolve vs stream/download)
 
 ### Frontend Issues
 
