@@ -16,9 +16,12 @@ class Settings(BaseSettings):
     # Gates auto-reload, OpenAPI docs exposure, and exception-detail leakage.
     ENV: str = os.getenv("ENV", "development")
 
-    # API Keys
-    SPOTIFY_CLIENT_ID: str = os.getenv("SPOTIFY_CLIENT_ID", "")
-    SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+    # Audio sources
+    # Audius needs no key — just an app identifier sent on every request.
+    AUDIUS_APP_NAME: str = os.getenv("AUDIUS_APP_NAME", "stepageddon")
+    # Jamendo needs a free client_id (devportal.jamendo.com). Empty disables
+    # Jamendo search/links gracefully (the app still boots).
+    JAMENDO_CLIENT_ID: str = os.getenv("JAMENDO_CLIENT_ID", "")
 
     # Server Configuration
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -64,12 +67,6 @@ class Settings(BaseSettings):
 
     # ML Model Settings
     ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
-
-    # YouTube cookies file (Netscape format) handed to yt-dlp to get past
-    # bot/age checks. Empty falls back to backend/cookies.txt if present.
-    # yt-dlp rewrites the jar on exit, so the client always copies this to a
-    # writable temp file first (the source is often a read-only mount).
-    YT_COOKIES_PATH: str = os.getenv("YT_COOKIES_PATH", "")
 
     class Config:
         env_file = ".env"

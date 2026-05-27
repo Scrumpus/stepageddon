@@ -8,7 +8,7 @@ import { Step } from '@/features/game/types/step.types';
 /**
  * Audio source type
  */
-export type AudioSource = 'file' | 'youtube' | 'spotify';
+export type AudioSource = 'file' | 'audius' | 'jamendo';
 
 /**
  * Difficulty information for display
@@ -83,10 +83,11 @@ export interface LoadingState {
 }
 
 /**
- * One search result from /api/search-songs (YouTube Music).
+ * One search result from /api/search-songs (Audius + Jamendo, merged).
  */
 export interface SongSearchResult {
-  videoId: string;
+  id: string;
+  source: 'audius' | 'jamendo';
   title: string;
   artist: string;
   album: string | null;

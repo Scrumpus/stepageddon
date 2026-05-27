@@ -28,7 +28,7 @@ export async function generateStepsFromFile(
 }
 
 /**
- * Generate charts for every difficulty from a URL (YouTube or Spotify).
+ * Generate charts for every difficulty from a URL (Audius or Jamendo).
  */
 export async function generateStepsFromUrl(
   url: string

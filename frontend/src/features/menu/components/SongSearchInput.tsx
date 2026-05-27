@@ -1,13 +1,13 @@
 /**
- * Search-as-you-type widget backed by YouTube Music.
+ * Search-as-you-type widget backed by Audius + Jamendo (merged).
  *
- * Clicking a result calls `onSelect(url)` with a youtube.com watch URL — the
- * existing generation pipeline handles the rest.
+ * Clicking a result calls `onSelect(url)` with the provider's track URL — the
+ * generation pipeline re-resolves and downloads it.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { Search, Loader2, Music, X } from 'lucide-react';
-import { useYouTubeMusicSearch } from '../hooks';
+import { useSongSearch } from '../hooks';
 import type { SongSearchResult } from '../types/menu.types';
 
 interface SongSearchInputProps {
@@ -22,7 +22,7 @@ function formatDuration(seconds: number | null): string {
 }
 
 function SongSearchInput({ onSelect }: SongSearchInputProps) {
-  const { query, setQuery, results, isLoading, error } = useYouTubeMusicSearch();
+  const { query, setQuery, results, isLoading, error } = useSongSearch();
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -102,7 +102,7 @@ function SongSearchInput({ onSelect }: SongSearchInputProps) {
           {!error && results.length > 0 && (
             <ul className="max-h-80 overflow-y-auto divide-y divide-white/5">
               {results.map((r) => (
-                <li key={r.videoId}>
+                <li key={`${r.source}:${r.id}`}>
                   <button
                     type="button"
                     onClick={() => handlePick(r)}
@@ -123,9 +123,20 @@ function SongSearchInput({ onSelect }: SongSearchInputProps) {
                       <div className="text-sm font-medium text-white truncate">
                         {r.title}
                       </div>
-                      <div className="text-xs text-gray-400 truncate">
-                        {r.artist}
-                        {r.album ? ` • ${r.album}` : ''}
+                      <div className="text-xs text-gray-400 truncate flex items-center gap-1.5">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide flex-shrink-0 ${
+                            r.source === 'audius'
+                              ? 'bg-purple-500/20 text-purple-300'
+                              : 'bg-orange-500/20 text-orange-300'
+                          }`}
+                        >
+                          {r.source}
+                        </span>
+                        <span className="truncate">
+                          {r.artist}
+                          {r.album ? ` • ${r.album}` : ''}
+                        </span>
                       </div>
                     </div>
                     <div className="text-xs font-mono text-gray-500 flex-shrink-0">

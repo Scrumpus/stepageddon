@@ -82,8 +82,8 @@ function MenuScreen() {
               </button>
               {showUrlFallback && (
                 <div className="space-y-4 mt-4">
-                  <UrlInput source="youtube" onUrlSubmit={handleUrlSubmit} />
-                  <UrlInput source="spotify" onUrlSubmit={handleUrlSubmit} />
+                  <UrlInput source="audius" onUrlSubmit={handleUrlSubmit} />
+                  <UrlInput source="jamendo" onUrlSubmit={handleUrlSubmit} />
                 </div>
               )}
             </div>

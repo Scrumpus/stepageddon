@@ -1,2 +1,2 @@
 export { useStepGeneration } from './useStepGeneration';
-export { useYouTubeMusicSearch } from './useYouTubeMusicSearch';
+export { useSongSearch } from './useSongSearch';

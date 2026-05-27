@@ -1,5 +1,5 @@
 /**
- * YouTube Music song search.
+ * Song search (Audius + Jamendo, merged).
  */
 
 import { api } from '@/lib/axios';

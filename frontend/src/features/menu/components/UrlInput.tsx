@@ -3,31 +3,31 @@
  */
 
 import { useState } from 'react';
-import { Youtube, Music, Send } from 'lucide-react';
+import { Music, Disc3, Send } from 'lucide-react';
 import type { AudioSource } from '../types/menu.types';
 
 const SOURCE_CONFIG = {
-  youtube: {
-    label: 'YouTube',
-    icon: Youtube,
-    iconColor: 'text-red-500',
-    placeholder: 'https://youtube.com/watch?v=...',
-    borderColor: 'border-red-500/30',
-    hoverBorder: 'hover:border-red-500/60',
-    focusBorder: 'focus:border-red-500',
-    buttonGradient: 'from-red-600 to-red-500',
-    buttonShadow: 'hover:shadow-red-500/30',
-  },
-  spotify: {
-    label: 'Spotify',
+  audius: {
+    label: 'Audius',
     icon: Music,
-    iconColor: 'text-green-500',
-    placeholder: 'https://open.spotify.com/track/...',
-    borderColor: 'border-green-500/30',
-    hoverBorder: 'hover:border-green-500/60',
-    focusBorder: 'focus:border-green-500',
-    buttonGradient: 'from-green-600 to-green-500',
-    buttonShadow: 'hover:shadow-green-500/30',
+    iconColor: 'text-purple-400',
+    placeholder: 'https://audius.co/artist/track-name',
+    borderColor: 'border-purple-500/30',
+    hoverBorder: 'hover:border-purple-500/60',
+    focusBorder: 'focus:border-purple-500',
+    buttonGradient: 'from-purple-600 to-purple-500',
+    buttonShadow: 'hover:shadow-purple-500/30',
+  },
+  jamendo: {
+    label: 'Jamendo',
+    icon: Disc3,
+    iconColor: 'text-orange-400',
+    placeholder: 'https://www.jamendo.com/track/...',
+    borderColor: 'border-orange-500/30',
+    hoverBorder: 'hover:border-orange-500/60',
+    focusBorder: 'focus:border-orange-500',
+    buttonGradient: 'from-orange-600 to-orange-500',
+    buttonShadow: 'hover:shadow-orange-500/30',
   },
 } as const;
 
