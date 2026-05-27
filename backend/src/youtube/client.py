@@ -4,16 +4,31 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
 import yt_dlp
 
+from src.config import settings
+
 logger = logging.getLogger(__name__)
 
 # backend/src/youtube/client.py → backend/
 _BACKEND_DIR = Path(__file__).resolve().parents[2]
-_COOKIES_PATH = _BACKEND_DIR / "cookies.txt"
+_DEFAULT_COOKIES_PATH = _BACKEND_DIR / "cookies.txt"
+
+
+def _resolve_cookies_path() -> Optional[Path]:
+    """Cookies file to use, or None. YT_COOKIES_PATH wins; else the bundled file."""
+    if settings.YT_COOKIES_PATH:
+        path = Path(settings.YT_COOKIES_PATH).expanduser()
+        if path.exists():
+            return path
+        logger.warning(f"YT_COOKIES_PATH set but not found: {path}")
+        return None
+    return _DEFAULT_COOKIES_PATH if _DEFAULT_COOKIES_PATH.exists() else None
 
 
 class YouTubeClient:
@@ -40,8 +55,16 @@ class YouTubeClient:
             'extractor_args': {'youtube': {'player_client': ['android_vr']}},
         }
 
-        if os.path.exists(_COOKIES_PATH):
-            ydl_opts['cookiefile'] = str(_COOKIES_PATH)
+        # yt-dlp rewrites the cookie jar back to ``cookiefile`` when the session
+        # ends. The source is often mounted read-only (or sits on a read-only
+        # rootfs), so hand yt-dlp a writable copy and discard it after.
+        cookies_tmp: Optional[str] = None
+        cookies_path = _resolve_cookies_path()
+        if cookies_path is not None:
+            fd, cookies_tmp = tempfile.mkstemp(prefix="ytcookies_", suffix=".txt")
+            os.close(fd)
+            shutil.copyfile(cookies_path, cookies_tmp)
+            ydl_opts['cookiefile'] = cookies_tmp
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -63,6 +86,9 @@ class YouTubeClient:
         except Exception as e:
             logger.error(f"YouTube download failed: {e}")
             raise ValueError(f"Could not download from YouTube: {str(e)}")
+        finally:
+            if cookies_tmp and os.path.exists(cookies_tmp):
+                os.remove(cookies_tmp)
 
     def get_metadata(self, url: str) -> Optional[Dict]:
         """Lightweight metadata-only lookup (no audio fetch)."""
