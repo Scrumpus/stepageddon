@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, Disc3, Link2, ListMusic, Sparkles } from 'lucide-react';
+import { Disc3, Link2, ListMusic, Search, Sparkles, Upload } from 'lucide-react';
 import { useGameStore } from '@/app/store/useGameStore';
 import { useStepGeneration } from '../hooks';
 import FileUploader from './FileUploader';
@@ -10,13 +10,14 @@ import { PlaylistsTab } from '@/features/playlists/components';
 import { SongsTab } from '@/features/songs/components';
 
 type Tab = 'playlists' | 'songs' | 'create';
+type CreateTab = 'search' | 'upload' | 'url';
 
 function MenuScreen() {
   const gameMode = useGameStore((s) => s.gameMode);
   const setGameMode = useGameStore((s) => s.setGameMode);
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [tab, setTab] = useState<Tab>('playlists');
-  const [showUrlFallback, setShowUrlFallback] = useState(false);
+  const [createTab, setCreateTab] = useState<CreateTab>('search');
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -64,39 +65,39 @@ function MenuScreen() {
             <SongsTab />
           </div>
           <div className={tab === 'create' ? 'space-y-6' : 'hidden'}>
-            <SongSearchInput onSelect={handleUrlSubmit} />
-
-            <div>
-              <button
-                type="button"
-                onClick={() => setShowUrlFallback((v) => !v)}
-                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition-colors"
-              >
-                <Link2 className="w-3.5 h-3.5" />
-                Paste a link instead
-                <ChevronDown
-                  className={`w-3.5 h-3.5 transition-transform ${
-                    showUrlFallback ? 'rotate-180' : ''
-                  }`}
-                />
-              </button>
-              {showUrlFallback && (
-                <div className="space-y-4 mt-4">
-                  <UrlInput source="audius" onUrlSubmit={handleUrlSubmit} />
-                  <UrlInput source="jamendo" onUrlSubmit={handleUrlSubmit} />
-                </div>
-              )}
+            <div className="flex gap-1 bg-white/5 p-1 rounded-xl border border-white/10 w-fit mx-auto">
+              <TabButton
+                active={createTab === 'search'}
+                onClick={() => setCreateTab('search')}
+                icon={<Search className="w-4 h-4" />}
+                label="Search"
+              />
+              <TabButton
+                active={createTab === 'upload'}
+                onClick={() => setCreateTab('upload')}
+                icon={<Upload className="w-4 h-4" />}
+                label="Upload"
+              />
+              <TabButton
+                active={createTab === 'url'}
+                onClick={() => setCreateTab('url')}
+                icon={<Link2 className="w-4 h-4" />}
+                label="URL"
+              />
             </div>
 
-            <div className="flex items-center gap-4">
-              <div className="flex-1 border-t border-white/10" />
-              <span className="text-xs text-gray-500 uppercase tracking-wider">
-                or upload a file
-              </span>
-              <div className="flex-1 border-t border-white/10" />
+            <div className={createTab === 'search' ? '' : 'hidden'}>
+              <SongSearchInput onSelect={handleUrlSubmit} />
             </div>
 
-            <FileUploader onFileSelect={handleFileUpload} />
+            <div className={createTab === 'upload' ? '' : 'hidden'}>
+              <FileUploader onFileSelect={handleFileUpload} />
+            </div>
+
+            <div className={createTab === 'url' ? 'space-y-4' : 'hidden'}>
+              <UrlInput source="audius" onUrlSubmit={handleUrlSubmit} />
+              <UrlInput source="jamendo" onUrlSubmit={handleUrlSubmit} />
+            </div>
           </div>
         </div>
       </div>
