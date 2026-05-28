@@ -361,6 +361,7 @@ class MLChartGenerator:
         style_profiles_path: Optional[str] = None,
         min_first_step_time: float = 0.25,
         min_last_step_buffer: float = 0.0,
+        timing_offset: float = 0.0,
     ):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -378,6 +379,9 @@ class MLChartGenerator:
         self.intensity_threshold_base = float(intensity_threshold_base)
         self.min_first_step_time = float(min_first_step_time)
         self.min_last_step_buffer = float(min_last_step_buffer)
+        # Global timing calibration (seconds) added to every emitted step time.
+        # Negative pulls notes earlier to compensate librosa's analysis latency.
+        self.timing_offset = float(timing_offset)
         self.style = str(style)
 
         self.model: Optional[StepChartModel] = None
@@ -1271,6 +1275,10 @@ class MLChartGenerator:
 
         for i, event in enumerate(note_events):
             t = round(event['time'], 3)
+            # Emitted (player-facing) time carries the global timing
+            # calibration; `t` stays on the analyzed grid so energy lookups and
+            # subdivision derivation reference the true musical position.
+            emit_t = round(max(0.0, event['time'] + self.timing_offset), 3)
             subdivision = event.get('subdivision') or self._subdivision_from_grid(
                 t, tempo, beat_times,
             )
@@ -1311,7 +1319,7 @@ class MLChartGenerator:
                         t, event['hold_duration'], energy, brightness,
                     )]
                 steps.append(Step(
-                    time=t,
+                    time=emit_t,
                     arrows=arrows,
                     step_type=StepType.HOLD,
                     hold_duration=round(event['hold_duration'], 3),
@@ -1323,7 +1331,7 @@ class MLChartGenerator:
                 else:
                     arrows = [assigner.assign_single(t, energy, brightness)]
                 steps.append(Step(
-                    time=t,
+                    time=emit_t,
                     arrows=arrows,
                     step_type=StepType.TAP,
                     beat_subdivision=subdivision,
