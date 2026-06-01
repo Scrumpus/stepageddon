@@ -84,6 +84,41 @@ class AudiusClient:
                 break
         return results
 
+    async def trending(
+        self,
+        *,
+        genre: Optional[str] = None,
+        underground: bool = False,
+        limit: int = 20,
+    ) -> List[SongSearchResult]:
+        """Browse Audius trending — overall, by genre, or underground.
+
+        Returns the same ``SongSearchResult`` shape as ``search``. ``underground``
+        surfaces lesser-known tracks; that endpoint takes no genre filter, so
+        ``genre`` is ignored when it's set.
+        """
+        path = "/tracks/trending/underground" if underground else "/tracks/trending"
+        params = {"app_name": self.app_name}
+        if genre and not underground:
+            params["genre"] = genre
+        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+            async with session.get(
+                f"{_API_BASE}{path}", params=params, headers=_HEADERS
+            ) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+
+        results: List[SongSearchResult] = []
+        for t in payload.get("data") or []:
+            if t.get("is_streamable") is False:
+                continue
+            mapped = self._map_track(t)
+            if mapped is not None:
+                results.append(mapped)
+            if len(results) >= limit:
+                break
+        return results
+
     async def download(self, url: str, output_path: str) -> Dict:
         """Resolve an audius.co URL to a track and stream its MP3 to disk.
 

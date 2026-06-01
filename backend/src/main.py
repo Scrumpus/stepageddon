@@ -23,6 +23,7 @@ from src.playlists.router import router as playlists_router
 from src.generation.router import router as generation_router
 from src.audio.router import router as audio_router
 from src.search.router import router as search_router
+from src.discover.router import router as discover_router
 
 # Load environment variables
 load_dotenv()
@@ -122,6 +123,7 @@ app.include_router(songs_router, prefix="/api", tags=["songs"])
 app.include_router(charts_router, prefix="/api", tags=["charts"])
 app.include_router(playlists_router, prefix="/api", tags=["playlists"])
 app.include_router(search_router, prefix="/api", tags=["search"])
+app.include_router(discover_router, prefix="/api", tags=["discover"])
 
 
 # Global exception handler — never leak exception detail to clients.

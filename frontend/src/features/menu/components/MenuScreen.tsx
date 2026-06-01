@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Disc3, Link2, ListMusic, Search, Sparkles, Upload } from 'lucide-react';
+import { Compass, Disc3, Link2, ListMusic, Search, Sparkles, Upload } from 'lucide-react';
 import { useGameStore } from '@/app/store/useGameStore';
 import { useStepGeneration } from '../hooks';
 import FileUploader from './FileUploader';
@@ -8,8 +8,9 @@ import SongSearchInput from './SongSearchInput';
 import ModeSelector from './ModeSelector';
 import { PlaylistsTab } from '@/features/playlists/components';
 import { SongsTab } from '@/features/songs/components';
+import { DiscoverTab } from '@/features/discover/components';
 
-type Tab = 'playlists' | 'songs' | 'create';
+type Tab = 'playlists' | 'songs' | 'discover' | 'create';
 type CreateTab = 'search' | 'upload' | 'url';
 
 function MenuScreen() {
@@ -49,6 +50,12 @@ function MenuScreen() {
             label="Songs"
           />
           <TabButton
+            active={tab === 'discover'}
+            onClick={() => setTab('discover')}
+            icon={<Compass className="w-4 h-4" />}
+            label="Discover"
+          />
+          <TabButton
             active={tab === 'create'}
             onClick={() => setTab('create')}
             icon={<Sparkles className="w-4 h-4" />}
@@ -63,6 +70,9 @@ function MenuScreen() {
           </div>
           <div className={tab === 'songs' ? '' : 'hidden'}>
             <SongsTab />
+          </div>
+          <div className={tab === 'discover' ? '' : 'hidden'}>
+            <DiscoverTab onSelect={handleUrlSubmit} />
           </div>
           <div className={tab === 'create' ? 'space-y-6' : 'hidden'}>
             <div className="flex gap-1 bg-white/5 p-1 rounded-xl border border-white/10 w-fit mx-auto">

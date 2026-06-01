@@ -15,6 +15,25 @@ export interface SongInfo {
 }
 
 /**
+ * One song result from the Audius + Jamendo providers. Shared by search
+ * (/api/search-songs) and discovery (/api/discover) — both return this shape.
+ */
+export interface SongSearchResult {
+  id: string;
+  source: 'audius' | 'jamendo';
+  title: string;
+  artist: string;
+  album: string | null;
+  duration_seconds: number | null;
+  thumbnail: string;
+  url: string;
+}
+
+export interface SongSearchResponse {
+  results: SongSearchResult[];
+}
+
+/**
  * Difficulty levels for gameplay
  */
 export type DifficultyLevel = 'beginner' | 'easy' | 'medium' | 'hard' | 'challenge';

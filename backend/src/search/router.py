@@ -24,8 +24,11 @@ audius_client = AudiusClient()
 jamendo_client = JamendoClient()
 
 
-def _interleave(*lists: List[SongSearchResult]) -> List[SongSearchResult]:
-    """Round-robin merge so neither provider dominates the top of the list."""
+def interleave(*lists: List[SongSearchResult]) -> List[SongSearchResult]:
+    """Round-robin merge so neither provider dominates the top of the list.
+
+    Shared with the discovery router so browse feeds merge identically to search.
+    """
     merged: List[SongSearchResult] = []
     for row in zip_longest(*lists):
         merged.extend(item for item in row if item is not None)
@@ -66,7 +69,7 @@ async def search_songs(
             detail="Song search failed. Try again or paste a link.",
         )
 
-    merged = _interleave(
+    merged = interleave(
         _ok(audius_res, "Audius"),
         _ok(jamendo_res, "Jamendo"),
     )[:limit]

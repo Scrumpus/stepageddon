@@ -84,6 +84,28 @@ class JamendoClient:
                 results.append(mapped)
         return results
 
+    async def trending(
+        self, *, tag: Optional[str] = None, limit: int = 20
+    ) -> List[SongSearchResult]:
+        """Browse Jamendo's most popular tracks, optionally filtered by tag.
+
+        Returns the same ``SongSearchResult`` shape as ``search``; empty when the
+        client isn't configured (mirrors ``search``).
+        """
+        if not self.enabled:
+            return []
+        params: dict = {"order": "popularity_month", "limit": limit}
+        if tag:
+            params["tags"] = tag
+        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+            rows = await self._get_tracks(session, params)
+        results: List[SongSearchResult] = []
+        for t in rows:
+            mapped = self._map_track(t)
+            if mapped is not None:
+                results.append(mapped)
+        return results
+
     @staticmethod
     def extract_track_id(url: str) -> str:
         m = _TRACK_ID_RE.search(url)

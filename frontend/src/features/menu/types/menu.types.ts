@@ -5,6 +5,10 @@
 import { DifficultyLevel, SongInfo } from '@/types/common.types';
 import { Step } from '@/features/game/types/step.types';
 
+// Re-exported from the shared types so existing `../types/menu.types` imports
+// keep working; the canonical definition now lives in common.types.
+export type { SongSearchResult, SongSearchResponse } from '@/types/common.types';
+
 /**
  * Audio source type
  */
@@ -82,20 +86,3 @@ export interface LoadingState {
   progress: number;
 }
 
-/**
- * One search result from /api/search-songs (Audius + Jamendo, merged).
- */
-export interface SongSearchResult {
-  id: string;
-  source: 'audius' | 'jamendo';
-  title: string;
-  artist: string;
-  album: string | null;
-  duration_seconds: number | null;
-  thumbnail: string;
-  url: string;
-}
-
-export interface SongSearchResponse {
-  results: SongSearchResult[];
-}
