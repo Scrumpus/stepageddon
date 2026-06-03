@@ -38,6 +38,7 @@ const ARROW_ROTATION: Record<Direction, number> = {
 const SUBDIVISION_FILTERS: Record<BeatSubdivision, string> = {
   '4th': 'none',                                    // default blue
   '8th': 'hue-rotate(150deg) saturate(1.3)',         // red
+  '12th': 'hue-rotate(-70deg) saturate(1.3)',        // light green
   '16th': 'hue-rotate(70deg) saturate(1.3)',         // purple
 };
 

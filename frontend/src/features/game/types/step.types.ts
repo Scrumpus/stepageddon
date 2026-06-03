@@ -8,7 +8,7 @@ import { Direction } from '@/types/common.types';
  * Step type from backend
  */
 export type StepType = 'tap' | 'hold';
-export type BeatSubdivision = '4th' | '8th' | '16th';
+export type BeatSubdivision = '4th' | '8th' | '12th' | '16th';
 
 /**
  * Single step/note in the chart (new format from backend)
