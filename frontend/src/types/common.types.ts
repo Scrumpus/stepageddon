@@ -12,6 +12,11 @@ export interface SongInfo {
   tempo: number;
   thumbnail?: string;
   is_preview?: boolean;
+  // Chart origin. ML-generated charts ('upload', 'USER') carry the backend
+  // generation timing offset in their note times; imported 'DDR' .sm charts use
+  // their own authored #OFFSET and must not get the extra shift. Drives whether
+  // the receptor pulse applies GENERATION_TIMING_OFFSET_S. See GameScreen.
+  source?: 'upload' | 'USER' | 'DDR';
 }
 
 /**

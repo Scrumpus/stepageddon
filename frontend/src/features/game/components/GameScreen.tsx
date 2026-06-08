@@ -11,6 +11,7 @@ import {
   Judgment,
   HitAccuracy,
   getArrowSpeed,
+  GENERATION_TIMING_OFFSET_S,
   KEY_MAP,
   KEY_MAP_P2,
 } from '../types/game.types';
@@ -287,6 +288,11 @@ function GameScreen() {
 
   const arrowSpeed = getArrowSpeed(songData.tempo || 120);
   const tempo = songData.tempo || 120;
+  // Imported DDR .sm charts carry their own authored #OFFSET, so the generation
+  // offset is NOT baked into their note times — only ML-generated charts get it.
+  // Apply the pulse offset everywhere except DDR so the pulse tracks the notes.
+  const beatOffset =
+    songData.source === 'DDR' ? 0 : GENERATION_TIMING_OFFSET_S;
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -307,6 +313,8 @@ function GameScreen() {
           activeHolds={activeHolds1}
           arrowSpeed={arrowSpeed}
           tempo={tempo}
+          currentTime={currentTime}
+          beatOffset={beatOffset}
           centerPercent={25}
           processedStepsRef={processedStepsRefP1}
         />
@@ -318,6 +326,8 @@ function GameScreen() {
             activeHolds={activeHolds2}
             arrowSpeed={arrowSpeed}
             tempo={tempo}
+            currentTime={currentTime}
+            beatOffset={beatOffset}
             centerPercent={75}
             processedStepsRef={processedStepsRefP2}
           />

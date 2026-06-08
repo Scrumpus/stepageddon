@@ -52,6 +52,7 @@ if _style_profiles_path is None:
 ml_generator = MLChartGenerator(
     model_path=settings.ML_MODEL_PATH,
     style_profiles_path=_style_profiles_path,
+    timing_offset=settings.GENERATION_TIMING_OFFSET_MS / 1000.0,
 )
 logger.info("ML chart generator loaded successfully")
 
