@@ -13,6 +13,10 @@ interface ArrowLaneProps {
   activeHolds: ActiveHold[];
   arrowSpeed: number;  // Pixels per second for calculating hold trail length
   tempo: number;       // BPM for beat-synced spritesheet animation
+  currentTime: number; // Audio clock (s) — drives the receptor beat pulse
+  // Generation timing offset (s) baked into note times; phase-aligns the
+  // receptor pulse with the shifted note grid. Defaults to no shift.
+  beatOffset?: number;
   // Horizontal center of this lane as a percent of the playfield width.
   // 50 = single centered lane (default). 25/75 = left/right lane in dual mode.
   centerPercent?: number;
@@ -96,12 +100,29 @@ function ArrowImage({ direction, subdivision = '4th', isHold = false, size = 64,
   );
 }
 
-function ReceptorImage({ direction, size = 64, tempo = 120 }: {
+function ReceptorImage({ direction, size = 64, tempo = 120, currentTime = 0, beatOffset = 0 }: {
   direction: Direction;
   size?: number;
   tempo?: number;
+  currentTime?: number;  // audio clock (s) — same source as note timing
+  beatOffset?: number;   // s — the same shift baked into note times
 }) {
   const beatDuration = 60 / tempo;
+
+  // Phase within the current beat, driven by the audio clock rather than a
+  // free-running CSS animation. Anchored so a beat lands at
+  // currentTime === k*beatDuration + beatOffset — i.e. exactly where an on-beat
+  // note arrives after the generation offset. The double-mod keeps phase in
+  // [0,1) even when (currentTime - beatOffset) is negative.
+  const phase =
+    ((((currentTime - beatOffset) % beatDuration) + beatDuration) % beatDuration) /
+    beatDuration;
+
+  // Envelope: bright flash at the beat, decaying to rest by the half-beat, then
+  // flat until the next beat. Tweak the 0.5 to lengthen/shorten the flash.
+  // Only the light pulses — the receptor keeps a constant size.
+  const pulse = Math.max(0, 1 - phase / 0.5);
+  const brightness = 0.7 + 0.9 * pulse;  // 1.6 at the beat → 0.7 at rest
 
   return (
     <img
@@ -110,10 +131,7 @@ function ReceptorImage({ direction, size = 64, tempo = 120 }: {
       height={size}
       alt=""
       draggable={false}
-      style={{
-        opacity: 0.5,
-        animation: `receptor-pulse ${beatDuration}s steps(1) infinite`,
-      }}
+      style={{ opacity: 0.5, filter: `brightness(${brightness})` }}
     />
   );
 }
@@ -239,6 +257,8 @@ function ArrowLane({
   activeHolds,
   arrowSpeed,
   tempo,
+  currentTime,
+  beatOffset = 0,
   centerPercent = 50,
   processedStepsRef,
 }: ArrowLaneProps) {
@@ -274,7 +294,13 @@ function ArrowLane({
                 transform: `rotate(${rotation}deg) ${isActive ? 'scale(1.1)' : 'scale(1)'}`,
               }}
             >
-              <ReceptorImage direction={direction} size={arrowSize} tempo={tempo} />
+              <ReceptorImage
+                direction={direction}
+                size={arrowSize}
+                tempo={tempo}
+                currentTime={currentTime}
+                beatOffset={beatOffset}
+              />
             </div>
           );
         })}

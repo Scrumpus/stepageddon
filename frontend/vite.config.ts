@@ -5,6 +5,15 @@ import path from 'path'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
 
+  // Single source of truth for the generation timing offset: read it from the
+  // backend's .env so the receptor pulse stays aligned with the offset baked
+  // into ML-generated note times. Falls back to the backend default (-30) when
+  // the var is unset there. Resolved at build time and injected via `define`.
+  const backendEnv = loadEnv(mode, path.resolve(__dirname, '../backend'), '')
+  const generationTimingOffsetMs = Number(
+    backendEnv.GENERATION_TIMING_OFFSET_MS ?? -30
+  )
+
   // Fail the production build instead of silently shipping with the
   // localhost fallback baked in. Vite resolves import.meta.env at build
   // time, so a missing VITE_API_URL here = a broken prod bundle.
@@ -16,6 +25,9 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
+    define: {
+      __GENERATION_TIMING_OFFSET_MS__: JSON.stringify(generationTimingOffsetMs),
+    },
     plugins: [react()],
     resolve: {
       alias: {

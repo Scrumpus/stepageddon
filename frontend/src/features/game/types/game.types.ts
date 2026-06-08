@@ -90,6 +90,19 @@ export const VISUAL_CONFIG = {
 } as const;
 
 /**
+ * Generation timing offset (seconds), mirroring the backend's
+ * GENERATION_TIMING_OFFSET_MS that is baked into ML-generated note times.
+ * Injected at build time from the backend's .env (see vite.config.ts) so both
+ * sides share one source of truth. Used to phase-align the receptor pulse with
+ * the shifted note grid. Falls back to the backend default (-30ms) if the
+ * build-time define is absent (e.g. tests).
+ */
+export const GENERATION_TIMING_OFFSET_S =
+  (typeof __GENERATION_TIMING_OFFSET_MS__ !== 'undefined'
+    ? __GENERATION_TIMING_OFFSET_MS__
+    : -30) / 1000;
+
+/**
  * Calculate arrow speed based on song tempo
  */
 export function getArrowSpeed(_tempo: number): number {

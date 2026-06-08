@@ -33,6 +33,9 @@ export function usePlayChart() {
             duration: song.duration,
             tempo: song.tempo,
             thumbnail: song.jacket_url ?? song.banner_url ?? undefined,
+            // Carries chart origin so the receptor pulse only applies the
+            // generation offset to ML charts, not imported DDR .sm charts.
+            source: song.source,
           },
           steps: fullChart.steps,
           audioUrl: getAudioUrl(song.audio_url),

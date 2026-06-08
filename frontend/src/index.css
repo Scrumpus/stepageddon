@@ -22,12 +22,6 @@
   to { background-position-x: var(--sheet-width); }
 }
 
-/* Receptor beat pulse - short burst */
-@keyframes receptor-pulse {
-  0%, 24.9% { filter: brightness(1.6); }
-  25%, 100% { filter: brightness(0.7); }
-}
-
 @layer utilities {
   /* Judgment text animations */
   .judgment-perfect {
