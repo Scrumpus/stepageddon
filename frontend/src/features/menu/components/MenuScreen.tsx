@@ -110,6 +110,17 @@ function MenuScreen() {
             </div>
           </div>
         </div>
+
+        {/* Credit */}
+        <p className="text-center text-xs text-white/40 mt-6">
+          Created by{' '}
+          <a
+            href="mailto:scottdschwalbe@gmail.com"
+            className="hover:text-white/70 transition-colors"
+          >
+            scottdschwalbe@gmail.com
+          </a>
+        </p>
       </div>
     </div>
   );

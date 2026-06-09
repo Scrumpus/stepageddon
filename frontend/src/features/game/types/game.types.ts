@@ -78,37 +78,47 @@ export const HOLD_SCORING = {
 export const VISUAL_CONFIG = {
   HIT_ZONE_Y: 80,          // Y position of hit zone (near top)
   ARROW_SIZE: 90,          // Arrow size in pixels
-  // Seconds of lookahead. Arrows spawn at HIT_ZONE_Y + VISIBLE_WINDOW *
-  // arrowSpeed; with the playfield clipped via overflow-hidden, the arrow's
-  // initial Y lands well below the bottom edge so it slides naturally up
-  // into view rather than popping in mid-air.
   VISIBLE_WINDOW: 5,
   SPAWN_Y: 700,            // Y position where arrows spawn (bottom)
-  // Speed is calculated based on tempo: faster tempo = faster arrows
-  BASE_SPEED: 200,         // Base pixels per second at 100 BPM
-  TEMPO_SPEED_FACTOR: 2.5, // Speed multiplier per BPM
 } as const;
 
-/**
- * Generation timing offset (seconds), mirroring the backend's
- * GENERATION_TIMING_OFFSET_MS that is baked into ML-generated note times.
- * Injected at build time from the backend's .env (see vite.config.ts) so both
- * sides share one source of truth. Used to phase-align the receptor pulse with
- * the shifted note grid. Falls back to the backend default (-30ms) if the
- * build-time define is absent (e.g. tests).
- */
 export const GENERATION_TIMING_OFFSET_S =
   (typeof __GENERATION_TIMING_OFFSET_MS__ !== 'undefined'
     ? __GENERATION_TIMING_OFFSET_MS__
     : -30) / 1000;
 
-/**
- * Calculate arrow speed based on song tempo
- */
-export function getArrowSpeed(_tempo: number): number {
-  // NOTE: tempo scaling is not yet applied — speed is currently constant.
-  // (`_tempo` is accepted for API stability; see VISUAL_CONFIG.TEMPO_SPEED_FACTOR.)
-  return VISUAL_CONFIG.BASE_SPEED;
+const SPEED_MOD_BANDS: ReadonlyArray<readonly [minBpm: number, mod: number]> = [
+  [410, 1.0],
+  [293, 1.5],
+  [240, 2.0],
+  [186, 2.5],
+  [157, 3.0],
+  [136, 3.5],
+  [120, 4.0],
+  [108, 4.5],
+  [98, 5.0],
+  [89, 5.5],
+  [82, 6.0],
+  [76, 6.5],
+  [71, 7.0],
+  [65, 7.5],
+] as const;
+
+const LOWEST_BAND_MOD = 8.0; // bpm < 65
+
+// Calibration: arrowSpeed = bpm * mod * SPEED_SCALAR.
+// bpm*mod is ~440-610 across the bands; 0.9 targets ~450 px/s typical.
+const SPEED_SCALAR = 0.9;
+
+export function getSpeedMod(tempo: number): number {
+  for (const [minBpm, mod] of SPEED_MOD_BANDS) {
+    if (tempo >= minBpm) return mod;
+  }
+  return LOWEST_BAND_MOD;
+}
+
+export function getArrowSpeed(tempo: number): number {
+  return tempo * getSpeedMod(tempo) * SPEED_SCALAR;
 }
 
 /**

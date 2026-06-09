@@ -18,11 +18,6 @@ function PlaylistCard({ playlist, onClick }: Props) {
         </div>
         <div className="flex-1 min-w-0">
           <div className="font-semibold text-white truncate">{playlist.name}</div>
-          {playlist.description && (
-            <div className="text-xs text-white/50 truncate mt-0.5">
-              {playlist.description}
-            </div>
-          )}
           <div className="text-[11px] text-white/40 mt-1">
             {playlist.song_count} {playlist.song_count === 1 ? 'song' : 'songs'}
           </div>

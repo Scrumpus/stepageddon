@@ -27,6 +27,13 @@ function GameHUD({
   onReturnToMenu,
 }: GameHUDProps) {
   const dualMode = score2 !== undefined;
+  // Clamp to 0-100 and guard against a missing/zero duration (which would yield
+  // NaN/Infinity and break the bar). currentTime can overrun the API-reported
+  // duration, so cap at 100.
+  const progressPercent =
+    songInfo.duration > 0
+      ? Math.min(100, Math.max(0, (currentTime / songInfo.duration) * 100))
+      : 0;
   return (
     <>
       {/* Header */}
@@ -75,8 +82,8 @@ function GameHUD({
       {/* Progress Bar */}
       <div className="h-1">
         <div
-          className="h-full bg-game-primary transition-all"
-          style={{ width: `${(currentTime / songInfo.duration) * 100}%` }}
+          className="h-full bg-game-primary"
+          style={{ width: `${progressPercent}%` }}
         />
       </div>
     </>
