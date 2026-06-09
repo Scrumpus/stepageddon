@@ -344,6 +344,8 @@ function ArrowLane({
               // (later in DOM = later in time) renders entirely on top of any
               // earlier arrow it overlaps — DDR-style note lapping.
               isolation: 'isolate',
+              // Sit above the receptors (z-20) so arrows pass over them.
+              zIndex: 30,
             }}
           >
             {/* Hold trail (not rotated - stays vertical) */}
