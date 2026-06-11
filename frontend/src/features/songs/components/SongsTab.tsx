@@ -1,26 +1,22 @@
 import { useState } from 'react';
+import { SongSummaryDTO } from '@/features/playlists/types';
 import SongList from './SongList';
 import SongDetail from './SongDetail';
 
-type View = { type: 'list' } | { type: 'detail'; songId: string };
-
 function SongsTab() {
-  const [view, setView] = useState<View>({ type: 'list' });
+  const [selected, setSelected] = useState<SongSummaryDTO | null>(null);
 
-  if (view.type === 'detail') {
+  if (selected) {
     return (
       <SongDetail
-        songId={view.songId}
-        onBack={() => setView({ type: 'list' })}
+        songId={selected.id}
+        fallbackSong={selected}
+        onBack={() => setSelected(null)}
       />
     );
   }
 
-  return (
-    <SongList
-      onSelect={(songId) => setView({ type: 'detail', songId })}
-    />
-  );
+  return <SongList onSelect={setSelected} />;
 }
 
 export default SongsTab;
