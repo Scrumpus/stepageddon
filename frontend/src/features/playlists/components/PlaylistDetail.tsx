@@ -1,6 +1,8 @@
+import { useState } from 'react';
 import { ArrowLeft, Loader2 } from 'lucide-react';
 import { usePlayChart, usePlaylist } from '../hooks';
-import SongRow from './SongRow';
+import ChartSelect from './ChartSelect';
+import SongCard from './SongCard';
 
 interface Props {
   playlistId: string;
@@ -10,6 +12,21 @@ interface Props {
 function PlaylistDetail({ playlistId, onBack }: Props) {
   const { playlist, songsWithCharts, isLoading, error } = usePlaylist(playlistId);
   const { playChart, isLoading: isPlaying } = usePlayChart();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const selected = songsWithCharts.find((s) => s.song.id === selectedId);
+
+  if (selected) {
+    return (
+      <ChartSelect
+        song={selected.song}
+        charts={selected.charts}
+        onSelectChart={playChart}
+        onBack={() => setSelectedId(null)}
+        disabled={isPlaying}
+      />
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -51,15 +68,9 @@ function PlaylistDetail({ playlistId, onBack }: Props) {
       )}
 
       {!isLoading && !error && songsWithCharts.length > 0 && (
-        <div className="space-y-2">
-          {songsWithCharts.map(({ song, charts }) => (
-            <SongRow
-              key={song.id}
-              song={song}
-              charts={charts}
-              onSelectChart={playChart}
-              disabled={isPlaying}
-            />
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          {songsWithCharts.map(({ song }) => (
+            <SongCard key={song.id} song={song} onSelect={() => setSelectedId(song.id)} />
           ))}
         </div>
       )}

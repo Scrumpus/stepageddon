@@ -1,9 +1,10 @@
 import { Loader2, Search, X } from 'lucide-react';
+import { SongCard } from '@/features/playlists/components';
+import { SongSummaryDTO } from '@/features/playlists/types';
 import { useSongSearch } from '../hooks';
-import SongListItem from './SongListItem';
 
 interface Props {
-  onSelect: (songId: string) => void;
+  onSelect: (song: SongSummaryDTO) => void;
 }
 
 function SongList({ onSelect }: Props) {
@@ -65,9 +66,9 @@ function SongList({ onSelect }: Props) {
 
       {!isLoading && !error && songs.length > 0 && (
         <>
-          <div className="space-y-2">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             {songs.map((song) => (
-              <SongListItem key={song.id} song={song} onSelect={onSelect} />
+              <SongCard key={song.id} song={song} onSelect={onSelect} />
             ))}
           </div>
 
