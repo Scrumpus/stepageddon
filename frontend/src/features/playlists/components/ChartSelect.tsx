@@ -71,7 +71,7 @@ function ChartSelect({
           No charts for this song.
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {charts.map((chart) => {
             const color =
               DIFFICULTY_COLORS[chart.difficulty_name.toLowerCase()] ??

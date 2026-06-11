@@ -108,7 +108,7 @@ function DiscoverTab({ onSelect }: DiscoverTabProps) {
           Nothing here right now. Try a different genre.
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 max-h-[24rem] overflow-y-auto pr-1">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 max-h-[65vh] overflow-y-auto pr-1">
           {results.map((r) => (
             <TrackCard key={`${r.source}:${r.id}`} track={r} onSelect={onSelect} />
           ))}

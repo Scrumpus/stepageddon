@@ -22,7 +22,7 @@ function MenuScreen() {
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="max-w-2xl w-full">
+      <div className="max-w-6xl w-full">
         {/* Title */}
         <div className="text-center mb-4">
           <h1 className="text-6xl font-bold mb-4 text-game-primary">
