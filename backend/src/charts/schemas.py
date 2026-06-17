@@ -89,6 +89,10 @@ class Chart(BaseModel):
     difficulty: str
     tempo: float
     duration: float
+    # Seconds baked into every step time (negative = notes pulled earlier to
+    # compensate analysis latency). The frontend reuses it to phase-lock the
+    # receptor pulse. 0.0 for imported .sm charts (they carry an authored offset).
+    timing_offset: float = 0.0
 
     def get_taps(self) -> List[Step]:
         """Get only tap notes."""
@@ -116,6 +120,7 @@ class Chart(BaseModel):
             'difficulty': self.difficulty,
             'tempo': round(self.tempo, 1),
             'duration': round(self.duration, 2),
+            'timing_offset': round(self.timing_offset, 4),
             'steps': steps_data,
             'stats': {
                 'total_steps': len(self.steps),

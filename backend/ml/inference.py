@@ -53,6 +53,7 @@ class _AudioAnalysis:
     feats_whitened: np.ndarray
     tempo: float
     beat_times: np.ndarray
+    timing_offset: float
     rms_norm: np.ndarray
     centroid_norm: np.ndarray
     harm_rms: np.ndarray
@@ -361,7 +362,7 @@ class MLChartGenerator:
         style_profiles_path: Optional[str] = None,
         min_first_step_time: float = 0.25,
         min_last_step_buffer: float = 0.0,
-        timing_offset: float = 0.0,
+        timing_trim: float = 0.0,
     ):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -379,9 +380,10 @@ class MLChartGenerator:
         self.intensity_threshold_base = float(intensity_threshold_base)
         self.min_first_step_time = float(min_first_step_time)
         self.min_last_step_buffer = float(min_last_step_buffer)
-        # Global timing calibration (seconds) added to every emitted step time.
-        # Negative pulls notes earlier to compensate librosa's analysis latency.
-        self.timing_offset = float(timing_offset)
+        # Manual timing trim (seconds) added on top of the per-song measured
+        # offset (see _analyze_audio). Negative pulls notes earlier. Normally 0;
+        # exists only for fine-tuning beyond the auto-calibrated value.
+        self.timing_trim = float(timing_trim)
         self.style = str(style)
 
         self.model: Optional[StepChartModel] = None
@@ -641,11 +643,61 @@ class MLChartGenerator:
         feats = self._extract_feats(y, sr)
         feats_whitened = (feats - self.feat_mean) / self.feat_std
 
-        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        # Shared onset-strength envelope: drives both the beat grid and the
+        # per-song timing-offset measurement below.
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
+
+        # Global tempo scalar (still used for difficulty conditioning and the
+        # frontend receptor pulse, which both want a single BPM).
+        tempo, bt_frames = librosa.beat.beat_track(
+            onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH,
+        )
         if hasattr(tempo, '__len__'):
             tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
         tempo = float(tempo)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+
+        # Predominant Local Pulse: phase-accurate under tempo variation, unlike
+        # beat_track's single-tempo DP (which drifts out of phase mid-song and
+        # made on-beat notes snap to 8th/16th cells → wrong subdivision colors).
+        # Constrain the tempo window around the detected tempo to avoid octave
+        # (half/double) errors.
+        pulse = librosa.beat.plp(
+            onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH,
+            tempo_min=max(30.0, tempo * 0.7), tempo_max=min(300.0, tempo * 1.5),
+        )
+        plp_frames = np.flatnonzero(librosa.util.localmax(pulse))
+        beat_times = librosa.frames_to_time(plp_frames, sr=sr, hop_length=HOP_LENGTH)
+
+        # Fallback: if PLP produced an implausible grid (too few beats vs.
+        # duration*tempo), revert to the beat_track grid so steady-tempo songs
+        # are never made worse.
+        expected_beats = duration * tempo / 60.0
+        if len(beat_times) < 0.5 * expected_beats:
+            beat_times = librosa.frames_to_time(
+                bt_frames, sr=sr, hop_length=HOP_LENGTH,
+            )
+
+        # Per-song timing offset: measure how far each detected onset's envelope
+        # peak sits after the true transient. onset_detect(backtrack=True) snaps
+        # each onset back to the preceding local energy minimum; the median gap is
+        # the systematic latency to compensate by pulling notes earlier.
+        peaks = librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH,
+            backtrack=False, units='time',
+        )
+        backtracked = librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH,
+            backtrack=True, units='time',
+        )
+        if len(peaks) and len(peaks) == len(backtracked):
+            lag = float(np.median(peaks - backtracked))
+            timing_offset = -max(0.0, min(lag, 0.080))  # clamp to (-80ms, 0]
+        else:
+            timing_offset = -0.030  # old hardcoded default as a safe fallback
+        logger.info(
+            "Measured timing offset: %.1f ms (tempo=%.1f, beats=%d)",
+            timing_offset * 1000.0, tempo, len(beat_times),
+        )
 
         rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)[0]
         rms_norm = rms / (rms.max() + 1e-8)
@@ -690,6 +742,7 @@ class MLChartGenerator:
             feats_whitened=feats_whitened,
             tempo=tempo,
             beat_times=beat_times,
+            timing_offset=timing_offset,
             rms_norm=rms_norm,
             centroid_norm=centroid_norm,
             harm_rms=harm_rms,
@@ -722,6 +775,10 @@ class MLChartGenerator:
             resolved_style, onset_density_pred, intensity_mean_pred,
         )
 
+        # Effective offset baked into emitted step times: per-song measured
+        # latency plus the manual trim.
+        timing_offset = analysis.timing_offset + self.timing_trim
+
         steps = self._postprocess(
             onset_p, sustain_p, intensity,
             analysis.tempo, analysis.beat_times, analysis.duration, diff_config,
@@ -730,6 +787,7 @@ class MLChartGenerator:
             harmonic_curve=analysis.harm_rms,
             audio_seed=analysis.audio_seed,
             style_knobs=knobs,
+            timing_offset=timing_offset,
         )
 
         chart = Chart(
@@ -737,6 +795,7 @@ class MLChartGenerator:
             difficulty=difficulty,
             tempo=analysis.tempo,
             duration=analysis.duration,
+            timing_offset=round(timing_offset, 4),
         )
         logger.info(
             f"Generated {len(steps)} {difficulty} steps "
@@ -1027,10 +1086,14 @@ class MLChartGenerator:
         harmonic_curve: np.ndarray,
         audio_seed: int,
         style_knobs: Dict[str, float],
+        timing_offset: float = 0.0,
     ) -> List[Step]:
         """
         Detect WHEN (NMS on onset_p) → classify type (jump/hold/tap) →
         assign arrows via FootStateArrowAssigner driven by style knobs.
+
+        ``timing_offset`` (seconds) is the per-song calibration baked into every
+        emitted step time; negative pulls notes earlier.
         """
         T = onset_p.shape[0]
         logger.info(
@@ -1293,7 +1356,7 @@ class MLChartGenerator:
             # Emitted (player-facing) time carries the global timing
             # calibration; `t` stays on the analyzed grid so energy lookups and
             # subdivision derivation reference the true musical position.
-            emit_t = round(max(0.0, event['time'] + self.timing_offset), 3)
+            emit_t = round(max(0.0, event['time'] + timing_offset), 3)
             subdivision = event.get('subdivision') or self._subdivision_from_grid(
                 t, tempo, beat_times,
             )
@@ -1365,8 +1428,22 @@ class MLChartGenerator:
         if len(beat_times) == 0 or tempo <= 0:
             return BeatSubdivision.QUARTER
 
-        beat_interval = 60.0 / tempo
-        anchor = float(beat_times[0])
+        # Anchor to the nearest preceding beat and use the local beat spacing so
+        # the position stays correct under tempo changes (a global 60/tempo
+        # interval drifts out of phase on dynamic-tempo songs and mis-colors
+        # otherwise on-beat events).
+        bts = np.asarray(beat_times, dtype=np.float64)
+        idx = int(np.searchsorted(bts, time)) - 1
+        idx = max(0, min(idx, bts.size - 1))
+        anchor = float(bts[idx])
+        if idx + 1 < bts.size:
+            beat_interval = float(bts[idx + 1] - bts[idx])
+        elif idx > 0:
+            beat_interval = float(bts[idx] - bts[idx - 1])
+        else:
+            beat_interval = 60.0 / tempo
+        if beat_interval <= 0:
+            beat_interval = 60.0 / tempo
         beat_position = ((time - anchor) % beat_interval) / beat_interval
 
         # Triplet positions (1/3, 2/3) win when within 1/24 of a beat. The

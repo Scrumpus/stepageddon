@@ -15,8 +15,13 @@ export interface SongInfo {
   // Chart origin. ML-generated charts ('upload', 'USER') carry the backend
   // generation timing offset in their note times; imported 'DDR' .sm charts use
   // their own authored #OFFSET and must not get the extra shift. Drives whether
-  // the receptor pulse applies GENERATION_TIMING_OFFSET_S. See GameScreen.
+  // the receptor pulse applies the generation offset. See GameScreen.
   source?: 'upload' | 'USER' | 'DDR';
+  // Per-song generation timing offset (seconds) measured by the backend and
+  // baked into note times. The receptor pulse reuses it to stay phase-locked.
+  // Absent for DDR charts and older responses; GameScreen falls back to the
+  // build-time GENERATION_TIMING_OFFSET_S constant when undefined.
+  timing_offset?: number;
 }
 
 /**

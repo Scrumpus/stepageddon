@@ -5,10 +5,11 @@ import path from 'path'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
 
-  // Single source of truth for the generation timing offset: read it from the
-  // backend's .env so the receptor pulse stays aligned with the offset baked
-  // into ML-generated note times. Falls back to the backend default (-30) when
-  // the var is unset there. Resolved at build time and injected via `define`.
+  // Receptor-pulse offset FALLBACK. The backend now measures a per-song timing
+  // offset and sends it in song_info.timing_offset; GameScreen prefers that.
+  // This build-time constant only applies when the per-song value is absent
+  // (stored charts / older responses). Read the backend's manual trim env var
+  // and fall back to a typical -30ms so the pulse stays roughly aligned.
   const backendEnv = loadEnv(mode, path.resolve(__dirname, '../backend'), '')
   const generationTimingOffsetMs = Number(
     backendEnv.GENERATION_TIMING_OFFSET_MS ?? -30

@@ -291,8 +291,12 @@ function GameScreen() {
   // Imported DDR .sm charts carry their own authored #OFFSET, so the generation
   // offset is NOT baked into their note times — only ML-generated charts get it.
   // Apply the pulse offset everywhere except DDR so the pulse tracks the notes.
+  // Prefer the per-song offset the backend measured and sent; fall back to the
+  // build-time constant for older responses that omit it.
   const beatOffset =
-    songData.source === 'DDR' ? 0 : GENERATION_TIMING_OFFSET_S;
+    songData.source === 'DDR'
+      ? 0
+      : songData.timing_offset ?? GENERATION_TIMING_OFFSET_S;
 
   return (
     <div className="min-h-screen flex flex-col">

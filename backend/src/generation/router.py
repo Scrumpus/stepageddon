@@ -52,7 +52,7 @@ if _style_profiles_path is None:
 ml_generator = MLChartGenerator(
     model_path=settings.ML_MODEL_PATH,
     style_profiles_path=_style_profiles_path,
-    timing_offset=settings.GENERATION_TIMING_OFFSET_MS / 1000.0,
+    timing_trim=settings.GENERATION_TIMING_OFFSET_MS / 1000.0,
 )
 logger.info("ML chart generator loaded successfully")
 
@@ -143,6 +143,7 @@ async def generate_steps_from_file(
             "title": file.filename,
             "duration": any_chart.duration,
             "tempo": any_chart.tempo,
+            "timing_offset": any_chart.timing_offset,
             "source": "upload"
         },
         "audio_url": f"/api/audio/{audio_key}"
@@ -232,6 +233,7 @@ async def generate_steps_from_url(
             "artist": metadata.get("artist", "Unknown"),
             "duration": any_chart.duration,
             "tempo": any_chart.tempo,
+            "timing_offset": any_chart.timing_offset,
             "thumbnail": metadata.get("thumbnail", ""),
             "source": metadata["source"],
             "is_preview": download_result.get("is_preview", False)

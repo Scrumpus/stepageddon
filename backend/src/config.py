@@ -68,15 +68,15 @@ class Settings(BaseSettings):
     # ML Model Settings
     ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
 
-    # Global timing calibration for ML-generated charts, in milliseconds.
-    # Added to every generated step time: negative shifts notes earlier,
-    # positive later. Defaults to a small negative value to compensate the
-    # systematic latency of librosa's onset/beat analysis (its onset-strength
-    # envelope peaks slightly after the true transient, so beat-snapped notes
-    # land a touch late). Imported .sm charts are unaffected — their times come
-    # from authored offsets, not analysis.
+    # Manual timing trim for ML-generated charts, in milliseconds. Added on top
+    # of the per-song offset that inference now measures automatically from
+    # librosa's onset-envelope latency (see MLChartGenerator._analyze_audio).
+    # Negative shifts notes earlier, positive later. Defaults to 0 — the measured
+    # offset already handles the systematic latency; this only exists for manual
+    # fine-tuning. Imported .sm charts are unaffected — their times come from
+    # authored offsets, not analysis.
     GENERATION_TIMING_OFFSET_MS: float = float(
-        os.getenv("GENERATION_TIMING_OFFSET_MS", "-30")
+        os.getenv("GENERATION_TIMING_OFFSET_MS", "0")
     )
 
     class Config:
