@@ -8,18 +8,35 @@ import uuid
 import logging
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
+from pathlib import Path
+
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from ml import MLChartGenerator
 from src.audius.client import AudiusClient
+from src.charts.sm_export import (
+    build_simfile,
+    build_song_zip,
+    content_disposition,
+    sanitize_filename,
+)
 from src.config import settings
-from src.generation.schemas import GenerateRequest
+from src.generation.schemas import ExportRequest, GenerateRequest
 from src.generation.service import download_audio
 from src.generation.utils import AudioProcessor
 from src.jamendo.client import JamendoClient
 from src.rate_limit import limiter
 from src.storage import get_storage
+
+# StepMania meter when a generated chart has no authored difficulty rating.
+_DEFAULT_METER = {
+    "beginner": 2,
+    "easy": 4,
+    "medium": 6,
+    "hard": 9,
+    "challenge": 12,
+}
 
 _ALLOWED_URL_HOSTS = ("audius.co", "jamendo.com")
 
@@ -155,6 +172,62 @@ async def generate_steps_from_file(
         f"for {song_id}"
     )
     return JSONResponse(content=response)
+
+
+@router.post("/charts/export")
+async def export_generated_charts(body: ExportRequest) -> Response:
+    """Export freshly generated (in-memory) charts as a StepMania zip.
+
+    Unlike DDR-library songs, generated charts aren't persisted, so the caller
+    posts the chart payload it already holds. The audio is still in storage,
+    keyed by ``audio_url``.
+    """
+    info = body.song_info or {}
+    title = info.get("title") or "Generated Song"
+    # Strip a file extension if the title came from an upload filename.
+    title = Path(title).stem if "." in Path(title).name else title
+
+    audio_key = body.audio_url.split("/api/audio/", 1)[-1].lstrip("/")
+    if not audio_key:
+        raise HTTPException(400, "Missing audio reference")
+    audio_bytes = storage.read_bytes(audio_key)
+
+    folder = sanitize_filename(title)
+    audio_name = f"{folder}{Path(audio_key).suffix or '.mp3'}"
+
+    tempo = float(info.get("tempo") or 120.0)
+    # timing_offset is baked into step times (notes pulled earlier); undo it so
+    # notes land on the musical grid against a constant-tempo, zero-offset map.
+    timing_offset = float(info.get("timing_offset") or 0.0)
+    meta = {
+        "title": title,
+        "artist": info.get("artist") or "",
+        "music": audio_name,
+        "offset": 0.0,
+        "bpms": [[0.0, tempo]],
+        "time_shift": -timing_offset,
+    }
+
+    chart_dicts = []
+    for diff_name, chart in (body.charts or {}).items():
+        steps = (chart or {}).get("steps") or []
+        if not steps:
+            continue
+        chart_dicts.append({
+            "difficulty_name": diff_name,
+            "difficulty_level": _DEFAULT_METER.get(diff_name.lower(), 5),
+            "steps": steps,
+        })
+    if not chart_dicts:
+        raise HTTPException(400, "No charts to export")
+
+    sm_text = build_simfile(meta, chart_dicts)
+    zip_bytes = build_song_zip(sm_text, folder, {audio_name: audio_bytes})
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": content_disposition(f"{folder}.zip")},
+    )
 
 
 def _validate_audio_url(url: str) -> None:

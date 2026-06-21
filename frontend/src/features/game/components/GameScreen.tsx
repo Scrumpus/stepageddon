@@ -37,6 +37,8 @@ function GameScreen() {
   const gameMode = useGameStore((s) => s.gameMode);
   const setGameMode = useGameStore((s) => s.setGameMode);
   const resetGame = useGameStore((s) => s.resetGame);
+  const stepsByDifficulty = useGameStore((s) => s.stepsByDifficulty);
+  const enterDifficultySelect = useGameStore((s) => s.enterDifficultySelect);
   const gameFinished = useGameStore((s) => s.gameFinished);
   const { audioRef } = useAudio();
   const isDualMode = gameMode === 'dual';
@@ -357,6 +359,7 @@ function GameScreen() {
           onResume={togglePause}
           mode={gameMode}
           onModeChange={handleModeChange}
+          onChangeDifficulty={stepsByDifficulty ? enterDifficultySelect : undefined}
         />
       )}
     </div>

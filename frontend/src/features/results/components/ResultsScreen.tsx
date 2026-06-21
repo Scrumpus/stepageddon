@@ -3,7 +3,7 @@
  * Composes GradeDisplay and StatsBreakdown components
  */
 
-import { RotateCcw, Home } from 'lucide-react';
+import { RotateCcw, Home, ListMusic } from 'lucide-react';
 import { useGameStore } from '@/app/store/useGameStore';
 import { GameState } from '@/types/common.types';
 import { calculateGrade } from '@/features/results/utils/gradeCalculation';
@@ -13,12 +13,17 @@ import StatsBreakdown from './StatsBreakdown';
 function ResultsScreen() {
   const gameResults = useGameStore((s) => s.gameResults);
   const songData = useGameStore((s) => s.songData);
+  const stepsByDifficulty = useGameStore((s) => s.stepsByDifficulty);
   const setGameState = useGameStore((s) => s.setGameState);
+  const enterDifficultySelect = useGameStore((s) => s.enterDifficultySelect);
   const resetGame = useGameStore((s) => s.resetGame);
 
   if (!gameResults || !songData) return null;
 
   const grade = calculateGrade(gameResults.accuracy);
+  // Only generated songs keep every difficulty's chart in memory; library
+  // songs load a single chart, so there's nothing to switch back to.
+  const canChangeDifficulty = !!stepsByDifficulty;
 
   const handlePlayAgain = () => {
     setGameState(GameState.READY);
@@ -38,6 +43,16 @@ function ResultsScreen() {
           <StatsBreakdown results={gameResults} />
 
           {/* Action Buttons */}
+          {canChangeDifficulty && (
+            <button
+              onClick={enterDifficultySelect}
+              className="w-full mb-4 py-3 bg-white/10 rounded-lg font-semibold hover:bg-white/20 transition-all flex items-center justify-center gap-2"
+            >
+              <ListMusic className="w-5 h-5" />
+              Return to Difficulty Selection
+            </button>
+          )}
+
           <div className="flex gap-4">
             <button
               onClick={handleReturnToMenu}
