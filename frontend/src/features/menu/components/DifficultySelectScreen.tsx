@@ -3,9 +3,11 @@
  * The user picks which of the generated charts to play.
  */
 
-import { ArrowLeft, Music } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowLeft, Download, Loader2, Music } from 'lucide-react';
 import { DifficultyLevel } from '@/types/common.types';
 import { useGameStore } from '@/app/store/useGameStore';
+import { exportGeneratedCharts } from '@/lib/exportSimfile';
 import { DIFFICULTY_INFO } from '../types/menu.types';
 
 const DIFFICULTY_ORDER: DifficultyLevel[] = [
@@ -19,8 +21,12 @@ const DIFFICULTY_ORDER: DifficultyLevel[] = [
 function DifficultySelectScreen() {
   const songData = useGameStore((s) => s.songData);
   const stepsByDifficulty = useGameStore((s) => s.stepsByDifficulty);
+  const audioUrl = useGameStore((s) => s.audioUrl);
   const difficultyPicked = useGameStore((s) => s.difficultyPicked);
   const resetGame = useGameStore((s) => s.resetGame);
+
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   if (!stepsByDifficulty) {
     return null;
@@ -28,6 +34,19 @@ function DifficultySelectScreen() {
 
   const handlePick = (level: DifficultyLevel) => {
     difficultyPicked(level);
+  };
+
+  const handleExport = async () => {
+    if (!songData || !audioUrl || !stepsByDifficulty) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      await exportGeneratedCharts({ songInfo: songData, audioUrl, stepsByDifficulty });
+    } catch {
+      setExportError('Export failed. Please try again.');
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -72,6 +91,23 @@ function DifficultySelectScreen() {
               );
             })}
           </div>
+
+          <button
+            onClick={handleExport}
+            disabled={exporting || !audioUrl}
+            className="w-full py-3 mb-3 bg-white/10 rounded-lg font-semibold hover:bg-white/20 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Download as a StepMania song folder (.zip)"
+          >
+            {exporting ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <Download className="w-5 h-5" />
+            )}
+            Export to StepMania
+          </button>
+          {exportError && (
+            <p className="text-rose-300 text-sm text-center mb-3">{exportError}</p>
+          )}
 
           <button
             onClick={resetGame}

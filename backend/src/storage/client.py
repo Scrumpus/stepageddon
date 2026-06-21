@@ -66,6 +66,10 @@ class StorageBackend(ABC):
         """
 
     @abstractmethod
+    def read_bytes(self, key: str) -> bytes:
+        """Return the raw bytes stored under ``key``. Raises 404 if missing."""
+
+    @abstractmethod
     def exists(self, key: str) -> bool:
         """Return True if ``key`` is present in storage."""
 
@@ -110,6 +114,13 @@ class LocalStorage(StorageBackend):
     def commit(self, key: str, local_path: Path) -> None:
         # File was written in place by the caller; nothing to do.
         return
+
+    def read_bytes(self, key: str) -> bytes:
+        target = self._resolve(key)
+        if not target.is_file():
+            logger.warning("Asset not found: %s", key)
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return target.read_bytes()
 
     def exists(self, key: str) -> bool:
         return self._resolve(key).is_file()
@@ -205,6 +216,22 @@ class S3Storage(StorageBackend):
             key,
             ExtraArgs={"ContentType": _content_type(key)},
         )
+
+    def read_bytes(self, key: str) -> bytes:
+        cache = self._cache_path(key)
+        if cache.is_file():
+            return cache.read_bytes()
+        try:
+            obj = self._client.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                raise HTTPException(status_code=404, detail="Asset not found") from e
+            raise
+        data = obj["Body"].read()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(data)
+        return data
 
     def exists(self, key: str) -> bool:
         try:
