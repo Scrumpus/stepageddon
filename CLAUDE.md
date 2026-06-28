@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Beat Sync is a DDR-style rhythm game that generates custom step charts from audio. It uses:
+Stepageddon is a DDR-style rhythm game that generates custom step charts from audio. It uses:
 - **Frontend**: React 18 + Vite + TailwindCSS
 - **Backend**: FastAPI (Python) with librosa for audio analysis
 - **Audio Processing**: librosa 22050 Hz sample rate, comprehensive feature extraction

@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Beat Sync - Setup Script
+# Stepageddon - Setup Script
 # This script helps you set up the project quickly
 
 set -e
 
-echo "🎮 Beat Sync Setup"
+echo "🎮 Stepageddon Setup"
 echo "=================="
 echo ""
 

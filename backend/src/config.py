@@ -1,5 +1,5 @@
 """
-Configuration settings for Beat Sync backend
+Configuration settings for Stepageddon backend
 """
 
 import os

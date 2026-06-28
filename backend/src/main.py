@@ -1,5 +1,5 @@
 """
-Beat Sync Backend - FastAPI Application
+Stepageddon Backend - FastAPI Application
 Main entry point for the rhythm game backend API
 """
 
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
-    logger.info("🎮 Beat Sync Backend Starting...")
+    logger.info("🎮 Stepageddon Backend Starting...")
 
     # Create audio storage directory
     os.makedirs(settings.AUDIO_STORAGE_PATH, exist_ok=True)
@@ -52,12 +52,12 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("⚠️  JAMENDO_CLIENT_ID not set - Jamendo search/links disabled")
 
-    logger.info("✓ Beat Sync Backend Ready!")
+    logger.info("✓ Stepageddon Backend Ready!")
 
     yield
 
     # Shutdown
-    logger.info("🛑 Beat Sync Backend Shutting Down...")
+    logger.info("🛑 Stepageddon Backend Shutting Down...")
     await engine.dispose()
 
 
@@ -66,7 +66,7 @@ _is_prod = settings.ENV == "production"
 # Create FastAPI app — hide OpenAPI surface in production to reduce
 # information disclosure to unauthenticated scanners.
 app = FastAPI(
-    title="Beat Sync API",
+    title="Stepageddon API",
     description="AI-powered DDR-style rhythm game backend",
     version="1.0.0",
     lifespan=lifespan,
@@ -98,7 +98,7 @@ async def root():
     """Root endpoint - health check"""
     return {
         "status": "online",
-        "service": "Beat Sync API",
+        "service": "Stepageddon API",
         "version": "1.0.0"
     }
 
