@@ -39,12 +39,12 @@ export function useStepGeneration() {
   );
 
   const handleFileUpload = useCallback(
-    async (file: File) => {
+    async (file: File, style: string = 'auto') => {
       try {
         setIsLoading(true);
         generationStarted({ message: 'Uploading audio...', progress: 25 });
 
-        const result = await generateStepsFromFile(file);
+        const result = await generateStepsFromFile(file, style);
         finishGeneration(result);
       } catch (error: any) {
         console.error('Upload failed:', error);
@@ -59,7 +59,7 @@ export function useStepGeneration() {
   );
 
   const handleUrlSubmit = useCallback(
-    async (url: string) => {
+    async (url: string, style: string = 'auto') => {
       try {
         setIsLoading(true);
         generationStarted({ message: 'Downloading audio...', progress: 20 });
@@ -70,7 +70,7 @@ export function useStepGeneration() {
           setLoadingProgress(50);
         }, 1000);
 
-        const result = await generateStepsFromUrl(url);
+        const result = await generateStepsFromUrl(url, style);
         finishGeneration(result);
       } catch (error: any) {
         console.error('URL processing failed:', error);

@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     # ML Model Settings
     ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
 
+    # Path to style_profiles.json, next to the training data the checkpoint was
+    # built from. When empty the app probes conventional locations (next to the
+    # checkpoint, or ml/checkpoints/style_profiles.json). Set it explicitly if
+    # profiles live elsewhere.
+    STYLE_PROFILES_PATH: str = os.getenv("STYLE_PROFILES_PATH", "")
+
     # Manual timing trim for ML-generated charts, in milliseconds. Added on top
     # of the per-song offset that inference now measures automatically from
     # librosa's onset-envelope latency (see MLChartGenerator._analyze_audio).

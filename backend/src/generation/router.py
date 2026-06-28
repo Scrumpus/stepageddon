@@ -57,8 +57,8 @@ logger.info(f"Loading ML generator from {settings.ML_MODEL_PATH}...")
 # We probe a couple of conventional locations so the API doesn't hard-fail
 # when profiles haven't been generated yet — `style='auto'` then falls back
 # to default knobs (see MLChartGenerator._resolve_style).
-_style_profiles_path = getattr(settings, 'STYLE_PROFILES_PATH', None)
-if _style_profiles_path is None:
+_style_profiles_path = getattr(settings, 'STYLE_PROFILES_PATH', None) or None
+if not _style_profiles_path:
     for _candidate in (
         os.path.join(os.path.dirname(settings.ML_MODEL_PATH), 'style_profiles.json'),
         os.path.join('ml', 'checkpoints', 'style_profiles.json'),

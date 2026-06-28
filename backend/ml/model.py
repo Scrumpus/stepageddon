@@ -1,17 +1,23 @@
 """
-Step Chart Neural Network Model (v7 hybrid).
+Step Chart Neural Network Model (v8 — arrow heads + structure awareness).
 
-Three-head architecture:
+v8 adds on top of v7:
+    - Four per-arrow logit heads (L/D/U/R) trained with focal BCE only at
+      onset frames, used by inference to bias the FootStateArrowAssigner.
+    - Section-boundary conditioning: a Fourier-encoded `section_position`
+      scalar (0=start of section, 0.5=middle, 1=end) plus an extra
+      `near_boundary` flag join the FiLM conditioner so the model can vary
+      its predictions across song sections.
+
+Core v7 heads retained:
     feats[T,88] -> AudioEncoder (CNN) -> Dilated TCN -> early FiLM
-        (difficulty + density + start_seconds + remaining_seconds)
+        (difficulty + density + start_seconds + remaining_seconds
+         + section_position + near_boundary)
         -> RoPE Transformer -> LayerNorm
         -> onset head      [T, 1] sigmoid: any-onset prob (Gaussian-smoothed BCE)
         -> sustain head    [T, 1] sigmoid: in-any-hold prob (dense BCE)
         -> intensity head  [T, 1] linear:  jump-vs-tap intensity (MSE regression)
-
-The model predicts dense, style-agnostic signals only. Algorithmic
-post-processing (see `inference.py`) decides arrows, jump vs. tap, hold
-start/end, and jumpholds, parameterized by selectable style profiles.
+        -> arrow_heads     [T, 4] sigmoid: per-arrow onset prob (focal BCE, onset-masked)
 """
 
 import math
@@ -22,13 +28,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Bumped to v7: full hybrid rewrite. The arrow/type/duration/beat/hold heads
-# of v6 are gone; the model now emits only onset/sustain/intensity.
-ARCH_VERSION = 7
+# v8: arrow prediction heads + structure-aware FiLM conditioning.
+ARCH_VERSION = 8
 
 
 class AudioEncoder(nn.Module):
-    """CNN encoder for the v7 88-channel audio feature tensor.
+    """CNN encoder for the v8 88-channel audio feature tensor.
 
     Input is `feats[B, T, n_in_channels]` (mel ⊕ onset_strength ⊕ spec_contrast)
     rather than the v6 mel-only input — the conv stack widens the channel
@@ -82,21 +87,27 @@ class DilatedTCNBlock(nn.Module):
 class DilatedTCN(nn.Module):
     """Stack of dilated residual conv blocks. [B, T, H] -> [B, T, H]."""
 
-    def __init__(self, hidden_dim: int, dilations=(1, 2, 4, 8, 16), dropout: float = 0.1):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dilations: Tuple[int, ...] = (1, 2, 4, 8, 16),
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.blocks = nn.ModuleList(
-            [DilatedTCNBlock(hidden_dim, d, dropout=dropout) for d in dilations]
-        )
+        self.blocks = nn.ModuleList([
+            DilatedTCNBlock(hidden_dim, d, dropout=dropout) for d in dilations
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)  # [B, H, T]
-        for b in self.blocks:
-            x = b(x)
-        return x.transpose(1, 2)  # [B, T, H]
+        # [B, T, H] -> [B, H, T] -> blocks -> [B, H, T] -> [B, T, H]
+        x = x.transpose(1, 2)
+        for blk in self.blocks:
+            x = blk(x)
+        return x.transpose(1, 2)
 
 
 # ---------------------------------------------------------------------------
-# Conditioning: difficulty embedding + Fourier features on density -> FiLM
+# FiLM conditioning (difficulty + density + song position + structure)
 # ---------------------------------------------------------------------------
 class FourierFeatures(nn.Module):
     """Random Fourier features for a scalar input."""
@@ -113,11 +124,12 @@ class FourierFeatures(nn.Module):
 
 class FiLMConditioner(nn.Module):
     """
-    FiLM conditioner for (difficulty, density, start_seconds, remaining_seconds).
+    FiLM conditioner for (difficulty, density, start_seconds, remaining_seconds,
+    section_position, near_boundary).
 
-    Builds (gamma, beta) from a difficulty embedding concatenated with random
-    Fourier features of density and the two song-position scalars, then
-    applies `gamma * x + beta` to features.
+    v8 adds section_position (0=start … 1=end of the detected section) and
+    near_boundary (0/1 flag for frames close to a section boundary) so the
+    model can adapt its predictions to song structure.
     """
 
     def __init__(
@@ -134,10 +146,20 @@ class FiLMConditioner(nn.Module):
         self.fourier = FourierFeatures(n_fourier)
         self.fourier_start = FourierFeatures(n_fourier_position, sigma=position_sigma)
         self.fourier_remaining = FourierFeatures(n_fourier_position, sigma=position_sigma)
-        cond_dim = hidden_dim + 2 * n_fourier + 2 * (2 * n_fourier_position)
+        self.fourier_section_pos = FourierFeatures(n_fourier_position, sigma=position_sigma)
+        # near_boundary is a 0/1 flag — small embedding + Fourier.
+        self.boundary_emb = nn.Embedding(2, 8)
+        cond_dim = (
+            hidden_dim                          # difficulty embedding
+            + 2 * n_fourier                     # density
+            + 2 * (2 * n_fourier_position)      # start + remaining
+            + 2 * n_fourier_position            # section_position
+            + 8                                  # near_boundary
+        )
         self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
 
         nn.init.normal_(self.diff_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.boundary_emb.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj.weight)
         with torch.no_grad():
             self.proj.bias.zero_()
@@ -150,12 +172,16 @@ class FiLMConditioner(nn.Module):
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
+        section_position: torch.Tensor,
+        near_boundary: torch.Tensor,
     ) -> torch.Tensor:
         d = self.diff_emb(difficulty)
         f = self.fourier(density)
         fs = self.fourier_start(start_seconds)
         fr = self.fourier_remaining(remaining_seconds)
-        cond = torch.cat([d, f, fs, fr], dim=-1)
+        fsec = self.fourier_section_pos(section_position)
+        bdry = self.boundary_emb(near_boundary.long())
+        cond = torch.cat([d, f, fs, fr, fsec, bdry], dim=-1)
         params = self.proj(cond)
         gamma, beta = params.chunk(2, dim=-1)
         return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
@@ -238,17 +264,20 @@ class TransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full step chart model (v7)
+# Full step chart model (v8)
 # ---------------------------------------------------------------------------
 
 class StepChartModel(nn.Module):
     """
-    feats -> (onset_logits, sustain_logits, intensity_pred).
+    feats -> (onset_logits, sustain_logits, intensity_pred, arrow_logits).
 
     onset_logits:    [B, T, 1]  any-onset pre-sigmoid
     sustain_logits:  [B, T, 1]  "any arrow currently held" pre-sigmoid
     intensity_pred:  [B, T, 1]  continuous jump-vs-tap intensity (linear out)
+    arrow_logits:    [B, T, 4]  per-arrow onset pre-sigmoid (L/D/U/R)
     """
+
+    N_ARROWS = 4  # left, down, up, right
 
     def __init__(
         self,
@@ -289,13 +318,10 @@ class StepChartModel(nn.Module):
         self.onset_head = _mlp_head(1)
         self.sustain_head = _mlp_head(1)
         self.intensity_head = _mlp_head(1)
+        self.arrow_heads = _mlp_head(self.N_ARROWS)  # [B, T, 4]
 
     def set_onset_prior(self, p: float) -> None:
-        """Bias-init the onset head's final layer to logit(p).
-
-        Anchors the freshly-built model at the empirical onset rate so the
-        BCE doesn't spend its first few epochs just reaching the prior.
-        """
+        """Bias-init the onset head's final layer to logit(p)."""
         p = float(max(min(p, 0.999), 1e-4))
         bias = math.log(p / (1.0 - p))
         final = self.onset_head[-1]
@@ -317,11 +343,16 @@ class StepChartModel(nn.Module):
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
+        section_position: torch.Tensor,
+        near_boundary: torch.Tensor,
     ) -> torch.Tensor:
         """Backbone forward. [B, T, n_in_channels] -> [B, T, H]."""
         x = self.audio_encoder(feats)
         x = self.tcn(x)
-        x = self.film(x, difficulty, density, start_seconds, remaining_seconds)
+        x = self.film(
+            x, difficulty, density, start_seconds, remaining_seconds,
+            section_position, near_boundary,
+        )
         for blk in self.blocks:
             x = blk(x)
         return self.norm(x)
@@ -333,7 +364,9 @@ class StepChartModel(nn.Module):
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        section_position: Optional[torch.Tensor] = None,
+        near_boundary: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             feats: [B, T, n_in_channels]
@@ -341,31 +374,46 @@ class StepChartModel(nn.Module):
             density: [B] float (normalized)
             start_seconds: [B] float
             remaining_seconds: [B] float
+            section_position: [B] float in [0, 1] — position within section (optional)
+            near_boundary: [B] float 0/1 — near a section boundary (optional)
 
         Returns:
             onset_logits:    [B, T, 1] pre-sigmoid
             sustain_logits:  [B, T, 1] pre-sigmoid
             intensity_pred:  [B, T, 1] linear regression output
+            arrow_logits:    [B, T, 4] per-arrow pre-sigmoid
         """
+        if section_position is None:
+            section_position = torch.zeros(
+                feats.size(0), dtype=torch.float32, device=feats.device,
+            )
+        if near_boundary is None:
+            near_boundary = torch.zeros(
+                feats.size(0), dtype=torch.float32, device=feats.device,
+            )
         features = self.encode(
             feats, difficulty, density, start_seconds, remaining_seconds,
+            section_position, near_boundary,
         )
         onset_logits = self.onset_head(features)
         sustain_logits = self.sustain_head(features)
         intensity_pred = self.intensity_head(features)
-        return onset_logits, sustain_logits, intensity_pred
+        arrow_logits = self.arrow_heads(features)
+        return onset_logits, sustain_logits, intensity_pred, arrow_logits
 
 
 # ---------------------------------------------------------------------------
-# Loss
+# Loss (v8 — adds arrow BCE loss)
 # ---------------------------------------------------------------------------
 
 class StepChartLoss(nn.Module):
     """
-    Combined v7 loss:
+    Combined v8 loss:
         - focal BCE on onset_logits against Gaussian-smoothed any-onset target
         - focal BCE on sustain_logits against dense in-any-hold target
         - MSE on intensity_pred against jump-intensity target (smeared)
+        - focal BCE on arrow_logits against per-arrow onset labels,
+          masked to onset frames only (where any arrow fires)
     """
 
     def __init__(
@@ -375,6 +423,8 @@ class StepChartLoss(nn.Module):
         focal_gamma: float = 2.0,
         sustain_weight: float = 1.0,
         intensity_weight: float = 0.5,
+        arrow_weight: float = 0.3,
+        arrow_pos_weight: float = 3.0,
     ):
         super().__init__()
         self.register_buffer(
@@ -385,19 +435,27 @@ class StepChartLoss(nn.Module):
             'sustain_pos_weight',
             torch.tensor(float(sustain_pos_weight), dtype=torch.float32),
         )
+        self.register_buffer(
+            'arrow_pos_weight',
+            torch.tensor(float(arrow_pos_weight), dtype=torch.float32),
+        )
         self.focal_gamma = float(focal_gamma)
         self.sustain_weight = float(sustain_weight)
         self.intensity_weight = float(intensity_weight)
+        self.arrow_weight = float(arrow_weight)
 
     def forward(
         self,
-        onset_logits: torch.Tensor,    # [B, T, 1]
-        sustain_logits: torch.Tensor,  # [B, T, 1]
-        intensity_pred: torch.Tensor,  # [B, T, 1]
-        onset_soft: torch.Tensor,      # [B, T, 1]
-        sustain_target: torch.Tensor,  # [B, T, 1]
+        onset_logits: torch.Tensor,      # [B, T, 1]
+        sustain_logits: torch.Tensor,    # [B, T, 1]
+        intensity_pred: torch.Tensor,    # [B, T, 1]
+        arrow_logits: torch.Tensor,      # [B, T, 4]
+        onset_soft: torch.Tensor,        # [B, T, 1]
+        sustain_target: torch.Tensor,    # [B, T, 1]
         intensity_target: torch.Tensor,  # [B, T, 1]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        arrow_target: torch.Tensor,      # [B, T, 4] uint8
+        onset_mask: Optional[torch.Tensor] = None,  # [B, T, 1] float — arrow loss mask
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Focal BCE on onset.
         if self.focal_gamma > 0.0:
             bce = F.binary_cross_entropy_with_logits(
@@ -435,9 +493,40 @@ class StepChartLoss(nn.Module):
 
         intensity_loss = F.mse_loss(intensity_pred, intensity_target)
 
+        # Arrow loss: focal BCE, masked to onset frames only.
+        if onset_mask is None:
+            onset_mask = onset_soft.clamp(0.0, 1.0)
+        # onset_mask is [B, T, 1] — expand to [B, T, 4]
+        mask_4 = onset_mask.expand(-1, -1, 4)
+        if self.focal_gamma > 0.0:
+            bce_a = F.binary_cross_entropy_with_logits(
+                arrow_logits, arrow_target,
+                pos_weight=self.arrow_pos_weight,
+                reduction='none',
+            )
+            with torch.no_grad():
+                p_a = torch.sigmoid(arrow_logits)
+                p_t_a = arrow_target * p_a + (1.0 - arrow_target) * (1.0 - p_a)
+                focal_w_a = (1.0 - p_t_a).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
+            arrow_loss = (focal_w_a * bce_a * mask_4).sum() / mask_4.sum().clamp(min=1.0)
+        else:
+            arrow_loss = F.binary_cross_entropy_with_logits(
+                arrow_logits, arrow_target,
+                pos_weight=self.arrow_pos_weight,
+                reduction='none',
+            )
+            arrow_loss = (arrow_loss * mask_4).sum() / mask_4.sum().clamp(min=1.0)
+
         total = (
             onset_loss
             + self.sustain_weight * sustain_loss
             + self.intensity_weight * intensity_loss
+            + self.arrow_weight * arrow_loss
         )
-        return total, onset_loss.detach(), sustain_loss.detach(), intensity_loss.detach()
+        return (
+            total,
+            onset_loss.detach(),
+            sustain_loss.detach(),
+            intensity_loss.detach(),
+            arrow_loss.detach(),
+        )

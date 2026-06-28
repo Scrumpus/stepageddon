@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { Compass, Disc3, Link2, ListMusic, Search, Sparkles, Upload } from 'lucide-react';
 import { useGameStore } from '@/app/store/useGameStore';
 import { useStepGeneration } from '../hooks';
@@ -19,6 +19,16 @@ function MenuScreen() {
   const { handleFileUpload, handleUrlSubmit } = useStepGeneration();
   const [tab, setTab] = useState<Tab>('playlists');
   const [createTab, setCreateTab] = useState<CreateTab>('search');
+  const [chartStyle, setChartStyle] = useState<string>('auto');
+
+  const handleFileUploadStyled = useCallback(
+    (file: File) => handleFileUpload(file, chartStyle),
+    [handleFileUpload, chartStyle],
+  );
+  const handleUrlSubmitStyled = useCallback(
+    (url: string) => handleUrlSubmit(url, chartStyle),
+    [handleUrlSubmit, chartStyle],
+  );
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -96,17 +106,35 @@ function MenuScreen() {
               />
             </div>
 
+            {/* Style selector */}
+            <div className="flex items-center gap-3 justify-center">
+              <label className="text-sm text-gray-400">Chart style:</label>
+              <select
+                value={chartStyle}
+                onChange={(e) => setChartStyle(e.target.value)}
+                className="px-3 py-1.5 bg-white/5 border border-white/20 rounded-lg text-sm text-white focus:outline-none focus:border-game-accent"
+              >
+                <option value="auto">Auto (match song)</option>
+                <option value="Flowing">Flowing</option>
+                <option value="Stream-Heavy">Stream-Heavy</option>
+                <option value="Jump-Heavy">Jump-Heavy</option>
+                <option value="Hold-Heavy">Hold-Heavy</option>
+                <option value="Technical">Technical</option>
+                <option value="Dense">Dense</option>
+              </select>
+            </div>
+
             <div className={createTab === 'search' ? '' : 'hidden'}>
-              <SongSearchInput onSelect={handleUrlSubmit} />
+              <SongSearchInput onSelect={handleUrlSubmitStyled} />
             </div>
 
             <div className={createTab === 'upload' ? '' : 'hidden'}>
-              <FileUploader onFileSelect={handleFileUpload} />
+              <FileUploader onFileSelect={handleFileUploadStyled} />
             </div>
 
             <div className={createTab === 'url' ? 'space-y-4' : 'hidden'}>
-              <UrlInput source="audius" onUrlSubmit={handleUrlSubmit} />
-              <UrlInput source="jamendo" onUrlSubmit={handleUrlSubmit} />
+              <UrlInput source="audius" onUrlSubmit={handleUrlSubmitStyled} />
+              <UrlInput source="jamendo" onUrlSubmit={handleUrlSubmitStyled} />
             </div>
           </div>
         </div>

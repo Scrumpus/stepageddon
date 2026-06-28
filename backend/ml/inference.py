@@ -311,34 +311,48 @@ class FootStateArrowAssigner:
 # Style profile resolution
 # ---------------------------------------------------------------------------
 
-def _profile_knobs(profile: Dict) -> Dict[str, float]:
-    """Derive runtime knobs from a profile centroid's raw_means.
+def _profile_knobs(profile: Dict, difficulty_id: int = 2) -> Dict[str, float]:
+    """Derive runtime knobs from a profile centroid's raw_means, difficulty-gated.
 
     Profiles ship raw stat means; we map those to the post-processing
     parameters that drive jump-vs-tap classification, hold cadence, and the
     arrow-assigner branches. Values are clamped to defensible ranges.
+
+    Difficulty gating scales pattern knobs so easier difficulties use simpler
+    patterns regardless of the profile's raw stats. Multipliers dampen rather
+    than zero-out so every difficulty retains musical variety.
     """
     rm = profile.get('raw_means', {})
     knobs = dict(DEFAULT_STYLE_KNOBS)
 
+    # Difficulty-level multipliers for pattern complexity (0=beginner, 4=challenge).
+    _DIFF_PATTERN_SCALE = {
+        0: 0.0,   # beginner: no jumps, jacks, crossovers, or streams
+        1: 0.25,  # easy: 25% of pattern rates
+        2: 0.60,  # medium: 60%
+        3: 0.85,  # hard: 85%
+        4: 1.0,   # challenge: full
+    }
+    scale = _DIFF_PATTERN_SCALE.get(difficulty_id, 1.0)
+
     # Top-K jump selection: the profile's observed jump_rate tells us what
-    # fraction of peaks should become jumps. We use the raw rate as a target
-    # and keep a small absolute intensity floor to filter out near-zero noise.
+    # fraction of peaks should become jumps, gated by difficulty.
     jump_rate = float(rm.get('jump_rate', 0.05))
-    knobs['target_jump_rate'] = float(np.clip(jump_rate, 0.0, 0.40))
+    knobs['target_jump_rate'] = float(np.clip(jump_rate * scale, 0.0, 0.40))
     knobs['jump_threshold'] = 0.05
 
-    # Jumphold: enable when both holds and jumps are common; rate scales with
-    # min(hold_rate, jump_rate).
+    # Jumphold: enable when both holds and jumps are common; gated by difficulty.
     hold_rate = float(rm.get('hold_rate', 0.04))
-    knobs['jumphold_rate'] = float(np.clip(min(hold_rate, jump_rate) * 1.5, 0.0, 0.4))
+    knobs['jumphold_rate'] = float(np.clip(
+        min(hold_rate, jump_rate) * 1.5 * scale, 0.0, 0.4,
+    ))
 
-    knobs['jack_rate'] = float(np.clip(rm.get('jack_rate', 0.05), 0.0, 0.5))
-    knobs['crossover_rate'] = float(np.clip(rm.get('crossover_rate', 0.10), 0.0, 0.5))
+    knobs['jack_rate'] = float(np.clip(rm.get('jack_rate', 0.05) * scale, 0.0, 0.5))
+    knobs['crossover_rate'] = float(np.clip(rm.get('crossover_rate', 0.10) * scale, 0.0, 0.5))
     # stream_preference rolls stream_density into the assigner's branch
     # probability — high values produce visibly more stream patterns.
     knobs['stream_preference'] = float(np.clip(
-        rm.get('stream_density', 0.20) * 2.0, 0.0, 1.0,
+        rm.get('stream_density', 0.20) * 2.0 * scale, 0.0, 1.0,
     ))
     return knobs
 
@@ -361,7 +375,7 @@ class MLChartGenerator:
         style: str = 'auto',
         style_profiles_path: Optional[str] = None,
         min_first_step_time: float = 0.25,
-        min_last_step_buffer: float = 0.0,
+        min_last_step_buffer: float = 0.5,
         timing_trim: float = 0.0,
     ):
         if device is None:
@@ -499,6 +513,7 @@ class MLChartGenerator:
         style: str,
         onset_density: float,
         intensity_mean: float,
+        difficulty_id: int = 2,
     ) -> Tuple[Dict[str, float], str]:
         """Pick a profile and return (knobs, resolved_name).
 
@@ -506,6 +521,7 @@ class MLChartGenerator:
         - If `style == 'auto'`, pick the profile whose mean_density is closest
           to the predicted onset density (with intensity_mean breaking ties).
         - Otherwise look up the named profile; raise on miss.
+        - difficulty_id gates pattern complexity (see _profile_knobs).
         """
         if not self.style_profiles:
             return dict(DEFAULT_STYLE_KNOBS), 'default'
@@ -522,10 +538,11 @@ class MLChartGenerator:
                     best_score = score
                     best_name = p['name']
             chosen = self._style_profiles_by_name[best_name]
-            knobs = _profile_knobs(chosen)
+            knobs = _profile_knobs(chosen, difficulty_id)
             logger.info(
                 f"Resolved style='auto' → '{best_name}' "
-                f"(onset_density={onset_density:.2f}, intensity_mean={intensity_mean:.3f})"
+                f"(onset_density={onset_density:.2f}, intensity_mean={intensity_mean:.3f}, "
+                f"diff_id={difficulty_id})"
             )
             return knobs, best_name
 
@@ -535,7 +552,7 @@ class MLChartGenerator:
                 f"Unknown style '{style}'. Available: {available} (or 'auto')."
             )
         chosen = self._style_profiles_by_name[style]
-        knobs = _profile_knobs(chosen)
+        knobs = _profile_knobs(chosen, difficulty_id)
         logger.info(f"Resolved style='{style}' → knobs={knobs}")
         return knobs, style
 
@@ -756,14 +773,19 @@ class MLChartGenerator:
         onset_p: np.ndarray,
         sustain_p: np.ndarray,
         intensity: np.ndarray,
+        arrow_p: Optional[np.ndarray] = None,
         style: Optional[str] = None,
     ) -> Chart:
         """Build a Chart from already-computed per-difficulty signals.
 
         Shared by the single-difficulty and batched-multi paths so
         post-processing only lives in one place.
+
+        v8: arrow_p[T,4] from the model's arrow heads biases the
+        FootStateArrowAssigner toward musically-suggested directions.
         """
         diff_config = get_difficulty_config(difficulty)
+        difficulty_id = APP_DIFFICULTY_MAP.get(difficulty, 2)
 
         T = onset_p.shape[0]
         onset_density_pred = float(onset_p.sum() / max(T / FRAMES_PER_SECOND, 1.0))
@@ -772,7 +794,7 @@ class MLChartGenerator:
         )
         resolved_style = style if style is not None else self.style
         knobs, resolved_name = self._resolve_style(
-            resolved_style, onset_density_pred, intensity_mean_pred,
+            resolved_style, onset_density_pred, intensity_mean_pred, difficulty_id,
         )
 
         # Effective offset baked into emitted step times: per-song measured
@@ -788,6 +810,7 @@ class MLChartGenerator:
             audio_seed=analysis.audio_seed,
             style_knobs=knobs,
             timing_offset=timing_offset,
+            arrow_p=arrow_p,
         )
 
         chart = Chart(
@@ -821,11 +844,12 @@ class MLChartGenerator:
             f"density={target_density:.2f} steps/sec)..."
         )
 
-        onset_p, sustain_p, intensity = self._predict_chunked(
+        onset_p, sustain_p, intensity, arrow_p = self._predict_chunked(
             analysis.feats_whitened, difficulty_id, target_density,
         )
         return self._chart_from_signals(
-            analysis, difficulty, onset_p, sustain_p, intensity, style=style,
+            analysis, difficulty, onset_p, sustain_p, intensity,
+            arrow_p=arrow_p, style=style,
         )
 
     def generate_from_audio(
@@ -868,7 +892,7 @@ class MLChartGenerator:
             f"Running batched inference over {len(names)} difficulties: "
             f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
         )
-        onset_batch, sustain_batch, intensity_batch = self._predict_chunked_multi(
+        onset_batch, sustain_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
             analysis.feats_whitened, difficulty_ids, target_densities,
         )
 
@@ -877,6 +901,7 @@ class MLChartGenerator:
             charts[name] = self._chart_from_signals(
                 analysis, name,
                 onset_batch[i], sustain_batch[i], intensity_batch[i],
+                arrow_p=arrow_batch[i],
                 style=style,
             )
         return charts
@@ -887,16 +912,18 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_id: int,
         target_density: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run model on overlapping chunks; return (onset_p, sustain_p, intensity).
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Run model on overlapping chunks; return (onset_p, sustain_p, intensity, arrow_p).
 
-        Each output is shape [T] float32. onset_p and sustain_p are sigmoids;
-        intensity is the raw regression output (clipped to [0, 1]).
+        Each output is shape [T] float32 (arrow_p is [T, 4]).
+        onset_p and sustain_p are sigmoids; intensity is clipped to [0, 1].
+        arrow_p is per-arrow onset probability.
         """
         T = feats.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
         sustain_sum = np.zeros(T, dtype=np.float32)
         intensity_sum = np.zeros(T, dtype=np.float32)
+        arrow_sum = np.zeros((T, 4), dtype=np.float32)
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -920,34 +947,37 @@ class MLChartGenerator:
             density_tensor = torch.tensor(
                 [density_norm], dtype=torch.float32, device=self.device,
             )
-            start_seconds = float(start) / FRAMES_PER_SECOND
-            remaining_seconds = max(0.0, float(T - end) / FRAMES_PER_SECOND)
+            start_sec = float(start) / FRAMES_PER_SECOND
+            remaining_sec = max(0.0, float(T - end) / FRAMES_PER_SECOND)
             start_seconds_tensor = torch.tensor(
-                [start_seconds], dtype=torch.float32, device=self.device,
+                [start_sec], dtype=torch.float32, device=self.device,
             )
             remaining_seconds_tensor = torch.tensor(
-                [remaining_seconds], dtype=torch.float32, device=self.device,
+                [remaining_sec], dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred = self.model(
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]
             sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[0, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[0, :, 0]
+            arrow_v = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0, :, :]  # [T, 4]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[start:start + valid_len] += onset_p[:valid_len]
             sustain_sum[start:start + valid_len] += sustain_p[:valid_len]
             intensity_sum[start:start + valid_len] += intensity_v[:valid_len]
+            arrow_sum[start:start + valid_len] += arrow_v[:valid_len]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        return onset_avg, sustain_avg, intensity_avg
+        arrow_avg = arrow_sum / counts[:, None]
+        return onset_avg, sustain_avg, intensity_avg, arrow_avg
 
     @torch.no_grad()
     def _predict_chunked_multi(
@@ -955,13 +985,13 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_ids: List[int],
         target_densities: List[float],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Batched-multi version of :meth:`_predict_chunked`.
 
         Runs all difficulties as one forward pass per chunk: the shared audio
         features are broadcast across the batch dimension, while difficulty
-        and density vary per row. Returns three arrays of shape ``[B, T]``,
-        one row per requested difficulty.
+        and density vary per row. Returns four arrays: onset [B,T], sustain [B,T],
+        intensity [B,T], arrow [B,T,4] — one row per requested difficulty.
         """
         B = len(difficulty_ids)
         if B == 0:
@@ -976,6 +1006,7 @@ class MLChartGenerator:
         onset_sum = np.zeros((B, T), dtype=np.float32)
         sustain_sum = np.zeros((B, T), dtype=np.float32)
         intensity_sum = np.zeros((B, T), dtype=np.float32)
+        arrow_sum = np.zeros((B, T, 4), dtype=np.float32)
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -1022,25 +1053,28 @@ class MLChartGenerator:
                 (B,), remaining_seconds, dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred = self.model(
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[:, :, 0]
             sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[:, :, 0]
+            arrow_v = torch.sigmoid(arrow_logits.float()).cpu().numpy()[:, :, :]  # [B, T, 4]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
             sustain_sum[:, start:start + valid_len] += sustain_p[:, :valid_len]
             intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
+            arrow_sum[:, start:start + valid_len] += arrow_v[:, :valid_len]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        return onset_avg, sustain_avg, intensity_avg
+        arrow_avg = arrow_sum / counts[:, None]
+        return onset_avg, sustain_avg, intensity_avg, arrow_avg
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1072,6 +1106,44 @@ class MLChartGenerator:
             f += 1
         return end_cap - 1
 
+    def _snap_hold_duration(
+        self,
+        start_time: float,
+        raw_duration: float,
+        tempo: float,
+        beat_times: np.ndarray,
+        diff_config,
+    ) -> float:
+        """Snap the hold end time to the nearest beat subdivision.
+
+        Musical hold lengths are more playable when they align with the beat
+        grid. This snaps the hold end to the nearest 8th, quarter, half-note,
+        or whole-note boundary, preferring the closest match.
+        """
+        beat_interval = 60.0 / max(tempo, 1.0)
+        # Candidate hold lengths in seconds: 8th, quarter, half, whole note.
+        candidates = [
+            beat_interval / 2.0,   # 8th
+            beat_interval,         # quarter
+            beat_interval * 2.0,   # half
+            beat_interval * 4.0,   # whole note
+        ]
+        best = raw_duration
+        best_diff = float('inf')
+        for cand in candidates:
+            # Allow multiples (2x, 3x) for longer holds.
+            for mult in (1, 2, 3):
+                dur = cand * mult
+                if dur > diff_config.max_hold_duration * 1.2:
+                    break
+                if dur < diff_config.min_hold_duration * 0.8:
+                    continue
+                diff = abs(dur - raw_duration)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = dur
+        return float(np.clip(best, diff_config.min_hold_duration, diff_config.max_hold_duration))
+
     def _postprocess(
         self,
         onset_p: np.ndarray,
@@ -1087,6 +1159,7 @@ class MLChartGenerator:
         audio_seed: int,
         style_knobs: Dict[str, float],
         timing_offset: float = 0.0,
+        arrow_p: Optional[np.ndarray] = None,
     ) -> List[Step]:
         """
         Detect WHEN (NMS on onset_p) → classify type (jump/hold/tap) →
@@ -1094,6 +1167,9 @@ class MLChartGenerator:
 
         ``timing_offset`` (seconds) is the per-song calibration baked into every
         emitted step time; negative pulls notes earlier.
+
+        ``arrow_p`` [T, 4] (v8): per-arrow onset probabilities from the model,
+        used to bias arrow assignment toward musically-suggested directions.
         """
         T = onset_p.shape[0]
         logger.info(
@@ -1101,7 +1177,12 @@ class MLChartGenerator:
             f"mean={onset_p.mean():.4f} p95={np.percentile(onset_p, 95):.4f}"
         )
 
+        # BPM-aware min_gap: scale with tempo so 16th notes at 225 BPM (0.067s)
+        # still pass while keeping sparse charts clean at low BPM.
+        bpm = max(tempo, 60.0)
+        bpm_sixteenth = 60.0 / bpm / 4.0  # seconds per 16th note
         min_gap = max(diff_config.min_gap, self.min_note_gap)
+        min_gap = max(min_gap, bpm_sixteenth * 0.75)  # allow 16th runs
         nms_window_frames = max(1, int(round(min_gap * FRAMES_PER_SECOND)))
         jumps_allowed = 'jump' in diff_config.allowed_patterns
         holds_allowed = diff_config.hold_percentage > 0
@@ -1181,6 +1262,12 @@ class MLChartGenerator:
                         (end_frame - frame) / FRAMES_PER_SECOND,
                     ),
                 )
+                # Beat-align hold end time to the nearest musical subdivision
+                # so holds land on clean beat boundaries (8th, quarter, etc).
+                if self.snap_to_beats and len(beat_times) > 1 and hold_seconds > 0.05:
+                    hold_seconds = self._snap_hold_duration(
+                        t, hold_seconds, tempo, beat_times, diff_config,
+                    )
                 # Jumphold heuristic: rare; only when both intensity is high
                 # and the audio energy spikes hard at hold onset.
                 rms_at_frame = float(energy_curve[frame]) if energy_curve is not None else 0.0

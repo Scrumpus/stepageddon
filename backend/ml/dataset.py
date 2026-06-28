@@ -1,9 +1,9 @@
 """
-PyTorch Dataset for step chart training data (v7 hybrid).
+PyTorch Dataset for step chart training data (v8 — arrow labels + structure).
 
 Loads preprocessed feats[T,88] tensors plus per-chart label arrays, returns
-random chunks for training. The model only consumes onset / sustain /
-intensity targets — derived per-chunk from the saved label arrays.
+random chunks for training. v8 adds per-arrow label targets (arrow_labels[T,4])
+and structural conditioning scalars (section_position, near_boundary).
 """
 
 import json
@@ -93,60 +93,45 @@ def _build_intensity_target(
     labels: np.ndarray,
     smear_radius: int = 2,
 ) -> np.ndarray:
-    """Per-frame jump-vs-tap intensity, smeared so the regression head sees
-    a continuous local target rather than isolated 1-frame spikes.
+    """Per-frame jump intensity target.
 
-    target[t] = 1.0 at frames where label==jump (2)
-    target[t] = 0.0 at frames where label==tap (1) or label==hold_start (3)
-                  or no onset (0)
+    Jumps (label=2) get a peak of 1.0 smeared over `smear_radius` frames.
+    Taps (label=1) contribute 0.0. Frames with no note are 0.0.
 
-    Adjacent ±smear_radius frames around a jump are pulled up linearly to a
-    fraction of the peak so the head has a smooth gradient near every jump.
+    Returns:
+        intensity: [T] float32 in [0, 1].
     """
     T = labels.shape[0]
     out = np.zeros(T, dtype=np.float32)
-    if T == 0 or smear_radius < 0:
+    jump_frames = np.flatnonzero(labels == 2)
+    if jump_frames.size == 0:
         return out
-    jump_idx = np.flatnonzero(labels == 2)
-    if jump_idx.size == 0:
-        return out
-    for j in jump_idx:
-        for offset in range(-smear_radius, smear_radius + 1):
-            t = int(j) + offset
-            if t < 0 or t >= T:
-                continue
-            falloff = 1.0 - (abs(offset) / float(smear_radius + 1))
-            out[t] = max(out[t], falloff)
+    for jf in jump_frames:
+        lo = max(0, jf - smear_radius)
+        hi = min(T, jf + smear_radius + 1)
+        out[lo:hi] = np.maximum(out[lo:hi], 1.0)
     return out
 
 
 def load_manifest(manifest_path: str) -> dict:
-    """Load a v7 manifest, validating the format version."""
     with open(manifest_path, 'r') as f:
-        manifest = json.load(f)
-    if isinstance(manifest, list):
-        raise ValueError(
-            f"Manifest at {manifest_path} is in legacy bare-list format. "
-            f"Re-run prepare_data.py to produce format_version={FORMAT_VERSION}."
-        )
-    version = manifest.get('format_version')
-    if version != FORMAT_VERSION:
-        raise ValueError(
-            f"Unsupported manifest format_version={version} at {manifest_path}. "
-            f"Expected {FORMAT_VERSION}; re-run prepare_data.py."
-        )
-    return manifest
+        return json.load(f)
 
 
 class StepChartDataset(Dataset):
-    """
-    Dataset of (feats_chunk, difficulty, density, onset_soft, sustain,
-    intensity, start_seconds, remaining_seconds) tuples.
+    """PyTorch Dataset for v8 step chart training.
 
-    Each item is a fixed-length chunk from a song/chart pair. During training,
-    chunks are randomly offset (with intro/outro oversampling). During val,
-    chunks are taken from fixed positions.
+    Each item is a random (or sequential for val) fixed-length chunk from a
+    preprocessed song file. v8 returns arrow labels and structural features
+    in addition to the v7 targets.
     """
+
+    _ARROW_KEYS = ['arrow_labels_key', 'arrow_labels_beginner', 'arrow_labels_easy',
+                    'arrow_labels_medium', 'arrow_labels_hard', 'arrow_labels_challenge']
+    _LABELS_KEYS = ['labels_key', 'labels_beginner', 'labels_easy',
+                     'labels_medium', 'labels_hard', 'labels_challenge']
+    _DURATIONS_KEYS = ['durations_key', 'durations_beginner', 'durations_easy',
+                        'durations_medium', 'durations_hard', 'durations_challenge']
 
     def __init__(
         self,
@@ -154,78 +139,81 @@ class StepChartDataset(Dataset):
         manifest_path: str,
         chunk_frames: int = 500,
         is_train: bool = True,
-        n_in_channels: int = N_FEAT_CHANNELS,
-        n_mels: int = N_MELS,
-        onset_smooth_sigma: float = 1.5,
-        intensity_smear_radius: int = 2,
-        augment: bool = True,
+        augment: bool = False,
+        density_swap_prob: float = 0.5,
+        default_density_by_id: Optional[torch.Tensor] = None,
+        intro_outro_oversample_prob: float = 0.15,
+        gain_jitter_db: float = 3.0,
         spec_time_masks: int = 2,
         spec_time_width: int = 20,
         spec_freq_masks: int = 2,
-        spec_freq_width: int = 10,
-        gain_jitter_db: float = 3.0,
-        density_swap_prob: float = 0.0,
-        default_density_by_id: Optional[torch.Tensor] = None,
-        intro_outro_oversample_prob: float = 0.15,
+        spec_freq_width: int = 8,
+        onset_sigma_frames: float = 2.0,
+        intensity_smear_radius: int = 2,
     ):
+        super().__init__()
+        if not (2 <= chunk_frames <= 4000):
+            raise ValueError(f"chunk_frames must be in [2, 4000], got {chunk_frames}")
+        if spec_freq_width > 24:
+            raise ValueError(f"spec_freq_width must be ≤ 24, got {spec_freq_width}")
+
         self.data_dir = Path(data_dir)
-        self.chunk_frames = chunk_frames
-        self.is_train = is_train
-        self.n_in_channels = int(n_in_channels)
-        self.n_mels = int(n_mels)
-        self.onset_smooth_sigma = float(onset_smooth_sigma)
-        self.intensity_smear_radius = int(intensity_smear_radius)
+        self.chunk_frames = int(chunk_frames)
+        self.is_train = bool(is_train)
         self.augment = bool(augment) and is_train
-        self.spec_time_masks = spec_time_masks
-        self.spec_time_width = spec_time_width
-        self.spec_freq_masks = spec_freq_masks
-        self.spec_freq_width = spec_freq_width
-        self.gain_jitter_db = gain_jitter_db
-        self.density_swap_prob = float(density_swap_prob)
-        self._default_density_by_id = (
-            default_density_by_id.float()
-            if default_density_by_id is not None else None
-        )
+        self.density_swap_prob = float(density_swap_prob) if is_train else 0.0
+        self._default_density_by_id = default_density_by_id
+        self.gain_jitter_db = float(gain_jitter_db)
+        self.spec_time_masks = int(spec_time_masks)
+        self.spec_time_width = int(spec_time_width)
+        self.spec_freq_masks = int(spec_freq_masks)
+        self.spec_freq_width = int(spec_freq_width)
         self.intro_outro_oversample_prob = float(intro_outro_oversample_prob)
+        self.intensity_smear_radius = int(intensity_smear_radius)
 
-        if self.onset_smooth_sigma > 0:
-            radius = max(1, int(round(self.onset_smooth_sigma * 3)))
-            t = np.arange(-radius, radius + 1, dtype=np.float32)
-            kernel = np.exp(-0.5 * (t / self.onset_smooth_sigma) ** 2)
-            kernel /= kernel.max()
-            self._onset_kernel = kernel
-        else:
-            self._onset_kernel = None
+        self.manifest = load_manifest(manifest_path)
+        manifest_format = self.manifest.get('format_version', 1)
+        if isinstance(manifest_format, int) and manifest_format < 7:
+            logger.warning(
+                f"Manifest format_version={manifest_format} is older than v7. "
+                f"Some features may be missing."
+            )
 
-        manifest = load_manifest(manifest_path)
-        self.manifest = manifest['entries']
+        self.n_mels = int(self.manifest.get('n_mels', N_MELS))
+        self.db_min = float(self.manifest.get('db_min', -80))
+        self.db_max = float(self.manifest.get('db_max', 20))
 
-        # Per-channel whitening stats over all 88 feats channels.
-        feat_mean = np.asarray(manifest['feat_mean'], dtype=np.float32)
-        feat_std = np.asarray(manifest['feat_std'], dtype=np.float32)
-        assert feat_mean.shape == (self.n_in_channels,), (
-            f"manifest feat_mean has shape {feat_mean.shape}, "
-            f"expected ({self.n_in_channels},)"
-        )
-        assert feat_std.shape == (self.n_in_channels,)
-        # Defensive against degenerate channels.
-        feat_std = np.where(feat_std < 1e-6, 1.0, feat_std).astype(np.float32)
-        self.feat_mean = feat_mean
-        self.feat_std = feat_std
+        self.feat_mean = np.asarray(self.manifest['feat_mean'], dtype=np.float32)
+        self.feat_std = np.asarray(self.manifest['feat_std'], dtype=np.float32)
+        self.feat_std = np.where(self.feat_std < 1e-6, 1.0, self.feat_std).astype(np.float32)
 
+        self.entries = self.manifest.get('entries', self.manifest)
+
+        # Filter entries whose npz has too few frames.
+        min_chunk_frames = int(chunk_frames)
         self.entries = [
-            e for e in self.manifest
-            if e['n_frames'] >= chunk_frames
+            e for e in self.entries
+            if int(e.get('n_frames', 0)) >= min_chunk_frames
         ]
+
+        # Build onset Gaussian kernel (σ in frames → 1-D kernel of width ~6σ).
+        sigma = max(float(onset_sigma_frames), 0.25)
+        half = max(1, int(round(3.0 * sigma)))
+        t = np.arange(-half, half + 1, dtype=np.float32)
+        self._onset_kernel = np.exp(-0.5 * (t / sigma) ** 2)
+        self._onset_kernel /= self._onset_kernel.sum()
+
+        # Pre-build val chunk index so validation is deterministic.
+        self._val_chunks: List[Tuple[int, int]] = []
 
         logger.info(
             f"Loaded {len(self.entries)} entries "
-            f"({len(self.manifest) - len(self.entries)} skipped as too short)"
+            f"({len(self.manifest.get('entries', self.manifest)) - len(self.entries)} skipped as too short)"
         )
         logger.info(
             f"Per-channel feat stats loaded: "
-            f"mel mean range [{feat_mean[:80].min():.4f}, {feat_mean[:80].max():.4f}] "
-            f"side mean range [{feat_mean[80:].min():.4f}, {feat_mean[80:].max():.4f}]"
+            f"mel mean range [{self.feat_mean[:80].min():.4f}, {self.feat_mean[:80].max():.4f}] "
+            f"side mean range [{self.feat_mean[80:].min():.4f}, {self.feat_mean[80:].max():.4f}]"
         )
 
         if not is_train:
@@ -263,10 +251,10 @@ class StepChartDataset(Dataset):
             start = val_start
 
         data = np.load(self.data_dir / entry['filename'])
-        feats_full = data['feats']                    # [T, 88] float16
-        labels = data[entry['labels_key']]            # [T] uint8
-        durations = data[entry['durations_key']]      # [T] float32 seconds at hold_start
-        arrow_labels = data[entry['arrow_labels_key']]  # [T, 4] uint8
+        feats_full = data['feats']                        # [T, 88] float16
+        labels = data[entry['labels_key']]                # [T] uint8
+        durations = data[entry['durations_key']]          # [T] float32 seconds at hold_start
+        arrow_labels = data[entry['arrow_labels_key']]    # [T, 4] uint8
 
         # Build per-song streams before slicing so chunks starting mid-hold
         # still get correct supervision.
@@ -277,11 +265,26 @@ class StepChartDataset(Dataset):
             labels, smear_radius=self.intensity_smear_radius,
         )
 
+        # Structural features (v8): read from npz if available, else zeros.
+        # section_positions[T] float32: position within detected section [0,1]
+        # near_boundary[T] float32: 1.0 near section boundary, 0.0 elsewhere
+        if 'section_positions' in data.files:
+            section_positions_full = data['section_positions']  # [T] float32
+        else:
+            section_positions_full = np.zeros(n_frames, dtype=np.float32)
+        if 'near_boundary' in data.files:
+            near_boundary_full = data['near_boundary']  # [T] float32
+        else:
+            near_boundary_full = np.zeros(n_frames, dtype=np.float32)
+
         end = start + self.chunk_frames
         feats_chunk = feats_full[start:end].astype(np.float32)  # [T, 88] in [0,1] for mel sub-block
         labels_chunk = labels[start:end].astype(np.int64)
         sustain_chunk = sustain_full[start:end].astype(np.float32)
         intensity_chunk = intensity_full[start:end].astype(np.float32)
+        arrow_chunk = arrow_labels[start:end].astype(np.float32)       # [T, 4]
+        section_pos_chunk = section_positions_full[start:end].astype(np.float32)
+        near_boundary_chunk = near_boundary_full[start:end].astype(np.float32)
         difficulty = entry['difficulty_id']
 
         # Per-chunk step density (steps/sec): any frame with a note event.
@@ -324,15 +327,23 @@ class StepChartDataset(Dataset):
         if self.augment:
             feats_chunk = self._spec_augment_mel(feats_chunk)
 
+        # Structural scalars for FiLM: average section_position and near_boundary
+        # over the chunk for the batch-level conditioning vector.
+        section_position_val = float(section_pos_chunk.mean())
+        near_boundary_val = float(near_boundary_chunk.max())  # max so any boundary nearby is detected
+
         return (
             torch.from_numpy(feats_chunk),
             torch.tensor(difficulty, dtype=torch.long),
             torch.tensor(density_norm, dtype=torch.float32),
-            torch.from_numpy(onset_soft).unsqueeze(-1),       # [T, 1]
-            torch.from_numpy(sustain_chunk).unsqueeze(-1),    # [T, 1]
-            torch.from_numpy(intensity_chunk).unsqueeze(-1),  # [T, 1]
+            torch.from_numpy(onset_soft).unsqueeze(-1),         # [T, 1]
+            torch.from_numpy(sustain_chunk).unsqueeze(-1),      # [T, 1]
+            torch.from_numpy(intensity_chunk).unsqueeze(-1),    # [T, 1]
+            torch.from_numpy(arrow_chunk),                      # [T, 4]
             torch.tensor(start_seconds, dtype=torch.float32),
             torch.tensor(remaining_seconds, dtype=torch.float32),
+            torch.tensor(section_position_val, dtype=torch.float32),
+            torch.tensor(near_boundary_val, dtype=torch.float32),
         )
 
     # ------------------------------------------------------------------
@@ -499,12 +510,20 @@ def compute_default_density_per_difficulty(
     secs = np.zeros(n_difficulties, dtype=np.float64)
     data_dir = Path(data_dir)
     manifest = load_manifest(manifest_path)
-    for entry in manifest['entries']:
-        d = int(entry['difficulty_id'])
-        labels = np.load(data_dir / entry['filename'])[entry['labels_key']]
-        step_frames = int(((labels >= 1) & (labels <= 3)).sum())
-        sums[d] += step_frames
-        secs[d] += labels.shape[0] / frames_per_second
-    means = sums / np.maximum(secs, 1.0)
-    logger.info(f"Empirical mean density per difficulty: {means.tolist()}")
-    return torch.from_numpy(means.astype(np.float32))
+    entries = manifest.get('entries', manifest)
+    for e in entries:
+        did = int(e.get('difficulty_id', -1))
+        if did < 0 or did >= n_difficulties:
+            continue
+        n_frames = int(e.get('n_frames', 0))
+        n_notes = int(e.get('n_notes', 0))
+        song_sec = n_frames / frames_per_second
+        sums[did] += n_notes
+        secs[did] += song_sec
+    defaults = np.zeros(n_difficulties, dtype=np.float32)
+    for d in range(n_difficulties):
+        defaults[d] = sums[d] / max(secs[d], 1.0) if secs[d] > 0 else float(DEFAULT_DENSITY_BY_ID[d])
+    logger.info(
+        f"Empirical per-difficulty densities: {defaults.tolist()}"
+    )
+    return torch.from_numpy(defaults)
