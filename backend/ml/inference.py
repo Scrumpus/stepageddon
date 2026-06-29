@@ -178,7 +178,8 @@ class FootStateArrowAssigner:
 
     def assign_single(self, time: float, energy: float = 0.5,
                        brightness: float = 0.5) -> Direction:
-        # Active stream — follow the pattern.
+        # Active stream — follow the pattern. Must not emit a stream arrow
+        # onto a panel that is still held from a prior hold_start.
         if self._stream_pattern is not None:
             arrow_idx = self._stream_pattern[self._stream_idx]
             self._stream_idx += 1
@@ -186,18 +187,29 @@ class FootStateArrowAssigner:
                 self._stream_pattern = None
                 self._stream_idx = 0
             arrow = self.ALL_PANELS[arrow_idx]
+            if arrow in self._held_arrows(time):
+                free = [p for p in self.ALL_PANELS if p not in self.active_holds]
+                if free:
+                    arrow = free[0]
+                else:
+                    # All four held — abort the stream.
+                    self._stream_pattern = None
+                    self._stream_idx = 0
             foot = self._pick_foot(time)
             self._update_foot(foot, arrow)
             self._step_count += 1
             return arrow
 
         # Jack branch: with profile-controlled probability, repeat the last
-        # arrow rather than alternating feet.
+        # arrow rather than alternating feet. Must not jack onto an arrow
+        # that is still held from a prior hold_start.
+        held_now = self._held_arrows(time)
         if (
             self._last_arrow is not None
             and self.jack_rate > 0.0
             and self.rng.random() < self.jack_rate
             and not self._held_feet(time)
+            and self._last_arrow not in held_now
         ):
             self._step_count += 1
             arrow = self._last_arrow
@@ -236,6 +248,18 @@ class FootStateArrowAssigner:
             total = weights[0] + weights[1]
             arrow = panels[0] if self.rng.random() < weights[0] / total else panels[1]
 
+        # Guard: if the chosen arrow is still held from a prior hold_start,
+        # swap to any free panel (same foot first, then the other foot).
+        if arrow in self._held_arrows(time):
+            same_foot = [p for p in panels if p not in self.active_holds]
+            if same_foot:
+                arrow = same_foot[0]
+            else:
+                free = [p for p in self.ALL_PANELS if p not in self.active_holds]
+                if free:
+                    arrow = free[0]
+                    foot = 'left' if arrow in self.LEFT_FOOT_PANELS else 'right'
+
         self._update_foot(foot, arrow)
         return arrow
 
@@ -252,7 +276,18 @@ class FootStateArrowAssigner:
         else:
             candidates = list(self.JUMP_PATTERNS)
 
-        pattern = self.rng.choice(candidates)
+        held_now = self._held_arrows(time)
+        # Shuffle so repeated collisions don't always fall back the same way.
+        self.rng.shuffle(candidates)
+        pattern = None
+        for c in candidates:
+            if c[0] not in held_now and c[1] not in held_now:
+                pattern = c
+                break
+        # If every jump pattern collides with active holds, emit a tap.
+        if pattern is None:
+            return [self.assign_single(time, energy, brightness)]
+
         self._step_count += 1
         self.left_pos = pattern[0]
         self.right_pos = pattern[1]
@@ -1408,6 +1443,11 @@ class MLChartGenerator:
                     arrows = assigner.assign_jump(t, energy, brightness)
                 else:
                     arrows = [assigner.assign_single(t, energy, brightness)]
+                # Safety net: drop the step if any assigned arrow is still
+                # held (e.g. all four panels occupied by jumpholds).
+                held_now = assigner._held_arrows(t)
+                if any(a in held_now for a in arrows):
+                    continue
                 steps.append(Step(
                     time=emit_t,
                     arrows=arrows,
