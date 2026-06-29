@@ -1,4 +1,5 @@
 import { useCallback, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useGameStore } from '@/app/store/useGameStore';
 import { useToastApi } from '@/app/providers/ToastProvider';
 import { GameState } from '@/types/common.types';
@@ -16,12 +17,14 @@ export function usePlayChart() {
   const setGameState = useGameStore((s) => s.setGameState);
   const { showToast } = useToastApi();
 
+  const navigate = useNavigate();
   const [isLoading, setIsLoading] = useState(false);
 
   const playChart = useCallback(
     async (song: SongSummaryDTO, chart: ChartSummaryDTO) => {
       try {
         setIsLoading(true);
+        navigate('/game');
         chartLoadStarted({ message: `Loading ${song.title}…`, progress: 40 });
 
         const fullChart = await getChart(song.id, chart.difficulty_name);

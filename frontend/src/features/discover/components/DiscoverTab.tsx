@@ -8,11 +8,8 @@
 
 import { Flame, Gem, Loader2, Music, Sparkles } from 'lucide-react';
 import { useDiscover } from '../hooks';
+import { useStepGeneration } from '@/features/menu/hooks';
 import type { SongSearchResult } from '@/types/common.types';
-
-interface DiscoverTabProps {
-  onSelect: (url: string) => void;
-}
 
 function formatDuration(seconds: number | null): string {
   if (seconds == null || !Number.isFinite(seconds)) return '';
@@ -21,7 +18,8 @@ function formatDuration(seconds: number | null): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-function DiscoverTab({ onSelect }: DiscoverTabProps) {
+function DiscoverTab() {
+  const { handleUrlSubmit } = useStepGeneration();
   const {
     feed,
     setFeed,
@@ -38,7 +36,7 @@ function DiscoverTab({ onSelect }: DiscoverTabProps) {
   const handleSurprise = () => {
     if (results.length === 0) return;
     const pick = results[Math.floor(Math.random() * results.length)];
-    onSelect(pick.url);
+    handleUrlSubmit(pick.url);
   };
 
   return (
@@ -110,7 +108,7 @@ function DiscoverTab({ onSelect }: DiscoverTabProps) {
       ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 max-h-[65vh] overflow-y-auto pr-1">
           {results.map((r) => (
-            <TrackCard key={`${r.source}:${r.id}`} track={r} onSelect={onSelect} />
+            <TrackCard key={`${r.source}:${r.id}`} track={r} onSelect={handleUrlSubmit} />
           ))}
         </div>
       )}
