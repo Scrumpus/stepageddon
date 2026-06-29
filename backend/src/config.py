@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ML Model Settings
-    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
+    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model_2.pt")
 
     # Path to style_profiles.json, next to the training data the checkpoint was
     # built from. When empty the app probes conventional locations (next to the
