@@ -54,7 +54,7 @@ function SettingsModal() {
           onClick={(e) => { if (e.target === e.currentTarget) setOpen(false); }}
         >
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
-          <div className="relative bg-white/5 backdrop-blur-lg rounded-2xl p-6 shadow-2xl border border-white/10 w-full max-w-md">
+          <div className="relative bg-white/5 backdrop-blur-lg rounded-2xl p-6 shadow-2xl border border-white/10 w-full max-w-lg">
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-lg font-semibold">Settings</h2>
               <button
