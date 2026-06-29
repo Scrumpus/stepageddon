@@ -5,26 +5,20 @@
 
 import { Compass, Disc3, ListMusic, Sparkles } from 'lucide-react';
 import { NavLink, Outlet } from 'react-router-dom';
-import { useGameStore } from '@/app/store/useGameStore';
-import ModeSelector from './ModeSelector';
+import SettingsModal from './SettingsModal';
 
 function MenuScreen() {
-  const gameMode = useGameStore((s) => s.gameMode);
-  const setGameMode = useGameStore((s) => s.setGameMode);
-
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
+      {/* Settings gear — fixed top-right */}
+      <SettingsModal />
+
       <div className="max-w-6xl w-full">
         {/* Title */}
         <div className="text-center mb-4">
           <h1 className="text-6xl font-bold mb-4 text-game-primary">
             
           </h1>
-        </div>
-
-        {/* Mode toggle (applies to all tabs) */}
-        <div className="flex justify-center mb-6">
-          <ModeSelector mode={gameMode} onModeChange={setGameMode} />
         </div>
 
         {/* Tabs — NavLink replaces useState + onClick */}

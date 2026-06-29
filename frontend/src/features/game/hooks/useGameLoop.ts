@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { GameState } from '@/types/common.types';
+import { useGameStore } from '@/app/store/useGameStore';
 import { Step, ActiveArrow, ActiveHold } from '../types/step.types';
 import { VISUAL_CONFIG, getArrowSpeed } from '../types/game.types';
 
@@ -46,7 +47,8 @@ export function useGameLoop({
   const activeHoldsRef = useRef(activeHolds);
   activeHoldsRef.current = activeHolds;
 
-  const arrowSpeed = getArrowSpeed(tempo);
+  const speedMult = useGameStore((s) => s.arrowSpeedMultiplier);
+  const arrowSpeed = getArrowSpeed(tempo) * speedMult;
 
   useEffect(() => {
     if (gameState !== GameState.PLAYING) {
