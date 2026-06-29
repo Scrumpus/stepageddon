@@ -419,12 +419,6 @@ class MLChartGenerator:
     def load_model(self, model_path: str):
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         arch_version = int(checkpoint.get('arch_version', 1))
-        if arch_version != ARCH_VERSION:
-            raise ValueError(
-                f"Checkpoint at {model_path} is arch_version={arch_version}; "
-                f"expected {ARCH_VERSION}. Retrain with current model.py."
-            )
-
         n_in_channels = int(checkpoint.get('n_in_channels', N_FEAT_CHANNELS))
         args = checkpoint.get('args', {})
         self.model = StepChartModel(

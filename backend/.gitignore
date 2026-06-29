@@ -1,6 +1,7 @@
 cookies.txt
 
 plans/
+data/
 
 ml/data
 ml/training_data*

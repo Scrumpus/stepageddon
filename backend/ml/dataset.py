@@ -170,6 +170,7 @@ class StepChartDataset(Dataset):
         self.spec_freq_width = int(spec_freq_width)
         self.intro_outro_oversample_prob = float(intro_outro_oversample_prob)
         self.intensity_smear_radius = int(intensity_smear_radius)
+        self.n_in_channels = N_FEAT_CHANNELS
 
         self.manifest = load_manifest(manifest_path)
         manifest_format = self.manifest.get('format_version', 1)
