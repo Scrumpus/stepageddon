@@ -245,12 +245,16 @@ def build_loss(
     logger.info(
         f"Onset pos_weight={opw:.2f}, sustain pos_weight={spw:.2f}"
     )
+    arrow_weight = float(getattr(args, 'arrow_weight', 0.3))
+    arrow_pos_weight = float(getattr(args, 'arrow_pos_weight', 3.0))
     return StepChartLoss(
         onset_pos_weight=opw,
         sustain_pos_weight=spw,
         focal_gamma=float(args.focal_gamma),
         sustain_weight=float(args.sustain_weight),
         intensity_weight=float(args.intensity_weight),
+        arrow_weight=arrow_weight,
+        arrow_pos_weight=arrow_pos_weight,
     )
 
 
