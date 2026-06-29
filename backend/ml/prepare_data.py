@@ -359,13 +359,13 @@ def notes_to_frame_labels(notes, n_frames: int):
                         hold_durations_at_frame.get(h_frame, 0.0), dur
                     )
 
-    arrow_map = {'left': 0, 'down': 1, 'up': 2, 'right': 3}
     for note in notes:
         frame = int(round(note.time * FRAMES_PER_SECOND))
         if frame < 0 or frame >= n_frames:
             continue
-        arrow_idx = arrow_map.get(note.arrow)
-        if arrow_idx is None:
+        # note.arrow is integer 0-3 (L/D/U/R from n.column), not a string.
+        arrow_idx = note.arrow
+        if arrow_idx < 0 or arrow_idx > 3:
             continue
         if note.note_type in ('tap', 'hold_head'):
             arrow_labels[frame, arrow_idx] = 1

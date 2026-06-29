@@ -1356,7 +1356,11 @@ class MLChartGenerator:
                 # Drop claims older than one beat from the current event so
                 # collision-avoidance stays a local effect.
                 step_16_local = float(local_interval[beat_idxs[0]]) / 4.0
-                cap = 0.5 * step_16_local
+                # cap = 1.0 * step_16_local: accept notes up to one 16th-note
+                # away from any beat cell (≈117ms at 128 BPM).  Raised from
+                # 0.5× so on-beat notes don't fall through to the fallback
+                # _subdivision_from_grid when PLP drifts ~50-80 ms.
+                cap = 1.0 * step_16_local
                 cutoff = t - float(local_interval[beat_idxs[0]])
                 recent_claims = [c for c in recent_claims if c >= cutoff]
 
@@ -1543,8 +1547,16 @@ class MLChartGenerator:
         ):
             return BeatSubdivision.TWELFTH
 
-        if beat_position < 0.125 or beat_position > 0.875:
+        # The Quarter band is intentionally wide (~44% of the beat) because
+        # librosa beat tracking (PLP or beat_track fallback) can drift
+        # 50-100 ms from the true musical beat. A narrow band would
+        # misclassify on-beat notes as 8th/16th/12th → wrong arrow color.
+        # At 128 BPM (468 ms/beat) this catches notes within ~103 ms of the
+        # beat; at 60 BPM (1000 ms) within ~220 ms — well within the timing
+        # window where a note reads as "on the beat" to the player.
+        if beat_position < 0.22 or beat_position > 0.78:
             return BeatSubdivision.QUARTER
-        if abs(beat_position - 0.5) < 0.125:
+        # Eighth band (±0.15 around the half-beat = 30% of beat).
+        if abs(beat_position - 0.5) < 0.15:
             return BeatSubdivision.EIGHTH
         return BeatSubdivision.SIXTEENTH
