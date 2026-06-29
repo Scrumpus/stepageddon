@@ -6,6 +6,7 @@
  */
 
 import { useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { GameState } from '@/types/common.types';
 import { generateStepsFromFile, generateStepsFromUrl, getAudioUrl } from '../api';
 import { useGameStore } from '@/app/store/useGameStore';
@@ -21,6 +22,7 @@ export function useStepGeneration() {
   const setLoadingProgress = useGameStore((s) => s.setLoadingProgress);
   const { showToast } = useToastApi();
 
+  const navigate = useNavigate();
   const [isLoading, setIsLoading] = useState(false);
 
   const finishGeneration = useCallback(
@@ -42,6 +44,7 @@ export function useStepGeneration() {
     async (file: File) => {
       try {
         setIsLoading(true);
+        navigate('/game');
         generationStarted({ message: 'Uploading audio...', progress: 25 });
 
         const result = await generateStepsFromFile(file);
@@ -62,6 +65,7 @@ export function useStepGeneration() {
     async (url: string) => {
       try {
         setIsLoading(true);
+        navigate('/game');
         generationStarted({ message: 'Downloading audio...', progress: 20 });
 
         // Simulated progress mid-fetch

@@ -1,24 +1,29 @@
-import { useState } from 'react';
+/**
+ * PlaylistsTab — list or detail view, driven by URL params.
+ * /playlists      → PlaylistList
+ * /playlists/:id  → PlaylistDetail
+ */
+
+import { useNavigate, useParams } from 'react-router-dom';
 import PlaylistList from './PlaylistList';
 import PlaylistDetail from './PlaylistDetail';
 
-type View = { type: 'list' } | { type: 'detail'; playlistId: string };
-
 function PlaylistsTab() {
-  const [view, setView] = useState<View>({ type: 'list' });
+  const { playlistId } = useParams();
+  const navigate = useNavigate();
 
-  if (view.type === 'detail') {
+  if (playlistId) {
     return (
       <PlaylistDetail
-        playlistId={view.playlistId}
-        onBack={() => setView({ type: 'list' })}
+        playlistId={playlistId}
+        onBack={() => navigate('/playlists')}
       />
     );
   }
 
   return (
     <PlaylistList
-      onSelect={(playlistId) => setView({ type: 'detail', playlistId })}
+      onSelect={(id) => navigate(`/playlists/${id}`)}
     />
   );
 }
