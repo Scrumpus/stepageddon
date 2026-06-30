@@ -5,14 +5,10 @@
 
 import { Compass, Disc3, ListMusic, Sparkles } from 'lucide-react';
 import { NavLink, Outlet } from 'react-router-dom';
-import SettingsModal from './SettingsModal';
 
 function MenuScreen() {
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
-      {/* Settings gear — fixed top-right */}
-      <SettingsModal />
-
       <div className="max-w-6xl w-full">
         {/* Title */}
         <div className="text-center mb-4">

@@ -38,17 +38,26 @@ function GameHUD({
     <>
       {/* Header */}
       <div className="bg-black/50 backdrop-blur-sm p-4 flex items-center justify-between">
-        <div className="flex items-center gap-6">
-          <div>
-            <div className="text-sm text-gray-400">{dualMode ? 'P1 Score' : 'Score'}</div>
-            <div className="text-2xl font-bold">{score.toLocaleString()}</div>
+        <div className="flex items-center gap-4">
+          <div className="flex gap-2">
+            <button
+              onClick={onPause}
+              className="p-3 bg-white/10 hover:bg-white/20 rounded-lg transition-all"
+            >
+              {gameState === GameState.PAUSED ? (
+                <Play className="w-5 h-5" />
+              ) : (
+                <Pause className="w-5 h-5" />
+              )}
+            </button>
+
+            <button
+              onClick={onReturnToMenu}
+              className="p-3 bg-white/10 hover:bg-white/20 rounded-lg transition-all"
+            >
+              <Home className="w-5 h-5" />
+            </button>
           </div>
-          {dualMode && (
-            <div>
-              <div className="text-sm text-gray-400">P2 Score</div>
-              <div className="text-2xl font-bold">{score2!.toLocaleString()}</div>
-            </div>
-          )}
         </div>
 
         <div className="text-center">
@@ -58,25 +67,8 @@ function GameHUD({
           </div>
         </div>
 
-        <div className="flex gap-2">
-          <button
-            onClick={onPause}
-            className="p-3 bg-white/10 hover:bg-white/20 rounded-lg transition-all"
-          >
-            {gameState === GameState.PAUSED ? (
-              <Play className="w-5 h-5" />
-            ) : (
-              <Pause className="w-5 h-5" />
-            )}
-          </button>
-
-          <button
-            onClick={onReturnToMenu}
-            className="p-3 bg-white/10 hover:bg-white/20 rounded-lg transition-all"
-          >
-            <Home className="w-5 h-5" />
-          </button>
-        </div>
+        {/* Right side intentionally left empty — Create/Settings occupy the top-right corner */}
+        <div />
       </div>
 
       {/* Progress Bar */}
@@ -85,6 +77,21 @@ function GameHUD({
           className="h-full bg-game-primary"
           style={{ width: `${progressPercent}%` }}
         />
+      </div>
+
+      {/* Footer — scores at the bottom */}
+      <div className="fixed bottom-4 left-4 right-4 z-40 flex justify-between pointer-events-none">
+        <div className="bg-black/50 backdrop-blur-sm rounded-xl px-6 py-3 border border-white/10">
+          <div className="text-sm text-gray-400">{dualMode ? 'P1 Score' : 'Score'}</div>
+          <div className="text-3xl font-bold">{score.toLocaleString()}</div>
+        </div>
+
+        {dualMode && (
+          <div className="bg-black/50 backdrop-blur-sm rounded-xl px-6 py-3 border border-white/10 text-right">
+            <div className="text-sm text-gray-400">P2 Score</div>
+            <div className="text-3xl font-bold">{score2!.toLocaleString()}</div>
+          </div>
+        )}
       </div>
     </>
   );

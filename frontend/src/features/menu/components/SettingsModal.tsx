@@ -38,10 +38,10 @@ function SettingsModal() {
 
   return (
     <>
-      {/* Gear button — fixed top-right */}
+      {/* Gear button — positioned by parent container */}
       <button
         onClick={() => setOpen(true)}
-        className="fixed top-4 right-4 z-50 p-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-white/70 hover:text-white transition-colors"
+        className="p-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-white/70 hover:text-white transition-colors"
         aria-label="Settings"
       >
         <Settings className="w-5 h-5" />

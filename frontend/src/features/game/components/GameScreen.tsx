@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { GameState, GameMode } from '@/types/common.types';
+import { GameState } from '@/types/common.types';
 import { useGameStore } from '@/app/store/useGameStore';
 import { useAudio } from '@/app/providers/AudioProvider';
 import {
@@ -35,7 +35,6 @@ function GameScreen() {
   const steps = useGameStore((s) => s.steps);
   const songData = useGameStore((s) => s.songData);
   const gameMode = useGameStore((s) => s.gameMode);
-  const setGameMode = useGameStore((s) => s.setGameMode);
   const resetGame = useGameStore((s) => s.resetGame);
   const stepsByDifficulty = useGameStore((s) => s.stepsByDifficulty);
   const enterDifficultySelect = useGameStore((s) => s.enterDifficultySelect);
@@ -126,16 +125,6 @@ function GameScreen() {
       totalNotes,
     });
   }, [gameFinished]);
-
-  const handleModeChange = useCallback((newMode: GameMode) => {
-    setGameMode(newMode);
-    processedStepsRefP1.current.clear();
-    processedStepsRefP2.current.clear();
-    comboRefP1.current = 0;
-    comboRefP2.current = 0;
-    setCombo(0);
-    setCombo2(0);
-  }, [setGameMode]);
 
   const togglePause = useCallback(() => {
     setGameState((prev) => {
@@ -357,8 +346,6 @@ function GameScreen() {
       {gameState === GameState.PAUSED && (
         <PauseOverlay
           onResume={togglePause}
-          mode={gameMode}
-          onModeChange={handleModeChange}
           onChangeDifficulty={stepsByDifficulty ? enterDifficultySelect : undefined}
         />
       )}
