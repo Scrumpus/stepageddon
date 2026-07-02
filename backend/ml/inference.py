@@ -26,6 +26,12 @@ from ml.prepare_data import (
     DB_MIN, DB_MAX, DB_RANGE,
     N_FEAT_CHANNELS, N_SPECTRAL_CONTRAST,
 )
+from ml.patterns import (
+    STREAM_PATTERNS, JUMP_PATTERNS,
+    CANDLE_PATTERNS, SPIN_PATTERNS,
+    DRILL_PATTERNS, GALLOP_PAIRS,
+    arrow_from_index,
+)
 from src.charts.schemas import (
     Chart, Step, StepType, Direction, BeatSubdivision,
 )
@@ -72,6 +78,8 @@ DEFAULT_STYLE_KNOBS: Dict[str, float] = {
     'jack_rate': 0.05,
     'crossover_rate': 0.10,
     'stream_preference': 0.5,
+    'candle_rate': 0.05,          # probability of candle pattern injection
+    'spin_rate': 0.02,            # probability of spin pattern injection
 }
 
 
@@ -91,21 +99,11 @@ class FootStateArrowAssigner:
 
     ALL_PANELS = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
 
-    STREAM_PATTERNS = [
-        [0, 2, 1, 3],  # L U D R — standard weave
-        [3, 1, 2, 0],  # R D U L — reverse weave
-        [0, 1, 2, 3],  # L D U R — staircase up
-        [3, 2, 1, 0],  # R U D L — staircase down
-        [0, 3, 1, 2],  # L R D U — wide crossover
-        [1, 2, 0, 3],  # D U L R — inside-out
-    ]
-
-    JUMP_PATTERNS = [
-        (Direction.LEFT, Direction.RIGHT),
-        (Direction.DOWN, Direction.UP),
-        (Direction.LEFT, Direction.UP),
-        (Direction.DOWN, Direction.RIGHT),
-    ]
+    # Pattern catalogs imported from ml.patterns
+    STREAM_PATTERNS = STREAM_PATTERNS
+    JUMP_PATTERNS = JUMP_PATTERNS
+    CANDLE_PATTERNS = CANDLE_PATTERNS
+    SPIN_PATTERNS = SPIN_PATTERNS
 
     def __init__(
         self,
@@ -114,12 +112,16 @@ class FootStateArrowAssigner:
         jack_rate: float = 0.05,
         crossover_rate: float = 0.10,
         stream_preference: float = 0.5,
+        candle_rate: float = 0.05,
+        spin_rate: float = 0.02,
     ):
         self.rng = random.Random(seed)
         self.allowed_patterns = set(allowed_patterns or ['single'])
         self.jack_rate = float(np.clip(jack_rate, 0.0, 1.0))
         self.crossover_rate = float(np.clip(crossover_rate, 0.0, 1.0))
         self.stream_preference = float(np.clip(stream_preference, 0.0, 1.0))
+        self.candle_rate = float(np.clip(candle_rate, 0.0, 1.0))
+        self.spin_rate = float(np.clip(spin_rate, 0.0, 1.0))
         self.reset()
 
     def reset(self):
@@ -134,6 +136,14 @@ class FootStateArrowAssigner:
         self._stream_pattern: Optional[List[int]] = None
         self._stream_idx: int = 0
         self._last_arrow: Optional[Direction] = None
+        # Candle state: preloaded sequence of 3 arrow indices (or None).
+        self._candle_pattern: Optional[List[int]] = None
+        self._candle_idx: int = 0
+        # Spin state: preloaded sequence of 5 arrow indices (or None).
+        self._spin_pattern: Optional[List[int]] = None
+        self._spin_idx: int = 0
+        # Recent arrow history for pattern detection (last 4 single-tap arrows).
+        self._arrow_history: List[Direction] = []
 
     def _purge_holds(self, time: float) -> None:
         if not self.active_holds:
@@ -215,7 +225,110 @@ class FootStateArrowAssigner:
             arrow = self._last_arrow
             # Don't flip feet for a jack — same foot taps again.
             self._update_foot(self.last_foot, arrow)
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
             return arrow
+
+        # ---- Candle pattern branch ----
+        # Follow an active candle sequence if one is in progress.
+        if self._candle_pattern is not None:
+            arrow_idx = self._candle_pattern[self._candle_idx]
+            self._candle_idx += 1
+            if self._candle_idx >= len(self._candle_pattern):
+                self._candle_pattern = None
+                self._candle_idx = 0
+            arrow = self.ALL_PANELS[arrow_idx]
+            if arrow in held_now:
+                arrow = self._fallback_arrow(held_now)
+                self._candle_pattern = None
+                self._candle_idx = 0
+            foot = self._pick_foot(time)
+            self._update_foot(foot, arrow)
+            self._step_count += 1
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
+            return arrow
+
+        # ---- Spin pattern branch ----
+        if self._spin_pattern is not None:
+            arrow_idx = self._spin_pattern[self._spin_idx]
+            self._spin_idx += 1
+            if self._spin_idx >= len(self._spin_pattern):
+                self._spin_pattern = None
+                self._spin_idx = 0
+            arrow = self.ALL_PANELS[arrow_idx]
+            if arrow in held_now:
+                arrow = self._fallback_arrow(held_now)
+                self._spin_pattern = None
+                self._spin_idx = 0
+            foot = self._pick_foot(time)
+            self._update_foot(foot, arrow)
+            self._step_count += 1
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
+            return arrow
+
+        # ---- Pattern-start detection ----
+        # If no active pattern and not holding anything, try to start a candle
+        # or spin based on recent arrow history.
+        if not held_now and not self._held_feet(time):
+            hist = self._arrow_history
+            # Try candle start: need at least 2 recent taps to form a prefix.
+            if (
+                len(hist) >= 2
+                and self.candle_rate > 0.0
+                and self.rng.random() < self.candle_rate
+            ):
+                last2 = (self.ALL_PANELS.index(hist[-2]),
+                          self.ALL_PANELS.index(hist[-1]))
+                # Check if last 2 arrows match the start of any candle pattern.
+                match = self._match_pattern_prefix(last2, self.CANDLE_PATTERNS, 2)
+                if match is not None:
+                    self._candle_pattern = list(match)
+                    self._candle_idx = 2  # first two already emitted
+                    arrow_idx = self._candle_pattern[self._candle_idx]
+                    self._candle_idx += 1
+                    if self._candle_idx >= len(self._candle_pattern):
+                        self._candle_pattern = None
+                        self._candle_idx = 0
+                    arrow = self.ALL_PANELS[arrow_idx]
+                    foot = self._pick_foot(time)
+                    self._update_foot(foot, arrow)
+                    self._step_count += 1
+                    self._arrow_history.append(arrow)
+                    if len(self._arrow_history) > 5:
+                        self._arrow_history = self._arrow_history[-5:]
+                    return arrow
+
+            # Try spin start: need at least 3 recent taps.
+            if (
+                len(hist) >= 3
+                and self.spin_rate > 0.0
+                and self.rng.random() < self.spin_rate
+            ):
+                last3 = (self.ALL_PANELS.index(hist[-3]),
+                          self.ALL_PANELS.index(hist[-2]),
+                          self.ALL_PANELS.index(hist[-1]))
+                match = self._match_pattern_prefix(last3, self.SPIN_PATTERNS, 3)
+                if match is not None:
+                    self._spin_pattern = list(match)
+                    self._spin_idx = 3
+                    arrow_idx = self._spin_pattern[self._spin_idx]
+                    self._spin_idx += 1
+                    if self._spin_idx >= len(self._spin_pattern):
+                        self._spin_pattern = None
+                        self._spin_idx = 0
+                    arrow = self.ALL_PANELS[arrow_idx]
+                    foot = self._pick_foot(time)
+                    self._update_foot(foot, arrow)
+                    self._step_count += 1
+                    self._arrow_history.append(arrow)
+                    if len(self._arrow_history) > 5:
+                        self._arrow_history = self._arrow_history[-5:]
+                    return arrow
 
         foot = self._pick_foot(time)
         panels = self._panels_for_foot(foot)
@@ -261,7 +374,31 @@ class FootStateArrowAssigner:
                     foot = 'left' if arrow in self.LEFT_FOOT_PANELS else 'right'
 
         self._update_foot(foot, arrow)
+        self._arrow_history.append(arrow)
+        if len(self._arrow_history) > 5:
+            self._arrow_history = self._arrow_history[-5:]
         return arrow
+
+    def _fallback_arrow(self, held_now: Set[Direction]) -> Direction:
+        """Return a safe fallback arrow when pattern collides with holds."""
+        free = [p for p in self.ALL_PANELS if p not in held_now]
+        if free:
+            return free[0]
+        # All four held — abort patterns, just pick anything.
+        return Direction.LEFT
+
+    @staticmethod
+    def _match_pattern_prefix(
+        prefix: tuple,
+        patterns: List[List[int]],
+        min_match: int,
+    ) -> Optional[List[int]]:
+        """Check if `prefix` matches the first `min_match` elements of any pattern.
+        Returns the first matching full pattern, or None."""
+        for pat in patterns:
+            if list(prefix) == pat[:min_match]:
+                return pat
+        return None
 
     def assign_jump(self, time: float, energy: float = 0.5,
                      brightness: float = 0.5) -> List[Direction]:
@@ -375,6 +512,13 @@ def _profile_knobs(profile: Dict) -> Dict[str, float]:
     knobs['stream_preference'] = float(np.clip(
         rm.get('stream_density', 0.20) * 2.0, 0.0, 1.0,
     ))
+    # Candle rate: scale with crossover_rate (candles are a crossover variant)
+    # and stream_density (candles appear in dense passages).
+    candle_raw = float(rm.get('crossover_rate', 0.05)) * 0.5
+    knobs['candle_rate'] = float(np.clip(candle_raw, 0.0, 0.15))
+    # Spin rate: rare; only in high-crossover, high-density profiles.
+    spin_raw = float(rm.get('crossover_rate', 0.05)) * 0.2
+    knobs['spin_rate'] = float(np.clip(spin_raw, 0.0, 0.08))
     return knobs
 
 
@@ -1382,6 +1526,8 @@ class MLChartGenerator:
             jack_rate=style_knobs.get('jack_rate', DEFAULT_STYLE_KNOBS['jack_rate']),
             crossover_rate=style_knobs.get('crossover_rate', DEFAULT_STYLE_KNOBS['crossover_rate']),
             stream_preference=style_knobs.get('stream_preference', DEFAULT_STYLE_KNOBS['stream_preference']),
+            candle_rate=style_knobs.get('candle_rate', DEFAULT_STYLE_KNOBS['candle_rate']),
+            spin_rate=style_knobs.get('spin_rate', DEFAULT_STYLE_KNOBS['spin_rate']),
         )
         steps: List[Step] = []
         max_stream_length = max(1, getattr(diff_config, 'max_stream_length', 0))
