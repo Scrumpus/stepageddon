@@ -251,6 +251,7 @@ def build_loss(
         focal_gamma=float(args.focal_gamma),
         sustain_weight=float(args.sustain_weight),
         intensity_weight=float(args.intensity_weight),
+        arrow_weight=float(getattr(args, 'arrow_weight', 1.0)),
     )
 
 
@@ -264,10 +265,12 @@ def train_one_epoch(
     total_onset = 0.0
     total_sustain = 0.0
     total_intensity = 0.0
+    total_arrow = 0.0
     total_samples = 0
     n_batches = len(loader)
 
-    interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'n': 0}
+    interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0,
+                'intensity': 0.0, 'arrow': 0.0, 'n': 0}
     t_start = time.time()
 
     for step, batch in enumerate(loader):
@@ -275,6 +278,7 @@ def train_one_epoch(
             feats, difficulty, density,
             onset_soft, sustain_target, intensity_target,
             start_seconds, remaining_seconds,
+            arrow_target, prev_class, prev_dt,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -284,15 +288,20 @@ def train_one_epoch(
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+        arrow_target = arrow_target.to(device, non_blocking=True)
+        prev_class = prev_class.to(device, non_blocking=True)
+        prev_dt = prev_dt.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast('cuda'):
-            onset_logits, sustain_logits, intensity_pred = model(
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
+                prev_class, prev_dt,
             )
-            loss, onset_l, sustain_l, intensity_l = criterion(
+            loss, onset_l, sustain_l, intensity_l, arrow_l = criterion(
                 onset_logits, sustain_logits, intensity_pred,
                 onset_soft, sustain_target, intensity_target,
+                arrow_logits, arrow_target,
             )
 
         scaler.scale(loss).backward()
@@ -311,12 +320,14 @@ def train_one_epoch(
         total_onset += onset_l.item() * bs
         total_sustain += sustain_l.item() * bs
         total_intensity += intensity_l.item() * bs
+        total_arrow += arrow_l.item() * bs
         total_samples += bs
 
         interval['loss'] += loss.item() * bs
         interval['onset'] += onset_l.item() * bs
         interval['sustain'] += sustain_l.item() * bs
         interval['intensity'] += intensity_l.item() * bs
+        interval['arrow'] += arrow_l.item() * bs
         interval['n'] += bs
 
         if (step + 1) % log_interval == 0 or (step + 1) == n_batches:
@@ -328,11 +339,13 @@ def train_one_epoch(
                 f"loss={interval['loss']/n:.4f} "
                 f"(onset={interval['onset']/n:.4f} "
                 f"sustain={interval['sustain']/n:.4f} "
-                f"intensity={interval['intensity']/n:.4f}) "
+                f"intensity={interval['intensity']/n:.4f} "
+                f"arrow={interval['arrow']/n:.4f}) "
                 f"| lr={lr:.2e} | {elapsed:.1f}s",
                 flush=True,
             )
-            interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'n': 0}
+            interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0,
+                        'intensity': 0.0, 'arrow': 0.0, 'n': 0}
             t_start = time.time()
 
     return {
@@ -340,6 +353,7 @@ def train_one_epoch(
         'onset_loss': total_onset / max(total_samples, 1),
         'sustain_loss': total_sustain / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
+        'arrow_loss': total_arrow / max(total_samples, 1),
     }
 
 
@@ -464,12 +478,16 @@ def validate(
     sustain_true_chunks: List[np.ndarray] = []
     all_intensity_pred: List[np.ndarray] = []
     all_intensity_true: List[np.ndarray] = []
+    total_arrow = 0.0
+    arrow_correct = 0
+    arrow_total = 0
 
     for batch in loader:
         (
             feats, difficulty, density,
             onset_soft, sustain_target, intensity_target,
             start_seconds, remaining_seconds,
+            arrow_target, prev_class, prev_dt,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -479,14 +497,19 @@ def validate(
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+        arrow_target = arrow_target.to(device, non_blocking=True)
+        prev_class = prev_class.to(device, non_blocking=True)
+        prev_dt = prev_dt.to(device, non_blocking=True)
 
         with autocast('cuda'):
-            onset_logits, sustain_logits, intensity_pred = model(
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
+                prev_class, prev_dt,
             )
-            loss, onset_l, sustain_l, intensity_l = criterion(
+            loss, onset_l, sustain_l, intensity_l, arrow_l = criterion(
                 onset_logits, sustain_logits, intensity_pred,
                 onset_soft, sustain_target, intensity_target,
+                arrow_logits, arrow_target,
             )
 
         bs = feats.size(0)
@@ -494,7 +517,18 @@ def validate(
         total_onset += onset_l.item() * bs
         total_sustain += sustain_l.item() * bs
         total_intensity += intensity_l.item() * bs
+        total_arrow += arrow_l.item() * bs
         total_samples += bs
+
+        # Teacher-forced top-1 arrow accuracy over modeled onset frames — a
+        # direct, weight-dependent step-selection metric (how often the model
+        # picks the human's exact panel set).
+        if arrow_logits is not None:
+            mask = arrow_target != -100
+            if bool(mask.any()):
+                pred_cls = arrow_logits.argmax(dim=-1)
+                arrow_correct += int((pred_cls[mask] == arrow_target[mask]).sum().item())
+                arrow_total += int(mask.sum().item())
 
         all_onset_pred.append(
             torch.sigmoid(onset_logits.float()).cpu().numpy().reshape(-1)
@@ -563,11 +597,12 @@ def validate(
     intensity_auc = _binary_auc(intensity_pred_all, jump_label)
     intensity_mse = float(np.mean((intensity_pred_all - intensity_true_all) ** 2))
 
-    return {
+    metrics = {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
         'sustain_loss': total_sustain / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
+        'arrow_loss': total_arrow / max(total_samples, 1),
         'onset_tol_f1': float(onset_f1),
         'onset_tol_p': float(onset_p),
         'onset_tol_r': float(onset_r),
@@ -579,16 +614,27 @@ def validate(
         'intensity_jump_auc': float(intensity_auc),
         'intensity_mse': intensity_mse,
     }
+    if arrow_total > 0:
+        metrics['arrow_acc'] = arrow_correct / arrow_total
+    return metrics
 
 
 def composite_score(metrics: Dict[str, float]) -> float:
-    """Headline checkpoint score per the v7 plan:
+    """Headline checkpoint score.
+
+    Headless (v7) checkpoints keep the original rhythm-only score:
         0.7 * onset_tol_f1 + 0.15 * sustain_f1 + 0.15 * intensity_jump_auc
+    When a learned arrow head is present (`arrow_acc` reported), choreography
+    enters the score so model selection optimizes step-selection too:
+        0.5 * onset + 0.1 * sustain + 0.1 * intensity_auc + 0.3 * arrow_acc
     """
     onset = float(metrics.get('onset_tol_f1', 0.0))
     sustain = float(metrics.get('sustain_f1', 0.0))
     auc = float(metrics.get('intensity_jump_auc', 0.5))
-    return 0.7 * onset + 0.15 * sustain + 0.15 * auc
+    arrow = metrics.get('arrow_acc')
+    if arrow is None:
+        return 0.7 * onset + 0.15 * sustain + 0.15 * auc
+    return 0.5 * onset + 0.1 * sustain + 0.1 * auc + 0.3 * float(arrow)
 
 
 def save_checkpoint(
@@ -659,6 +705,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--focal-gamma', type=float, default=2.0)
     parser.add_argument('--sustain-weight', type=float, default=2.0)
     parser.add_argument('--intensity-weight', type=float, default=0.5)
+    parser.add_argument('--arrow-weight', type=float, default=1.0,
+                        help='Weight of the step-selection (arrow) cross-entropy loss.')
     parser.add_argument('--onset-pos-weight', type=float, default=None,
                         help='Override onset BCE pos_weight; default sqrt((1-p)/p) capped at 50')
     parser.add_argument('--sustain-pos-weight', type=float, default=None,
@@ -773,7 +821,8 @@ def main():
             f"| train_loss={train_metrics['loss']:.4f} "
             f"(onset={train_metrics['onset_loss']:.4f} "
             f"sustain={train_metrics['sustain_loss']:.4f} "
-            f"intensity={train_metrics['intensity_loss']:.4f}) "
+            f"intensity={train_metrics['intensity_loss']:.4f} "
+            f"arrow={train_metrics.get('arrow_loss', 0.0):.4f}) "
             f"| val_loss={val_metrics['loss']:.4f} "
             f"onset_tol_f1={val_metrics['onset_tol_f1']:.3f} "
             f"(P={val_metrics['onset_tol_p']:.3f} "
@@ -784,6 +833,7 @@ def main():
             f"sustain_iou={val_metrics['sustain_iou']:.3f} "
             f"intensity_auc={val_metrics['intensity_jump_auc']:.3f} "
             f"intensity_mse={val_metrics['intensity_mse']:.4f} "
+            f"arrow_acc={val_metrics.get('arrow_acc', float('nan')):.3f} "
             f"| composite={composite:.3f} "
             f"| lr={lr:.2e} | {elapsed:.1f}s",
             flush=True,

@@ -120,6 +120,66 @@ def _build_intensity_target(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Panel-set vocabulary for the learned step-selection (arrow) head.
+#
+# Each step is one of 10 panel-set classes: the 4 single arrows + the 6 two-arrow
+# jumps. Codes are 4-bit (bit i set ⇒ arrow i active; L=0, D=1, U=2, R=3, the
+# canonical ordering used everywhere). Inference caps concurrency at 2, so 3-/4-
+# arrow frames are trained as ignore rather than given their own rare classes.
+# ---------------------------------------------------------------------------
+ARROW_CLASS_CODES = [1, 2, 4, 8, 3, 5, 9, 6, 10, 12]  # L D U R | LD LU LR DU DR UR
+N_ARROW_CLASSES = len(ARROW_CLASS_CODES)              # 10
+ARROW_BOS_CLASS = N_ARROW_CLASSES                     # 10: "no previous step" token
+CODE_TO_CLASS = {code: i for i, code in enumerate(ARROW_CLASS_CODES)}
+ARROW_IGNORE_INDEX = -100                             # CrossEntropy ignore_index
+_MAX_PREV_DT = 2.0                                    # seconds; clamp gap feature
+
+
+def _build_arrow_targets(
+    arrow_labels_chunk: np.ndarray,
+    fps: float = FRAMES_PER_SECOND,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-frame targets for the autoregressive arrow head over one chunk.
+
+    Returns (arrow_target, prev_class, prev_dt), each length T:
+      - arrow_target[t]: panel-set class 0..9 at onset frames, else ignore.
+        Onset frames whose panel set has >2 arrows are ignored (not modeled).
+      - prev_class[t]: class of the previous *modeled* step (teacher forcing),
+        or ARROW_BOS_CLASS at the first step / after an unmodeled step. Only
+        meaningful at onset frames; BOS elsewhere.
+      - prev_dt[t]: seconds since the previous modeled step, clamped to
+        [0, _MAX_PREV_DT]. 0 at the first step.
+
+    The chunk boundary resets the chain (first onset sees BOS), which is fine:
+    chunks span ~5 s so most onsets have an in-chunk predecessor.
+    """
+    T = arrow_labels_chunk.shape[0]
+    target = np.full(T, ARROW_IGNORE_INDEX, dtype=np.int64)
+    prev_class = np.full(T, ARROW_BOS_CLASS, dtype=np.int64)
+    prev_dt = np.zeros(T, dtype=np.float32)
+    if T == 0:
+        return target, prev_class, prev_dt
+
+    al = arrow_labels_chunk.astype(np.int64)
+    codes = al[:, 0] | (al[:, 1] << 1) | (al[:, 2] << 2) | (al[:, 3] << 3)
+    onset_frames = np.flatnonzero(codes > 0)
+
+    last_class = ARROW_BOS_CLASS
+    last_frame: Optional[int] = None
+    for f in onset_frames:
+        cls = CODE_TO_CLASS.get(int(codes[f]), ARROW_IGNORE_INDEX)
+        prev_class[f] = last_class
+        if last_frame is not None:
+            prev_dt[f] = min(_MAX_PREV_DT, (f - last_frame) / fps)
+        target[f] = cls
+        # Advance the teacher-forcing chain only on modeled (≤2-arrow) steps.
+        if cls != ARROW_IGNORE_INDEX:
+            last_class = cls
+            last_frame = int(f)
+    return target, prev_class, prev_dt
+
+
 def load_manifest(manifest_path: str) -> dict:
     """Load a v7 manifest, validating the format version."""
     with open(manifest_path, 'r') as f:
@@ -282,6 +342,9 @@ class StepChartDataset(Dataset):
         labels_chunk = labels[start:end].astype(np.int64)
         sustain_chunk = sustain_full[start:end].astype(np.float32)
         intensity_chunk = intensity_full[start:end].astype(np.float32)
+        arrow_target, prev_class, prev_dt = _build_arrow_targets(
+            arrow_labels[start:end],
+        )
         difficulty = entry['difficulty_id']
 
         # Per-chunk step density (steps/sec): any frame with a note event.
@@ -333,6 +396,9 @@ class StepChartDataset(Dataset):
             torch.from_numpy(intensity_chunk).unsqueeze(-1),  # [T, 1]
             torch.tensor(start_seconds, dtype=torch.float32),
             torch.tensor(remaining_seconds, dtype=torch.float32),
+            torch.from_numpy(arrow_target),                   # [T]  int64, ignore=-100
+            torch.from_numpy(prev_class),                     # [T]  int64 (teacher forcing)
+            torch.from_numpy(prev_dt),                        # [T]  float32 seconds
         )
 
     # ------------------------------------------------------------------

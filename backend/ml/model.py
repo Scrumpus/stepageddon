@@ -22,9 +22,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Bumped to v7: full hybrid rewrite. The arrow/type/duration/beat/hold heads
-# of v6 are gone; the model now emits only onset/sustain/intensity.
-ARCH_VERSION = 7
+# v7: full hybrid rewrite; model emitted only onset/sustain/intensity.
+# v9: adds a learned step-selection (arrow) head — the model now also predicts
+# which panel-set fires at each onset (see ArrowHead). Bumped past the v8 that
+# the training environment used for the headless checkpoint so a v9 checkpoint
+# is unambiguously "has arrow head". Loading is tolerant (strict=False) so older
+# headless checkpoints still load and fall back to the algorithmic assigner.
+ARCH_VERSION = 9
 
 
 class AudioEncoder(nn.Module):
@@ -241,13 +245,75 @@ class TransformerBlock(nn.Module):
 # Full step chart model (v7)
 # ---------------------------------------------------------------------------
 
+# Panel-set vocabulary for the arrow head. Kept in sync with
+# ml.dataset.{ARROW_CLASS_CODES, N_ARROW_CLASSES, ARROW_BOS_CLASS}.
+N_ARROW_CLASSES = 10        # 4 singles + 6 two-arrow jumps
+ARROW_BOS_CLASS = N_ARROW_CLASSES  # 10: "no previous step" token for prev-class emb
+
+
+class ArrowHead(nn.Module):
+    """Learned step-selection: which panel-set fires at an onset.
+
+    Predicts one of `n_classes` panel sets per onset frame, conditioned on the
+    backbone feature there plus the *previous* step's class and the gap since it
+    (teacher-forced at train time, fed autoregressively at inference). The
+    previous-step conditioning is what lets the head learn foot-flow — the
+    step-to-step transition structure a per-frame independent head can't.
+
+    Shapes are leading-dim agnostic: `h` is [..., hidden_dim], `prev_class` and
+    `dt` are [...], output is [..., n_classes]. Works for [B, T, H] (parallel,
+    teacher-forced) and [H] (single step, inference) alike.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_classes: int = N_ARROW_CLASSES,
+        class_emb: int = 32,
+        dt_bands: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_classes = n_classes
+        self.prev_emb = nn.Embedding(n_classes + 1, class_emb)  # +1 for BOS
+        # Sinusoidal encoding of the gap (seconds) at geometric frequencies.
+        self.register_buffer(
+            'dt_freqs',
+            (2.0 ** torch.arange(dt_bands, dtype=torch.float32)) * math.pi,
+        )
+        in_dim = hidden_dim + class_emb + 2 * dt_bands
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_classes),
+        )
+
+    def _encode_dt(self, dt: torch.Tensor) -> torch.Tensor:
+        ang = dt.unsqueeze(-1) * self.dt_freqs  # [..., dt_bands]
+        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        prev_class: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> torch.Tensor:
+        pe = self.prev_emb(prev_class)             # [..., class_emb]
+        de = self._encode_dt(dt)                   # [..., 2*dt_bands]
+        x = torch.cat([h, pe, de], dim=-1)
+        return self.mlp(x)                         # [..., n_classes]
+
+
 class StepChartModel(nn.Module):
     """
-    feats -> (onset_logits, sustain_logits, intensity_pred).
+    feats -> (onset_logits, sustain_logits, intensity_pred, arrow_logits).
 
     onset_logits:    [B, T, 1]  any-onset pre-sigmoid
     sustain_logits:  [B, T, 1]  "any arrow currently held" pre-sigmoid
     intensity_pred:  [B, T, 1]  continuous jump-vs-tap intensity (linear out)
+    arrow_logits:    [B, T, N_ARROW_CLASSES] panel-set logits, or None when the
+                     caller does not pass prev_class/prev_dt (headless dense pass)
     """
 
     def __init__(
@@ -289,6 +355,7 @@ class StepChartModel(nn.Module):
         self.onset_head = _mlp_head(1)
         self.sustain_head = _mlp_head(1)
         self.intensity_head = _mlp_head(1)
+        self.arrow_head = ArrowHead(hidden_dim, N_ARROW_CLASSES, dropout=dropout)
 
     def set_onset_prior(self, p: float) -> None:
         """Bias-init the onset head's final layer to logit(p).
@@ -333,7 +400,9 @@ class StepChartModel(nn.Module):
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        prev_class: Optional[torch.Tensor] = None,
+        prev_dt: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             feats: [B, T, n_in_channels]
@@ -341,11 +410,15 @@ class StepChartModel(nn.Module):
             density: [B] float (normalized)
             start_seconds: [B] float
             remaining_seconds: [B] float
+            prev_class: [B, T] long, previous-step class per frame (teacher
+                forcing). When None, arrow_logits is None (dense-only pass).
+            prev_dt: [B, T] float, seconds since previous step per frame.
 
         Returns:
             onset_logits:    [B, T, 1] pre-sigmoid
             sustain_logits:  [B, T, 1] pre-sigmoid
             intensity_pred:  [B, T, 1] linear regression output
+            arrow_logits:    [B, T, N_ARROW_CLASSES] or None
         """
         features = self.encode(
             feats, difficulty, density, start_seconds, remaining_seconds,
@@ -353,7 +426,10 @@ class StepChartModel(nn.Module):
         onset_logits = self.onset_head(features)
         sustain_logits = self.sustain_head(features)
         intensity_pred = self.intensity_head(features)
-        return onset_logits, sustain_logits, intensity_pred
+        arrow_logits = None
+        if prev_class is not None and prev_dt is not None:
+            arrow_logits = self.arrow_head(features, prev_class, prev_dt)
+        return onset_logits, sustain_logits, intensity_pred, arrow_logits
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +451,7 @@ class StepChartLoss(nn.Module):
         focal_gamma: float = 2.0,
         sustain_weight: float = 1.0,
         intensity_weight: float = 0.5,
+        arrow_weight: float = 1.0,
     ):
         super().__init__()
         self.register_buffer(
@@ -388,6 +465,7 @@ class StepChartLoss(nn.Module):
         self.focal_gamma = float(focal_gamma)
         self.sustain_weight = float(sustain_weight)
         self.intensity_weight = float(intensity_weight)
+        self.arrow_weight = float(arrow_weight)
 
     def forward(
         self,
@@ -397,7 +475,9 @@ class StepChartLoss(nn.Module):
         onset_soft: torch.Tensor,      # [B, T, 1]
         sustain_target: torch.Tensor,  # [B, T, 1]
         intensity_target: torch.Tensor,  # [B, T, 1]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        arrow_logits: Optional[torch.Tensor] = None,   # [B, T, C]
+        arrow_target: Optional[torch.Tensor] = None,   # [B, T] long, ignore=-100
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Focal BCE on onset.
         if self.focal_gamma > 0.0:
             bce = F.binary_cross_entropy_with_logits(
@@ -435,9 +515,29 @@ class StepChartLoss(nn.Module):
 
         intensity_loss = F.mse_loss(intensity_pred, intensity_target)
 
+        # Arrow (step-selection) loss: masked cross-entropy over panel-set
+        # classes at onset frames. ignore_index=-100 skips non-onset frames and
+        # unmodeled (>2-arrow) steps. Zero when the arrow head is absent.
+        if arrow_logits is not None and arrow_target is not None:
+            C = arrow_logits.shape[-1]
+            arrow_loss = F.cross_entropy(
+                arrow_logits.reshape(-1, C),
+                arrow_target.reshape(-1),
+                ignore_index=-100,
+            )
+        else:
+            arrow_loss = intensity_loss.new_zeros(())
+
         total = (
             onset_loss
             + self.sustain_weight * sustain_loss
             + self.intensity_weight * intensity_loss
+            + self.arrow_weight * arrow_loss
         )
-        return total, onset_loss.detach(), sustain_loss.detach(), intensity_loss.detach()
+        return (
+            total,
+            onset_loss.detach(),
+            sustain_loss.detach(),
+            intensity_loss.detach(),
+            arrow_loss.detach(),
+        )
