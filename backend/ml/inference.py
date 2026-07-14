@@ -26,10 +26,17 @@ from ml.prepare_data import (
     DB_MIN, DB_MAX, DB_RANGE,
     N_FEAT_CHANNELS, N_SPECTRAL_CONTRAST,
 )
+from ml.patterns import (
+    STREAM_PATTERNS, JUMP_PATTERNS,
+    CANDLE_PATTERNS, SPIN_PATTERNS,
+    DRILL_PATTERNS, GALLOP_PAIRS,
+    arrow_from_index,
+)
 from src.charts.schemas import (
     Chart, Step, StepType, Direction, BeatSubdivision,
 )
 from src.generation.constants import get_difficulty_config
+from ml.dataset import ARROW_CLASS_CODES, ARROW_BOS_CLASS
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,10 @@ class _AudioAnalysis:
     centroid_norm: np.ndarray
     harm_rms: np.ndarray
     audio_seed: int
+    # Dominant chroma pitch class per frame (0=C .. 11=B), or -1 where the frame
+    # is not confidently pitched (percussive/quiet). Drives music-aware arrow
+    # selection in FootStateArrowAssigner. Shape [T], int16.
+    pitch_class: np.ndarray
 
 
 # Defaults for style-profile post-processing knobs. These are used when a
@@ -72,7 +83,32 @@ DEFAULT_STYLE_KNOBS: Dict[str, float] = {
     'jack_rate': 0.05,
     'crossover_rate': 0.10,
     'stream_preference': 0.5,
+    'candle_rate': 0.05,          # probability of candle pattern injection
+    'spin_rate': 0.02,            # probability of spin pattern injection
 }
+
+
+# Music-aware arrow selection: map each of the 12 pitch classes to a panel, in
+# three-class blocks that align with the foot regions (LEFT/DOWN = left foot,
+# UP/RIGHT = right foot). Ascending pitch therefore drifts left-foot → right-
+# foot, mirroring pitch height → pad position. A given note maps to a stable
+# panel, so a repeated melodic phrase yields a repeated arrow phrase for free.
+_PITCH_CLASS_TO_PANEL = {
+    0: Direction.LEFT,  1: Direction.LEFT,  2: Direction.LEFT,     # C  C# D
+    3: Direction.DOWN,  4: Direction.DOWN,  5: Direction.DOWN,     # D# E  F
+    6: Direction.UP,    7: Direction.UP,    8: Direction.UP,       # F# G  G#
+    9: Direction.RIGHT, 10: Direction.RIGHT, 11: Direction.RIGHT,  # A  A# B
+}
+# Pitch-class "center" of each panel, for nearest-panel fallback (circular).
+_PANEL_PITCH_CENTER = {
+    Direction.LEFT: 1, Direction.DOWN: 4, Direction.UP: 7, Direction.RIGHT: 10,
+}
+
+
+def _pitch_class_distance(a: int, b: int) -> int:
+    """Circular distance between two pitch classes on the 12-tone wheel."""
+    d = abs(a - b) % 12
+    return min(d, 12 - d)
 
 
 class FootStateArrowAssigner:
@@ -91,21 +127,11 @@ class FootStateArrowAssigner:
 
     ALL_PANELS = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
 
-    STREAM_PATTERNS = [
-        [0, 2, 1, 3],  # L U D R — standard weave
-        [3, 1, 2, 0],  # R D U L — reverse weave
-        [0, 1, 2, 3],  # L D U R — staircase up
-        [3, 2, 1, 0],  # R U D L — staircase down
-        [0, 3, 1, 2],  # L R D U — wide crossover
-        [1, 2, 0, 3],  # D U L R — inside-out
-    ]
-
-    JUMP_PATTERNS = [
-        (Direction.LEFT, Direction.RIGHT),
-        (Direction.DOWN, Direction.UP),
-        (Direction.LEFT, Direction.UP),
-        (Direction.DOWN, Direction.RIGHT),
-    ]
+    # Pattern catalogs imported from ml.patterns
+    STREAM_PATTERNS = STREAM_PATTERNS
+    JUMP_PATTERNS = JUMP_PATTERNS
+    CANDLE_PATTERNS = CANDLE_PATTERNS
+    SPIN_PATTERNS = SPIN_PATTERNS
 
     def __init__(
         self,
@@ -114,12 +140,16 @@ class FootStateArrowAssigner:
         jack_rate: float = 0.05,
         crossover_rate: float = 0.10,
         stream_preference: float = 0.5,
+        candle_rate: float = 0.05,
+        spin_rate: float = 0.02,
     ):
         self.rng = random.Random(seed)
         self.allowed_patterns = set(allowed_patterns or ['single'])
         self.jack_rate = float(np.clip(jack_rate, 0.0, 1.0))
         self.crossover_rate = float(np.clip(crossover_rate, 0.0, 1.0))
         self.stream_preference = float(np.clip(stream_preference, 0.0, 1.0))
+        self.candle_rate = float(np.clip(candle_rate, 0.0, 1.0))
+        self.spin_rate = float(np.clip(spin_rate, 0.0, 1.0))
         self.reset()
 
     def reset(self):
@@ -134,6 +164,19 @@ class FootStateArrowAssigner:
         self._stream_pattern: Optional[List[int]] = None
         self._stream_idx: int = 0
         self._last_arrow: Optional[Direction] = None
+        # Pitch class of the previous single tap, for melodic-jack detection.
+        self._last_pitch_class: int = -1
+        # Consecutive melodic jacks so far, capped so a long repeated-note run
+        # eventually breaks to alternation instead of an endless jack.
+        self._melodic_jack_run: int = 0
+        # Candle state: preloaded sequence of 3 arrow indices (or None).
+        self._candle_pattern: Optional[List[int]] = None
+        self._candle_idx: int = 0
+        # Spin state: preloaded sequence of 5 arrow indices (or None).
+        self._spin_pattern: Optional[List[int]] = None
+        self._spin_idx: int = 0
+        # Recent arrow history for pattern detection (last 4 single-tap arrows).
+        self._arrow_history: List[Direction] = []
 
     def _purge_holds(self, time: float) -> None:
         if not self.active_holds:
@@ -176,9 +219,53 @@ class FootStateArrowAssigner:
         self.last_foot = foot
         self._last_arrow = arrow
 
+    def _panel_weights(
+        self,
+        panels: List[Direction],
+        current_pos: Direction,
+        brightness: float,
+        pitch_class: int,
+    ) -> List[float]:
+        """Weights over the chosen foot's two panels [panels[0], panels[1]].
+
+        Pitch-aware when a confident pitch class is available: strongly prefer
+        the panel this note maps to (or, if that panel is on the other foot, the
+        nearer of the two by pitch center). Falls back to the original
+        brightness heuristic for unpitched frames. A small stickiness term still
+        nudges away from the panel the foot is already on.
+        """
+        if pitch_class is not None and pitch_class >= 0:
+            pref = _PITCH_CLASS_TO_PANEL[pitch_class]
+            if pref == panels[0]:
+                weights = [0.85, 0.15]
+            elif pref == panels[1]:
+                weights = [0.15, 0.85]
+            else:
+                d0 = _pitch_class_distance(pitch_class, _PANEL_PITCH_CENTER[panels[0]])
+                d1 = _pitch_class_distance(pitch_class, _PANEL_PITCH_CENTER[panels[1]])
+                weights = [0.65, 0.35] if d0 <= d1 else [0.35, 0.65]
+        elif brightness > 0.6:
+            weights = [0.7, 0.3]
+        elif brightness < 0.4:
+            weights = [0.3, 0.7]
+        else:
+            weights = [0.5, 0.5]
+
+        if current_pos == panels[0]:
+            weights[1] += 0.2
+        else:
+            weights[0] += 0.2
+        return weights
+
     def assign_single(self, time: float, energy: float = 0.5,
-                       brightness: float = 0.5) -> Direction:
-        # Active stream — follow the pattern.
+                       brightness: float = 0.5, pitch_class: int = -1) -> Direction:
+        # Record this onset's pitch for the next call's melodic-jack check, and
+        # keep the previous value to test note repetition below.
+        prev_pitch_class = self._last_pitch_class
+        self._last_pitch_class = pitch_class
+
+        # Active stream — follow the pattern. Must not emit a stream arrow
+        # onto a panel that is still held from a prior hold_start.
         if self._stream_pattern is not None:
             arrow_idx = self._stream_pattern[self._stream_idx]
             self._stream_idx += 1
@@ -186,24 +273,160 @@ class FootStateArrowAssigner:
                 self._stream_pattern = None
                 self._stream_idx = 0
             arrow = self.ALL_PANELS[arrow_idx]
+            if arrow in self._held_arrows(time):
+                free = [p for p in self.ALL_PANELS if p not in self.active_holds]
+                if free:
+                    arrow = free[0]
+                else:
+                    # All four held — abort the stream.
+                    self._stream_pattern = None
+                    self._stream_idx = 0
             foot = self._pick_foot(time)
             self._update_foot(foot, arrow)
             self._step_count += 1
             return arrow
 
         # Jack branch: with profile-controlled probability, repeat the last
-        # arrow rather than alternating feet.
+        # arrow rather than alternating feet. Must not jack onto an arrow
+        # that is still held from a prior hold_start.
+        held_now = self._held_arrows(time)
         if (
             self._last_arrow is not None
             and self.jack_rate > 0.0
             and self.rng.random() < self.jack_rate
             and not self._held_feet(time)
+            and self._last_arrow not in held_now
         ):
             self._step_count += 1
             arrow = self._last_arrow
             # Don't flip feet for a jack — same foot taps again.
             self._update_foot(self.last_foot, arrow)
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
             return arrow
+
+        # Melodic-jack branch: a repeated note (same pitch class as the previous
+        # tap) is charted as a jack — repeat the same panel — the way human
+        # authors handle held/repeated melody notes. Music-driven, not random.
+        # Capped so a long repeated-note run breaks to alternation eventually.
+        if (
+            pitch_class >= 0
+            and prev_pitch_class == pitch_class
+            and self._melodic_jack_run < 3
+            and self._last_arrow is not None
+            and not self._held_feet(time)
+            and self._last_arrow not in held_now
+        ):
+            self._step_count += 1
+            self._melodic_jack_run += 1
+            arrow = self._last_arrow
+            self._update_foot(self.last_foot, arrow)
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
+            return arrow
+        self._melodic_jack_run = 0
+
+        # ---- Candle pattern branch ----
+        # Follow an active candle sequence if one is in progress.
+        if self._candle_pattern is not None:
+            arrow_idx = self._candle_pattern[self._candle_idx]
+            self._candle_idx += 1
+            if self._candle_idx >= len(self._candle_pattern):
+                self._candle_pattern = None
+                self._candle_idx = 0
+            arrow = self.ALL_PANELS[arrow_idx]
+            if arrow in held_now:
+                arrow = self._fallback_arrow(held_now)
+                self._candle_pattern = None
+                self._candle_idx = 0
+            foot = self._pick_foot(time)
+            self._update_foot(foot, arrow)
+            self._step_count += 1
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
+            return arrow
+
+        # ---- Spin pattern branch ----
+        if self._spin_pattern is not None:
+            arrow_idx = self._spin_pattern[self._spin_idx]
+            self._spin_idx += 1
+            if self._spin_idx >= len(self._spin_pattern):
+                self._spin_pattern = None
+                self._spin_idx = 0
+            arrow = self.ALL_PANELS[arrow_idx]
+            if arrow in held_now:
+                arrow = self._fallback_arrow(held_now)
+                self._spin_pattern = None
+                self._spin_idx = 0
+            foot = self._pick_foot(time)
+            self._update_foot(foot, arrow)
+            self._step_count += 1
+            self._arrow_history.append(arrow)
+            if len(self._arrow_history) > 5:
+                self._arrow_history = self._arrow_history[-5:]
+            return arrow
+
+        # ---- Pattern-start detection ----
+        # If no active pattern and not holding anything, try to start a candle
+        # or spin based on recent arrow history.
+        if not held_now and not self._held_feet(time):
+            hist = self._arrow_history
+            # Try candle start: need at least 2 recent taps to form a prefix.
+            if (
+                len(hist) >= 2
+                and self.candle_rate > 0.0
+                and self.rng.random() < self.candle_rate
+            ):
+                last2 = (self.ALL_PANELS.index(hist[-2]),
+                          self.ALL_PANELS.index(hist[-1]))
+                # Check if last 2 arrows match the start of any candle pattern.
+                match = self._match_pattern_prefix(last2, self.CANDLE_PATTERNS, 2)
+                if match is not None:
+                    self._candle_pattern = list(match)
+                    self._candle_idx = 2  # first two already emitted
+                    arrow_idx = self._candle_pattern[self._candle_idx]
+                    self._candle_idx += 1
+                    if self._candle_idx >= len(self._candle_pattern):
+                        self._candle_pattern = None
+                        self._candle_idx = 0
+                    arrow = self.ALL_PANELS[arrow_idx]
+                    foot = self._pick_foot(time)
+                    self._update_foot(foot, arrow)
+                    self._step_count += 1
+                    self._arrow_history.append(arrow)
+                    if len(self._arrow_history) > 5:
+                        self._arrow_history = self._arrow_history[-5:]
+                    return arrow
+
+            # Try spin start: need at least 3 recent taps.
+            if (
+                len(hist) >= 3
+                and self.spin_rate > 0.0
+                and self.rng.random() < self.spin_rate
+            ):
+                last3 = (self.ALL_PANELS.index(hist[-3]),
+                          self.ALL_PANELS.index(hist[-2]),
+                          self.ALL_PANELS.index(hist[-1]))
+                match = self._match_pattern_prefix(last3, self.SPIN_PATTERNS, 3)
+                if match is not None:
+                    self._spin_pattern = list(match)
+                    self._spin_idx = 3
+                    arrow_idx = self._spin_pattern[self._spin_idx]
+                    self._spin_idx += 1
+                    if self._spin_idx >= len(self._spin_pattern):
+                        self._spin_pattern = None
+                        self._spin_idx = 0
+                    arrow = self.ALL_PANELS[arrow_idx]
+                    foot = self._pick_foot(time)
+                    self._update_foot(foot, arrow)
+                    self._step_count += 1
+                    self._arrow_history.append(arrow)
+                    if len(self._arrow_history) > 5:
+                        self._arrow_history = self._arrow_history[-5:]
+                    return arrow
 
         foot = self._pick_foot(time)
         panels = self._panels_for_foot(foot)
@@ -221,28 +444,53 @@ class FootStateArrowAssigner:
             )
             arrow = self.rng.choice(cross_panels)
         else:
-            if brightness > 0.6:
-                weights = [0.7, 0.3]
-            elif brightness < 0.4:
-                weights = [0.3, 0.7]
-            else:
-                weights = [0.5, 0.5]
-
-            if current_pos == panels[0]:
-                weights[1] += 0.2
-            else:
-                weights[0] += 0.2
-
+            weights = self._panel_weights(panels, current_pos, brightness, pitch_class)
             total = weights[0] + weights[1]
             arrow = panels[0] if self.rng.random() < weights[0] / total else panels[1]
 
+        # Guard: if the chosen arrow is still held from a prior hold_start,
+        # swap to any free panel (same foot first, then the other foot).
+        if arrow in self._held_arrows(time):
+            same_foot = [p for p in panels if p not in self.active_holds]
+            if same_foot:
+                arrow = same_foot[0]
+            else:
+                free = [p for p in self.ALL_PANELS if p not in self.active_holds]
+                if free:
+                    arrow = free[0]
+                    foot = 'left' if arrow in self.LEFT_FOOT_PANELS else 'right'
+
         self._update_foot(foot, arrow)
+        self._arrow_history.append(arrow)
+        if len(self._arrow_history) > 5:
+            self._arrow_history = self._arrow_history[-5:]
         return arrow
 
+    def _fallback_arrow(self, held_now: Set[Direction]) -> Direction:
+        """Return a safe fallback arrow when pattern collides with holds."""
+        free = [p for p in self.ALL_PANELS if p not in held_now]
+        if free:
+            return free[0]
+        # All four held — abort patterns, just pick anything.
+        return Direction.LEFT
+
+    @staticmethod
+    def _match_pattern_prefix(
+        prefix: tuple,
+        patterns: List[List[int]],
+        min_match: int,
+    ) -> Optional[List[int]]:
+        """Check if `prefix` matches the first `min_match` elements of any pattern.
+        Returns the first matching full pattern, or None."""
+        for pat in patterns:
+            if list(prefix) == pat[:min_match]:
+                return pat
+        return None
+
     def assign_jump(self, time: float, energy: float = 0.5,
-                     brightness: float = 0.5) -> List[Direction]:
+                     brightness: float = 0.5, pitch_class: int = -1) -> List[Direction]:
         if self._held_feet(time):
-            return [self.assign_single(time, energy, brightness)]
+            return [self.assign_single(time, energy, brightness, pitch_class)]
 
         if energy > 0.7:
             candidates = [self.JUMP_PATTERNS[0], self.JUMP_PATTERNS[2],
@@ -252,7 +500,18 @@ class FootStateArrowAssigner:
         else:
             candidates = list(self.JUMP_PATTERNS)
 
-        pattern = self.rng.choice(candidates)
+        held_now = self._held_arrows(time)
+        # Shuffle so repeated collisions don't always fall back the same way.
+        self.rng.shuffle(candidates)
+        pattern = None
+        for c in candidates:
+            if c[0] not in held_now and c[1] not in held_now:
+                pattern = c
+                break
+        # If every jump pattern collides with active holds, emit a tap.
+        if pattern is None:
+            return [self.assign_single(time, energy, brightness, pitch_class)]
+
         self._step_count += 1
         self.left_pos = pattern[0]
         self.right_pos = pattern[1]
@@ -261,9 +520,10 @@ class FootStateArrowAssigner:
         return [pattern[0], pattern[1]]
 
     def start_hold(self, time: float, duration: float,
-                    energy: float = 0.5, brightness: float = 0.5) -> Direction:
+                    energy: float = 0.5, brightness: float = 0.5,
+                    pitch_class: int = -1) -> Direction:
         self._purge_holds(time)
-        arrow = self.assign_single(time, energy, brightness)
+        arrow = self.assign_single(time, energy, brightness, pitch_class)
         # Same-arrow collision guard: if assign_single landed on an already-
         # held arrow (e.g. via crossover or jack with stale state), swap to
         # any free panel. With the concurrency cap upstream, a free panel is
@@ -311,49 +571,42 @@ class FootStateArrowAssigner:
 # Style profile resolution
 # ---------------------------------------------------------------------------
 
-def _profile_knobs(profile: Dict, difficulty_id: int = 2) -> Dict[str, float]:
-    """Derive runtime knobs from a profile centroid's raw_means, difficulty-gated.
+def _profile_knobs(profile: Dict) -> Dict[str, float]:
+    """Derive runtime knobs from a profile centroid's raw_means.
 
     Profiles ship raw stat means; we map those to the post-processing
     parameters that drive jump-vs-tap classification, hold cadence, and the
     arrow-assigner branches. Values are clamped to defensible ranges.
-
-    Difficulty gating scales pattern knobs so easier difficulties use simpler
-    patterns regardless of the profile's raw stats. Multipliers dampen rather
-    than zero-out so every difficulty retains musical variety.
     """
     rm = profile.get('raw_means', {})
     knobs = dict(DEFAULT_STYLE_KNOBS)
 
-    # Difficulty-level multipliers for pattern complexity (0=beginner, 4=challenge).
-    _DIFF_PATTERN_SCALE = {
-        0: 0.0,   # beginner: no jumps, jacks, crossovers, or streams
-        1: 0.25,  # easy: 25% of pattern rates
-        2: 0.60,  # medium: 60%
-        3: 0.85,  # hard: 85%
-        4: 1.0,   # challenge: full
-    }
-    scale = _DIFF_PATTERN_SCALE.get(difficulty_id, 1.0)
-
     # Top-K jump selection: the profile's observed jump_rate tells us what
-    # fraction of peaks should become jumps, gated by difficulty.
+    # fraction of peaks should become jumps. We use the raw rate as a target
+    # and keep a small absolute intensity floor to filter out near-zero noise.
     jump_rate = float(rm.get('jump_rate', 0.05))
-    knobs['target_jump_rate'] = float(np.clip(jump_rate * scale, 0.0, 0.40))
+    knobs['target_jump_rate'] = float(np.clip(jump_rate, 0.0, 0.40))
     knobs['jump_threshold'] = 0.05
 
-    # Jumphold: enable when both holds and jumps are common; gated by difficulty.
+    # Jumphold: enable when both holds and jumps are common; rate scales with
+    # min(hold_rate, jump_rate).
     hold_rate = float(rm.get('hold_rate', 0.04))
-    knobs['jumphold_rate'] = float(np.clip(
-        min(hold_rate, jump_rate) * 1.5 * scale, 0.0, 0.4,
-    ))
+    knobs['jumphold_rate'] = float(np.clip(min(hold_rate, jump_rate) * 1.5, 0.0, 0.4))
 
-    knobs['jack_rate'] = float(np.clip(rm.get('jack_rate', 0.05) * scale, 0.0, 0.5))
-    knobs['crossover_rate'] = float(np.clip(rm.get('crossover_rate', 0.10) * scale, 0.0, 0.5))
+    knobs['jack_rate'] = float(np.clip(rm.get('jack_rate', 0.05), 0.0, 0.5))
+    knobs['crossover_rate'] = float(np.clip(rm.get('crossover_rate', 0.10), 0.0, 0.5))
     # stream_preference rolls stream_density into the assigner's branch
     # probability — high values produce visibly more stream patterns.
     knobs['stream_preference'] = float(np.clip(
-        rm.get('stream_density', 0.20) * 2.0 * scale, 0.0, 1.0,
+        rm.get('stream_density', 0.20) * 2.0, 0.0, 1.0,
     ))
+    # Candle rate: scale with crossover_rate (candles are a crossover variant)
+    # and stream_density (candles appear in dense passages).
+    candle_raw = float(rm.get('crossover_rate', 0.05)) * 0.5
+    knobs['candle_rate'] = float(np.clip(candle_raw, 0.0, 0.15))
+    # Spin rate: rare; only in high-crossover, high-density profiles.
+    spin_raw = float(rm.get('crossover_rate', 0.05)) * 0.2
+    knobs['spin_rate'] = float(np.clip(spin_raw, 0.0, 0.08))
     return knobs
 
 
@@ -375,7 +628,7 @@ class MLChartGenerator:
         style: str = 'auto',
         style_profiles_path: Optional[str] = None,
         min_first_step_time: float = 0.25,
-        min_last_step_buffer: float = 0.5,
+        min_last_step_buffer: float = 0.0,
         timing_trim: float = 0.0,
     ):
         if device is None:
@@ -401,6 +654,9 @@ class MLChartGenerator:
         self.style = str(style)
 
         self.model: Optional[StepChartModel] = None
+        # Set at load time: True only for checkpoints trained with the learned
+        # step-selection head (arch_version >= 9). Gates learned vs assigner arrows.
+        self.has_arrow_head: bool = False
         self.default_density_by_id = DEFAULT_DENSITY_BY_ID.clone()
         self.feat_mean: Optional[np.ndarray] = None
         self.feat_std: Optional[np.ndarray] = None
@@ -419,6 +675,22 @@ class MLChartGenerator:
     def load_model(self, model_path: str):
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         arch_version = int(checkpoint.get('arch_version', 1))
+        if arch_version > ARCH_VERSION:
+            raise ValueError(
+                f"Checkpoint at {model_path} is arch_version={arch_version}, newer "
+                f"than this code's {ARCH_VERSION}. Update model.py."
+            )
+        # Older checkpoints load with strict=False; the learned arrow head only
+        # activates for checkpoints trained with it (arch_version >= 9). Anything
+        # older falls back to the algorithmic FootStateArrowAssigner.
+        self.has_arrow_head = arch_version >= 9
+        if arch_version < ARCH_VERSION:
+            logger.warning(
+                f"Checkpoint arch_version={arch_version} < {ARCH_VERSION}; loading "
+                f"tolerantly. Learned arrow head "
+                f"{'ENABLED' if self.has_arrow_head else 'DISABLED (assigner fallback)'}."
+            )
+
         n_in_channels = int(checkpoint.get('n_in_channels', N_FEAT_CHANNELS))
         args = checkpoint.get('args', {})
         self.model = StepChartModel(
@@ -507,7 +779,6 @@ class MLChartGenerator:
         style: str,
         onset_density: float,
         intensity_mean: float,
-        difficulty_id: int = 2,
     ) -> Tuple[Dict[str, float], str]:
         """Pick a profile and return (knobs, resolved_name).
 
@@ -515,7 +786,6 @@ class MLChartGenerator:
         - If `style == 'auto'`, pick the profile whose mean_density is closest
           to the predicted onset density (with intensity_mean breaking ties).
         - Otherwise look up the named profile; raise on miss.
-        - difficulty_id gates pattern complexity (see _profile_knobs).
         """
         if not self.style_profiles:
             return dict(DEFAULT_STYLE_KNOBS), 'default'
@@ -532,11 +802,10 @@ class MLChartGenerator:
                     best_score = score
                     best_name = p['name']
             chosen = self._style_profiles_by_name[best_name]
-            knobs = _profile_knobs(chosen, difficulty_id)
+            knobs = _profile_knobs(chosen)
             logger.info(
                 f"Resolved style='auto' → '{best_name}' "
-                f"(onset_density={onset_density:.2f}, intensity_mean={intensity_mean:.3f}, "
-                f"diff_id={difficulty_id})"
+                f"(onset_density={onset_density:.2f}, intensity_mean={intensity_mean:.3f})"
             )
             return knobs, best_name
 
@@ -546,7 +815,7 @@ class MLChartGenerator:
                 f"Unknown style '{style}'. Available: {available} (or 'auto')."
             )
         chosen = self._style_profiles_by_name[style]
-        knobs = _profile_knobs(chosen, difficulty_id)
+        knobs = _profile_knobs(chosen)
         logger.info(f"Resolved style='{style}' → knobs={knobs}")
         return knobs, style
 
@@ -742,6 +1011,24 @@ class MLChartGenerator:
         rms_norm = self._align_length(rms_norm, feats.shape[0])
         centroid_norm = self._align_length(centroid_norm, feats.shape[0])
 
+        # Dominant pitch class per frame for music-aware arrow selection. Chroma
+        # sums the spectrum into 12 pitch classes; the argmax is the frame's
+        # strongest note. Frames whose top class isn't clearly dominant (flat
+        # chroma ⇒ percussive/noisy) are marked -1 so the assigner ignores them.
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
+            chroma_sum = chroma.sum(axis=0) + 1e-8
+            top_class = chroma.argmax(axis=0).astype(np.int16)
+            top_frac = chroma.max(axis=0) / chroma_sum       # dominance in [1/12, 1]
+            pitch_class = np.where(top_frac >= 0.18, top_class, -1).astype(np.int16)
+            # Fit to the feats grid, padding any shortfall with -1 (not 0=C).
+            fitted = np.full(feats.shape[0], -1, dtype=np.int16)
+            n = min(pitch_class.shape[0], feats.shape[0])
+            fitted[:n] = pitch_class[:n]
+            pitch_class = fitted
+        except Exception:
+            pitch_class = np.full(feats.shape[0], -1, dtype=np.int16)
+
         audio_seed = int(
             hashlib.sha256(feats[:min(4096, feats.shape[0])].tobytes()
                            ).hexdigest()[:8],
@@ -758,6 +1045,7 @@ class MLChartGenerator:
             centroid_norm=centroid_norm,
             harm_rms=harm_rms,
             audio_seed=audio_seed,
+            pitch_class=pitch_class,
         )
 
     def _chart_from_signals(
@@ -767,19 +1055,15 @@ class MLChartGenerator:
         onset_p: np.ndarray,
         sustain_p: np.ndarray,
         intensity: np.ndarray,
-        arrow_p: Optional[np.ndarray] = None,
         style: Optional[str] = None,
+        arrow_features: Optional[np.ndarray] = None,
     ) -> Chart:
         """Build a Chart from already-computed per-difficulty signals.
 
         Shared by the single-difficulty and batched-multi paths so
         post-processing only lives in one place.
-
-        v8: arrow_p[T,4] from the model's arrow heads biases the
-        FootStateArrowAssigner toward musically-suggested directions.
         """
         diff_config = get_difficulty_config(difficulty)
-        difficulty_id = APP_DIFFICULTY_MAP.get(difficulty, 2)
 
         T = onset_p.shape[0]
         onset_density_pred = float(onset_p.sum() / max(T / FRAMES_PER_SECOND, 1.0))
@@ -788,7 +1072,7 @@ class MLChartGenerator:
         )
         resolved_style = style if style is not None else self.style
         knobs, resolved_name = self._resolve_style(
-            resolved_style, onset_density_pred, intensity_mean_pred, difficulty_id,
+            resolved_style, onset_density_pred, intensity_mean_pred,
         )
 
         # Effective offset baked into emitted step times: per-song measured
@@ -804,7 +1088,8 @@ class MLChartGenerator:
             audio_seed=analysis.audio_seed,
             style_knobs=knobs,
             timing_offset=timing_offset,
-            arrow_p=arrow_p,
+            arrow_features=arrow_features,
+            pitch_class_curve=analysis.pitch_class,
         )
 
         chart = Chart(
@@ -838,12 +1123,17 @@ class MLChartGenerator:
             f"density={target_density:.2f} steps/sec)..."
         )
 
-        onset_p, sustain_p, intensity, arrow_p = self._predict_chunked(
+        onset_p, sustain_p, intensity = self._predict_chunked(
             analysis.feats_whitened, difficulty_id, target_density,
         )
+        arrow_features = None
+        if self.has_arrow_head:
+            arrow_features = self._encode_features_chunked(
+                analysis.feats_whitened, difficulty_id, target_density,
+            )
         return self._chart_from_signals(
-            analysis, difficulty, onset_p, sustain_p, intensity,
-            arrow_p=arrow_p, style=style,
+            analysis, difficulty, onset_p, sustain_p, intensity, style=style,
+            arrow_features=arrow_features,
         )
 
     def generate_from_audio(
@@ -886,7 +1176,7 @@ class MLChartGenerator:
             f"Running batched inference over {len(names)} difficulties: "
             f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
         )
-        onset_batch, sustain_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
+        onset_batch, sustain_batch, intensity_batch = self._predict_chunked_multi(
             analysis.feats_whitened, difficulty_ids, target_densities,
         )
 
@@ -895,7 +1185,6 @@ class MLChartGenerator:
             charts[name] = self._chart_from_signals(
                 analysis, name,
                 onset_batch[i], sustain_batch[i], intensity_batch[i],
-                arrow_p=arrow_batch[i],
                 style=style,
             )
         return charts
@@ -906,18 +1195,16 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_id: int,
         target_density: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Run model on overlapping chunks; return (onset_p, sustain_p, intensity, arrow_p).
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run model on overlapping chunks; return (onset_p, sustain_p, intensity).
 
-        Each output is shape [T] float32 (arrow_p is [T, 4]).
-        onset_p and sustain_p are sigmoids; intensity is clipped to [0, 1].
-        arrow_p is per-arrow onset probability.
+        Each output is shape [T] float32. onset_p and sustain_p are sigmoids;
+        intensity is the raw regression output (clipped to [0, 1]).
         """
         T = feats.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
         sustain_sum = np.zeros(T, dtype=np.float32)
         intensity_sum = np.zeros(T, dtype=np.float32)
-        arrow_sum = np.zeros((T, 4), dtype=np.float32)
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -941,37 +1228,159 @@ class MLChartGenerator:
             density_tensor = torch.tensor(
                 [density_norm], dtype=torch.float32, device=self.device,
             )
-            start_sec = float(start) / FRAMES_PER_SECOND
-            remaining_sec = max(0.0, float(T - end) / FRAMES_PER_SECOND)
+            start_seconds = float(start) / FRAMES_PER_SECOND
+            remaining_seconds = max(0.0, float(T - end) / FRAMES_PER_SECOND)
             start_seconds_tensor = torch.tensor(
-                [start_sec], dtype=torch.float32, device=self.device,
+                [start_seconds], dtype=torch.float32, device=self.device,
             )
             remaining_seconds_tensor = torch.tensor(
-                [remaining_sec], dtype=torch.float32, device=self.device,
+                [remaining_seconds], dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, sustain_logits, intensity_pred, _arrow = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]
             sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[0, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[0, :, 0]
-            arrow_v = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0, :, :]  # [T, 4]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[start:start + valid_len] += onset_p[:valid_len]
             sustain_sum[start:start + valid_len] += sustain_p[:valid_len]
             intensity_sum[start:start + valid_len] += intensity_v[:valid_len]
-            arrow_sum[start:start + valid_len] += arrow_v[:valid_len]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        arrow_avg = arrow_sum / counts[:, None]
-        return onset_avg, sustain_avg, intensity_avg, arrow_avg
+        return onset_avg, sustain_avg, intensity_avg
+
+    @torch.no_grad()
+    def _encode_features_chunked(
+        self,
+        feats: np.ndarray,
+        difficulty_id: int,
+        target_density: float,
+    ) -> np.ndarray:
+        """Backbone hidden features [T, H], stitched over overlapping chunks.
+
+        Mirrors :meth:`_predict_chunked`'s chunking but returns `model.encode`
+        output (averaged across overlaps), which the learned arrow head consumes
+        at onset frames. Only called when `self.has_arrow_head`.
+        """
+        T = feats.shape[0]
+        H = int(self.model.hidden_dim)
+        feat_sum = np.zeros((T, H), dtype=np.float32)
+        counts = np.zeros(T, dtype=np.float32)
+
+        stride = self.chunk_frames - self.overlap_frames
+        density_norm = (target_density - DENSITY_MEAN) / DENSITY_STD
+
+        for start in range(0, T, stride):
+            end = min(start + self.chunk_frames, T)
+            chunk = feats[start:end]
+            if chunk.shape[0] < self.chunk_frames:
+                pad = np.zeros(
+                    (self.chunk_frames - chunk.shape[0], self.n_in_channels),
+                    dtype=np.float32,
+                )
+                chunk = np.concatenate([chunk, pad], axis=0)
+
+            feats_tensor = torch.from_numpy(chunk).unsqueeze(0).to(self.device)
+            diff_tensor = torch.tensor([difficulty_id], dtype=torch.long, device=self.device)
+            density_tensor = torch.tensor([density_norm], dtype=torch.float32, device=self.device)
+            start_seconds = float(start) / FRAMES_PER_SECOND
+            remaining_seconds = max(0.0, float(T - end) / FRAMES_PER_SECOND)
+            ss_tensor = torch.tensor([start_seconds], dtype=torch.float32, device=self.device)
+            rs_tensor = torch.tensor([remaining_seconds], dtype=torch.float32, device=self.device)
+
+            feats_h = self.model.encode(
+                feats_tensor, diff_tensor, density_tensor, ss_tensor, rs_tensor,
+            )
+            fh = feats_h.float().cpu().numpy()[0]  # [chunk_frames, H]
+
+            valid_len = min(end - start, self.chunk_frames)
+            feat_sum[start:start + valid_len] += fh[:valid_len]
+            counts[start:start + valid_len] += 1.0
+
+        counts = np.maximum(counts, 1.0)[:, None]
+        return feat_sum / counts
+
+    @staticmethod
+    def _class_to_dirs(cls: int) -> List[Direction]:
+        code = ARROW_CLASS_CODES[cls]
+        return [ARROW_DIRECTIONS[i] for i in range(4) if code & (1 << i)]
+
+    @torch.no_grad()
+    def _decode_arrows(
+        self,
+        features: np.ndarray,
+        note_events: List[dict],
+    ) -> List[List[Direction]]:
+        """Autoregressively decode a panel set for each note event.
+
+        Greedy over the arrow head's logits, feeding the previous chosen class
+        back in (as at train time). A legality mask enforces: (a) the desired
+        arity — the event's tap/jump decision from the intensity head is
+        preserved — (b) no arrow that is still held, and (c) the 2-arrow
+        concurrency cap. Holds register into a local active-hold map so later
+        events see them. Returns one Direction list per event, aligned to
+        `note_events`. Only called when `self.has_arrow_head`.
+        """
+        T = features.shape[0]
+        feats_t = torch.from_numpy(features.astype(np.float32)).to(self.device)
+        n_classes = len(ARROW_CLASS_CODES)
+
+        active_holds: Dict[Direction, float] = {}
+        prev_class = ARROW_BOS_CLASS
+        last_time: Optional[float] = None
+        out: List[List[Direction]] = []
+
+        for ev in note_events:
+            t = float(ev['time'])
+            frame = max(0, min(int(round(t * FRAMES_PER_SECOND)), T - 1))
+            active_holds = {a: e for a, e in active_holds.items() if e > t}
+            held = set(active_holds.keys())
+            free_slots = max(0, 2 - len(held))
+            target_arity = 2 if int(ev.get('num_arrows', 1)) >= 2 else 1
+
+            dt = 0.0 if last_time is None else min(2.0, t - last_time)
+            h = feats_t[frame]
+            pc = torch.tensor(prev_class, dtype=torch.long, device=self.device)
+            dtt = torch.tensor(dt, dtype=torch.float32, device=self.device)
+            logits = self.model.arrow_head(h, pc, dtt)  # [n_classes]
+
+            mask = torch.ones(n_classes, dtype=torch.bool, device=self.device)  # True = forbid
+            for c in range(n_classes):
+                dirs = self._class_to_dirs(c)
+                if len(dirs) != target_arity:
+                    continue
+                if any(d in held for d in dirs):
+                    continue
+                if len(dirs) > free_slots:
+                    continue
+                mask[c] = False
+
+            if bool((~mask).any()):
+                cls = int(torch.argmax(logits.masked_fill(mask, float('-inf'))))
+            else:
+                # No legal class at the desired arity: relax to any non-held single.
+                singles = [c for c in range(n_classes)
+                           if len(self._class_to_dirs(c)) == 1
+                           and self._class_to_dirs(c)[0] not in held]
+                cls = singles[int(torch.argmax(logits[singles]))] if singles else int(torch.argmax(logits))
+
+            dirs = self._class_to_dirs(cls)
+            if ev.get('type') == 'hold':
+                end_time = t + float(ev.get('hold_duration', 0.0))
+                for d in dirs:
+                    active_holds[d] = end_time
+            out.append(dirs)
+            prev_class = cls
+            last_time = t
+        return out
 
     @torch.no_grad()
     def _predict_chunked_multi(
@@ -979,13 +1388,13 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_ids: List[int],
         target_densities: List[float],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Batched-multi version of :meth:`_predict_chunked`.
 
         Runs all difficulties as one forward pass per chunk: the shared audio
         features are broadcast across the batch dimension, while difficulty
-        and density vary per row. Returns four arrays: onset [B,T], sustain [B,T],
-        intensity [B,T], arrow [B,T,4] — one row per requested difficulty.
+        and density vary per row. Returns three arrays of shape ``[B, T]``,
+        one row per requested difficulty.
         """
         B = len(difficulty_ids)
         if B == 0:
@@ -1000,7 +1409,6 @@ class MLChartGenerator:
         onset_sum = np.zeros((B, T), dtype=np.float32)
         sustain_sum = np.zeros((B, T), dtype=np.float32)
         intensity_sum = np.zeros((B, T), dtype=np.float32)
-        arrow_sum = np.zeros((B, T, 4), dtype=np.float32)
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -1047,28 +1455,25 @@ class MLChartGenerator:
                 (B,), remaining_seconds, dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, sustain_logits, intensity_pred, _arrow = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[:, :, 0]
             sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[:, :, 0]
-            arrow_v = torch.sigmoid(arrow_logits.float()).cpu().numpy()[:, :, :]  # [B, T, 4]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
             sustain_sum[:, start:start + valid_len] += sustain_p[:, :valid_len]
             intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
-            arrow_sum[:, start:start + valid_len] += arrow_v[:, :valid_len]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        arrow_avg = arrow_sum / counts[:, None]
-        return onset_avg, sustain_avg, intensity_avg, arrow_avg
+        return onset_avg, sustain_avg, intensity_avg
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1100,44 +1505,6 @@ class MLChartGenerator:
             f += 1
         return end_cap - 1
 
-    def _snap_hold_duration(
-        self,
-        start_time: float,
-        raw_duration: float,
-        tempo: float,
-        beat_times: np.ndarray,
-        diff_config,
-    ) -> float:
-        """Snap the hold end time to the nearest beat subdivision.
-
-        Musical hold lengths are more playable when they align with the beat
-        grid. This snaps the hold end to the nearest 8th, quarter, half-note,
-        or whole-note boundary, preferring the closest match.
-        """
-        beat_interval = 60.0 / max(tempo, 1.0)
-        # Candidate hold lengths in seconds: 8th, quarter, half, whole note.
-        candidates = [
-            beat_interval / 2.0,   # 8th
-            beat_interval,         # quarter
-            beat_interval * 2.0,   # half
-            beat_interval * 4.0,   # whole note
-        ]
-        best = raw_duration
-        best_diff = float('inf')
-        for cand in candidates:
-            # Allow multiples (2x, 3x) for longer holds.
-            for mult in (1, 2, 3):
-                dur = cand * mult
-                if dur > diff_config.max_hold_duration * 1.2:
-                    break
-                if dur < diff_config.min_hold_duration * 0.8:
-                    continue
-                diff = abs(dur - raw_duration)
-                if diff < best_diff:
-                    best_diff = diff
-                    best = dur
-        return float(np.clip(best, diff_config.min_hold_duration, diff_config.max_hold_duration))
-
     def _postprocess(
         self,
         onset_p: np.ndarray,
@@ -1153,17 +1520,16 @@ class MLChartGenerator:
         audio_seed: int,
         style_knobs: Dict[str, float],
         timing_offset: float = 0.0,
-        arrow_p: Optional[np.ndarray] = None,
+        arrow_features: Optional[np.ndarray] = None,
+        pitch_class_curve: Optional[np.ndarray] = None,
     ) -> List[Step]:
         """
         Detect WHEN (NMS on onset_p) → classify type (jump/hold/tap) →
-        assign arrows via FootStateArrowAssigner driven by style knobs.
+        assign arrows: the learned arrow head when `arrow_features` is provided
+        (checkpoint has one), else FootStateArrowAssigner driven by style knobs.
 
         ``timing_offset`` (seconds) is the per-song calibration baked into every
         emitted step time; negative pulls notes earlier.
-
-        ``arrow_p`` [T, 4] (v8): per-arrow onset probabilities from the model,
-        used to bias arrow assignment toward musically-suggested directions.
         """
         T = onset_p.shape[0]
         logger.info(
@@ -1171,12 +1537,7 @@ class MLChartGenerator:
             f"mean={onset_p.mean():.4f} p95={np.percentile(onset_p, 95):.4f}"
         )
 
-        # BPM-aware min_gap: scale with tempo so 16th notes at 225 BPM (0.067s)
-        # still pass while keeping sparse charts clean at low BPM.
-        bpm = max(tempo, 60.0)
-        bpm_sixteenth = 60.0 / bpm / 4.0  # seconds per 16th note
         min_gap = max(diff_config.min_gap, self.min_note_gap)
-        min_gap = max(min_gap, bpm_sixteenth * 0.75)  # allow 16th runs
         nms_window_frames = max(1, int(round(min_gap * FRAMES_PER_SECOND)))
         jumps_allowed = 'jump' in diff_config.allowed_patterns
         holds_allowed = diff_config.hold_percentage > 0
@@ -1256,12 +1617,6 @@ class MLChartGenerator:
                         (end_frame - frame) / FRAMES_PER_SECOND,
                     ),
                 )
-                # Beat-align hold end time to the nearest musical subdivision
-                # so holds land on clean beat boundaries (8th, quarter, etc).
-                if self.snap_to_beats and len(beat_times) > 1 and hold_seconds > 0.05:
-                    hold_seconds = self._snap_hold_duration(
-                        t, hold_seconds, tempo, beat_times, diff_config,
-                    )
                 # Jumphold heuristic: rare; only when both intensity is high
                 # and the audio energy spikes hard at hold onset.
                 rms_at_frame = float(energy_curve[frame]) if energy_curve is not None else 0.0
@@ -1350,11 +1705,7 @@ class MLChartGenerator:
                 # Drop claims older than one beat from the current event so
                 # collision-avoidance stays a local effect.
                 step_16_local = float(local_interval[beat_idxs[0]]) / 4.0
-                # cap = 1.0 * step_16_local: accept notes up to one 16th-note
-                # away from any beat cell (≈117ms at 128 BPM).  Raised from
-                # 0.5× so on-beat notes don't fall through to the fallback
-                # _subdivision_from_grid when PLP drifts ~50-80 ms.
-                cap = 1.0 * step_16_local
+                cap = 0.5 * step_16_local
                 cutoff = t - float(local_interval[beat_idxs[0]])
                 recent_claims = [c for c in recent_claims if c >= cutoff]
 
@@ -1425,6 +1776,15 @@ class MLChartGenerator:
             kept.append(event)
         note_events = kept
 
+        # Learned step-selection: when the checkpoint has a trained arrow head,
+        # decode a panel set per event up front. The assigner below is still
+        # constructed — it tracks hold state for the safety net — but the arrow
+        # *choice* comes from the model. Older (headless) checkpoints leave this
+        # None and fall back to the assigner's algorithmic choice.
+        learned_arrows: Optional[List[List[Direction]]] = None
+        if self.has_arrow_head and arrow_features is not None and note_events:
+            learned_arrows = self._decode_arrows(arrow_features, note_events)
+
         # Arrow assignment.
         assigner = FootStateArrowAssigner(
             seed=audio_seed,
@@ -1432,6 +1792,8 @@ class MLChartGenerator:
             jack_rate=style_knobs.get('jack_rate', DEFAULT_STYLE_KNOBS['jack_rate']),
             crossover_rate=style_knobs.get('crossover_rate', DEFAULT_STYLE_KNOBS['crossover_rate']),
             stream_preference=style_knobs.get('stream_preference', DEFAULT_STYLE_KNOBS['stream_preference']),
+            candle_rate=style_knobs.get('candle_rate', DEFAULT_STYLE_KNOBS['candle_rate']),
+            spin_rate=style_knobs.get('spin_rate', DEFAULT_STYLE_KNOBS['spin_rate']),
         )
         steps: List[Step] = []
         max_stream_length = max(1, getattr(diff_config, 'max_stream_length', 0))
@@ -1458,6 +1820,38 @@ class MLChartGenerator:
                 ])
             else:
                 brightness = 0.5
+            if pitch_class_curve is not None and len(pitch_class_curve) > 0:
+                pitch_class = int(pitch_class_curve[
+                    min(frame_idx, len(pitch_class_curve) - 1)
+                ])
+            else:
+                pitch_class = -1
+
+            target_arity = 2 if event.get('num_arrows', 1) >= 2 else 1
+
+            # Learned-arrow branch: model already chose the panel set (legality
+            # and concurrency enforced during decode). Register holds for the
+            # safety net and emit; skip the assigner's algorithmic choice.
+            if learned_arrows is not None:
+                arrows = list(learned_arrows[i])
+                if event['type'] == 'hold' and arrows:
+                    end_time = t + event['hold_duration']
+                    for a in arrows:
+                        assigner.active_holds[a] = end_time
+                    steps.append(Step(
+                        time=emit_t, arrows=arrows, step_type=StepType.HOLD,
+                        hold_duration=round(event['hold_duration'], 3),
+                        beat_subdivision=subdivision,
+                    ))
+                elif arrows:
+                    held_now = assigner._held_arrows(t)
+                    if any(a in held_now for a in arrows):
+                        continue
+                    steps.append(Step(
+                        time=emit_t, arrows=arrows, step_type=StepType.TAP,
+                        beat_subdivision=subdivision,
+                    ))
+                continue
 
             if max_stream_length > 0:
                 assigner.maybe_start_stream(
@@ -1467,19 +1861,17 @@ class MLChartGenerator:
                     time=t,
                 )
 
-            target_arity = 2 if event.get('num_arrows', 1) >= 2 else 1
-
             if event['type'] == 'hold':
                 if target_arity >= 2:
                     # Jumphold: assign two arrows, register both as active holds.
-                    arrows = assigner.assign_jump(t, energy, brightness)
+                    arrows = assigner.assign_jump(t, energy, brightness, pitch_class)
                     if arrows:
                         end_time = t + event['hold_duration']
                         for a in arrows:
                             assigner.active_holds[a] = end_time
                 else:
                     arrows = [assigner.start_hold(
-                        t, event['hold_duration'], energy, brightness,
+                        t, event['hold_duration'], energy, brightness, pitch_class,
                     )]
                 steps.append(Step(
                     time=emit_t,
@@ -1490,9 +1882,14 @@ class MLChartGenerator:
                 ))
             else:
                 if target_arity >= 2:
-                    arrows = assigner.assign_jump(t, energy, brightness)
+                    arrows = assigner.assign_jump(t, energy, brightness, pitch_class)
                 else:
-                    arrows = [assigner.assign_single(t, energy, brightness)]
+                    arrows = [assigner.assign_single(t, energy, brightness, pitch_class)]
+                # Safety net: drop the step if any assigned arrow is still
+                # held (e.g. all four panels occupied by jumpholds).
+                held_now = assigner._held_arrows(t)
+                if any(a in held_now for a in arrows):
+                    continue
                 steps.append(Step(
                     time=emit_t,
                     arrows=arrows,
@@ -1541,16 +1938,8 @@ class MLChartGenerator:
         ):
             return BeatSubdivision.TWELFTH
 
-        # The Quarter band is intentionally wide (~44% of the beat) because
-        # librosa beat tracking (PLP or beat_track fallback) can drift
-        # 50-100 ms from the true musical beat. A narrow band would
-        # misclassify on-beat notes as 8th/16th/12th → wrong arrow color.
-        # At 128 BPM (468 ms/beat) this catches notes within ~103 ms of the
-        # beat; at 60 BPM (1000 ms) within ~220 ms — well within the timing
-        # window where a note reads as "on the beat" to the player.
-        if beat_position < 0.22 or beat_position > 0.78:
+        if beat_position < 0.125 or beat_position > 0.875:
             return BeatSubdivision.QUARTER
-        # Eighth band (±0.15 around the half-beat = 30% of beat).
-        if abs(beat_position - 0.5) < 0.15:
+        if abs(beat_position - 0.5) < 0.125:
             return BeatSubdivision.EIGHTH
         return BeatSubdivision.SIXTEENTH

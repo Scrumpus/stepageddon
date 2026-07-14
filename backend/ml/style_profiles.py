@@ -318,8 +318,8 @@ def main():
     parser = argparse.ArgumentParser(description='Cluster style profiles from prepared data.')
     parser.add_argument('--data-dir', type=str, required=True,
                         help='Directory containing manifest.json + per-song .npz files.')
-    parser.add_argument('--k', type=int, default=12,
-                        help='Number of clusters (default: 12).')
+    parser.add_argument('--k', type=int, default=6,
+                        help='Number of clusters (default: 6).')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output', type=str, default=None,
                         help='Output path. Defaults to <data-dir>/style_profiles.json.')
