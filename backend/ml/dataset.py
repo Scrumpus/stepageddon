@@ -282,6 +282,7 @@ class StepChartDataset(Dataset):
         labels_chunk = labels[start:end].astype(np.int64)
         sustain_chunk = sustain_full[start:end].astype(np.float32)
         intensity_chunk = intensity_full[start:end].astype(np.float32)
+        arrow_labels_chunk = arrow_labels[start:end].astype(np.float32)  # [T, 4]
         difficulty = entry['difficulty_id']
 
         # Per-chunk step density (steps/sec): any frame with a note event.
@@ -333,6 +334,7 @@ class StepChartDataset(Dataset):
             torch.from_numpy(intensity_chunk).unsqueeze(-1),  # [T, 1]
             torch.tensor(start_seconds, dtype=torch.float32),
             torch.tensor(remaining_seconds, dtype=torch.float32),
+            torch.from_numpy(arrow_labels_chunk),             # [T, 4]
         )
 
     # ------------------------------------------------------------------
