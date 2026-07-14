@@ -154,9 +154,12 @@ def _to_notes(steps: Sequence[Union[Step, dict]]) -> List[_Note]:
 # Foot-flow inference (min-crossover / min-double-step DP over single runs)
 # ---------------------------------------------------------------------------
 
-# Cost weights: forbid double-steps hardest, then disallowed crossovers, then
-# keep crossed stance short, then minor movement. Kept as a natural footing model.
-_W_DOUBLE_STEP = 100.0
+# Cost weights: forbid double-steps hardest, heavily penalise a crossed run that
+# exceeds the difficulty budget (so the DP finds a min-*max*-run footing, not just
+# a min-*total*-cross one), then keep crossed stance short, then minor movement.
+_W_DOUBLE_STEP = 100.0        # fast same-foot move across panels — unplayable
+_W_OVER_BUDGET = 60.0         # crossed run beyond the difficulty budget
+_W_SLOW_DOUBLE_STEP = 5.0     # slow same-foot shuffle/footswitch — legal, mildly costly
 _W_CROSS_STEP = 4.0
 _W_MOVE = 0.1
 
@@ -203,6 +206,7 @@ class FootFlowInference:
             start.key(): (0.0, start, [], [])
         }
         pinned: Optional[Tuple[Foot, Direction, float]] = None  # (foot, panel, until)
+        prev_t: Optional[float] = None
 
         for n in notes:
             # Expire a pin whose hold has ended before this note.
@@ -212,8 +216,11 @@ class FootFlowInference:
             if len(n.arrows) >= 2:
                 frontier = self._commit_jump(frontier, n)
                 pinned = None  # a jump re-plants both feet
+                prev_t = n.time
                 continue
 
+            dt = (n.time - prev_t) if prev_t is not None else 1e9
+            prev_t = n.time
             panel = n.arrows[0]
             if n.is_hold:
                 # A hold is a barrier: commit the best stance, plant the hold foot,
@@ -223,19 +230,19 @@ class FootFlowInference:
                 continue
 
             # Ordinary single: expand the DP frontier.
-            frontier = self._expand_single(frontier, n, panel, pinned)
+            frontier = self._expand_single(frontier, n, panel, pinned, dt)
 
         # Reconstruct the min-cost path.
         best = min(frontier.values(), key=lambda v: v[0])
         return best[2], best[3]
 
-    def _expand_single(self, frontier, n: _Note, panel: Direction, pinned):
+    def _expand_single(self, frontier, n: _Note, panel: Direction, pinned, dt: float):
         new_frontier: Dict[Tuple, Tuple] = {}
         for cost, stance, feet, stances in frontier.values():
             for foot in ('L', 'R'):
                 if pinned is not None and pinned[0] == foot and pinned[1] != panel:
                     continue  # this foot is pinned to a different panel by a hold
-                step_cost = self._single_cost(stance, foot, panel)
+                step_cost = self._single_cost(stance, foot, panel, dt)
                 ns = _apply_single(stance, foot, panel)
                 nkey = ns.key()
                 total = cost + step_cost
@@ -254,33 +261,34 @@ class FootFlowInference:
                 break
         return new_frontier
 
-    def _single_cost(self, stance: _Stance, foot: Foot, panel: Direction) -> float:
+    def _single_cost(self, stance: _Stance, foot: Foot, panel: Direction, dt: float) -> float:
         cost = 0.0
         old_panel = _panel_of(stance, foot)
-        # Double-step: same foot as last note, moving to a different panel.
+        # Double-step: same foot as last note, moving to a different panel. A slow
+        # double-step (a legal footswitch/shuffle) is cheap; a fast one is forbidden.
         if stance.last_foot == foot and old_panel != panel:
-            cost += _W_DOUBLE_STEP
+            cost += _W_DOUBLE_STEP if dt < self.spec.double_step_min_dt else _W_SLOW_DOUBLE_STEP
         ns = _apply_single(stance, foot, panel)
         if is_crossed(ns.left_panel, ns.right_panel):
             cost += _W_CROSS_STEP
+            # A crossed run beyond the difficulty budget is much worse than a few
+            # extra isolated crossovers — steer the DP toward a spread footing.
+            if ns.crossed_run > self.spec.uncross_within:
+                cost += _W_OVER_BUDGET
         cost += _W_MOVE * abs(PANEL_X[old_panel] - PANEL_X[panel])
         return cost
 
     def _commit_single_barrier(self, frontier, n: _Note, panel: Direction, pinned):
-        # Choose the free foot for the hold (respect an existing pin).
+        # A hold is naturally taken by the foot that OWNS its panel (LEFT/DOWN -> left,
+        # UP/RIGHT -> right), which keeps the hold un-crossed — matching how the
+        # generator foots holds. Fall back to the other foot only if the owner is
+        # already pinned by another active hold.
         cost0, stance0, feet0, stances0 = min(frontier.values(), key=lambda v: v[0])
-        if pinned is not None and pinned[0] == 'L':
-            foot = 'R'
-        elif pinned is not None and pinned[0] == 'R':
-            foot = 'L'
+        owner = 'L' if panel in (Direction.LEFT, Direction.DOWN) else 'R'
+        if pinned is not None and pinned[0] == owner:
+            foot = 'R' if owner == 'L' else 'L'
         else:
-            # Prefer the foot that already owns/reaches the panel; else alternate.
-            if stance0.left_panel == panel:
-                foot = 'L'
-            elif stance0.right_panel == panel:
-                foot = 'R'
-            else:
-                foot = 'R' if stance0.last_foot == 'L' else 'L'
+            foot = owner
         ns = _apply_single(stance0, foot, panel)
         committed = {ns.key(): (cost0, ns, feet0 + [foot], stances0 + [ns])}
         return committed, foot
