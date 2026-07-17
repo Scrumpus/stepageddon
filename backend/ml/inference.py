@@ -30,6 +30,10 @@ from src.charts.schemas import (
     Chart, Step, StepType, Direction, BeatSubdivision,
 )
 from src.generation.constants import get_difficulty_config
+from ml.playability import (
+    PANEL_X as _PANEL_X,
+    spec_for as playability_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,271 +79,405 @@ DEFAULT_STYLE_KNOBS: Dict[str, float] = {
 }
 
 
-class FootStateArrowAssigner:
+class FootFlowAssigner:
+    """Whole-timeline, foot-flow arrow assignment.
+
+    Consumes the *finalized* ``note_events`` timeline (times, tap/hold/jump type,
+    and beat subdivisions are already decided by ``_postprocess``) and chooses the
+    arrows. Unlike the v6/v7 online assigner, it:
+
+    * Picks the FOOT before the panel, so the foot model and the panel it lands on
+      can never disagree (kills the desync -> forced-double-step bug).
+    * Keeps each foot on its own panels by default (left->LEFT/DOWN, right->UP/RIGHT),
+      which is un-crossed and double-step-free *by construction*.
+    * Only jacks when the local interval clears the per-difficulty ``jack_min_dt``.
+    * Only crosses over when allowed and spacing-safe, and lets the surrounding
+      alternation keep the crossed run short (validated by ``ml.playability``;
+      the harness reports any run that exceeds the difficulty's budget).
+    * Derives streams from the runs already present in the timeline -- no invented
+      pattern injection -- and layers musical texture on top: bar-fingerprint motif
+      repetition (identical rhythmic figures step identically), strong-beat emphasis
+      (outer panels on strong beats), and per-section contrast.
+
+    Determinism: panel textures come from a stable integer fingerprint (not Python's
+    randomized ``hash``); a single ``random.Random(seed)`` breaks the few remaining
+    ties. A given song regenerates identically.
     """
-    Assigns arrows to note events using foot-state tracking, a seeded PRNG,
-    and selectable style preferences (jack_rate, crossover_rate,
-    stream_preference).
 
-    The crossover/stream/jack branches existed in v6; what's new in v7 is
-    that the style profile drives the rates directly, replacing the
-    energy-only thresholds.
-    """
-
-    LEFT_FOOT_PANELS = [Direction.LEFT, Direction.DOWN]
-    RIGHT_FOOT_PANELS = [Direction.UP, Direction.RIGHT]
-
-    ALL_PANELS = [Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT]
-
-    STREAM_PATTERNS = [
-        [0, 2, 1, 3],  # L U D R — standard weave
-        [3, 1, 2, 0],  # R D U L — reverse weave
-        [0, 1, 2, 3],  # L D U R — staircase up
-        [3, 2, 1, 0],  # R U D L — staircase down
-        [0, 3, 1, 2],  # L R D U — wide crossover
-        [1, 2, 0, 3],  # D U L R — inside-out
-    ]
-
+    OUTER = {'L': Direction.LEFT, 'R': Direction.RIGHT}
+    INNER = {'L': Direction.DOWN, 'R': Direction.UP}
+    OWN_PANELS = {
+        'L': (Direction.LEFT, Direction.DOWN),
+        'R': (Direction.UP, Direction.RIGHT),
+    }
+    ALL_PANELS = (Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT)
+    # Column index of each panel, matching the model's arrow head (L/D/U/R).
+    COL = {Direction.LEFT: 0, Direction.DOWN: 1, Direction.UP: 2, Direction.RIGHT: 3}
+    # Physically sane two-panel jump pairs (all un-crossed).
     JUMP_PATTERNS = [
         (Direction.LEFT, Direction.RIGHT),
         (Direction.DOWN, Direction.UP),
         (Direction.LEFT, Direction.UP),
         (Direction.DOWN, Direction.RIGHT),
     ]
+    _SUB_CODE = {
+        BeatSubdivision.QUARTER: 0,
+        BeatSubdivision.EIGHTH: 1,
+        BeatSubdivision.TWELFTH: 2,
+        BeatSubdivision.SIXTEENTH: 3,
+    }
 
     def __init__(
         self,
+        difficulty: str,
         seed: int = 0,
         allowed_patterns: Optional[List[str]] = None,
         jack_rate: float = 0.05,
         crossover_rate: float = 0.10,
-        stream_preference: float = 0.5,
+        section_aware: bool = True,
     ):
+        self.difficulty = difficulty
+        self.spec = playability_spec(difficulty)
         self.rng = random.Random(seed)
-        self.allowed_patterns = set(allowed_patterns or ['single'])
+        self.allowed = set(allowed_patterns or ['single'])
         self.jack_rate = float(np.clip(jack_rate, 0.0, 1.0))
         self.crossover_rate = float(np.clip(crossover_rate, 0.0, 1.0))
-        self.stream_preference = float(np.clip(stream_preference, 0.0, 1.0))
-        self.reset()
+        self.section_aware = section_aware
 
-    def reset(self):
-        self.last_foot = 'right'
-        self.left_pos = Direction.LEFT
-        self.right_pos = Direction.RIGHT
-        # Per-arrow active hold map: arrow -> end_time. Replaces the v6
-        # singleton (held_foot, hold_end_time) so jumpholds and back-to-back
-        # holds don't overwrite each other's state.
-        self.active_holds: Dict[Direction, float] = {}
-        self._step_count = 0
-        self._stream_pattern: Optional[List[int]] = None
-        self._stream_idx: int = 0
-        self._last_arrow: Optional[Direction] = None
+        self._jacks_ok = difficulty in ('medium', 'hard', 'challenge')
+        self._crossovers_ok = (
+            'crossover' in self.allowed and self.spec.crossovers_allowed
+        )
+        self._jumps_ok = 'jump' in self.allowed
 
-    def _purge_holds(self, time: float) -> None:
-        if not self.active_holds:
-            return
-        self.active_holds = {
-            a: e for a, e in self.active_holds.items() if e > time
-        }
+    # -- foot / stance state -------------------------------------------------
 
-    def _held_arrows(self, time: float) -> Set[Direction]:
-        self._purge_holds(time)
-        return set(self.active_holds.keys())
+    def _reset(self):
+        self.left_panel = Direction.LEFT
+        self.right_panel = Direction.RIGHT
+        self.last_foot: Optional[str] = 'R'   # first single alternates to L
+        self.last_arrow: Optional[Direction] = None
+        self.prev_single_time: Optional[float] = None
+        # active_holds: panel -> (end_time, foot)
+        self.active_holds: Dict[Direction, Tuple[float, str]] = {}
+        self.crossed = False
+        self.crossed_len = 0
+        self.arrow_probs: Optional[np.ndarray] = None  # [T,4] learned direction (v8)
+        self._cur_pref: Optional[np.ndarray] = None    # 4-vector for the current event
 
-    def _held_feet(self, time: float) -> Set[str]:
-        feet: Set[str] = set()
-        for a in self._held_arrows(time):
-            if a in self.LEFT_FOOT_PANELS:
-                feet.add('left')
-            if a in self.RIGHT_FOOT_PANELS:
-                feet.add('right')
-        return feet
+    def _purge_holds(self, t: float):
+        if self.active_holds:
+            self.active_holds = {
+                p: (e, f) for p, (e, f) in self.active_holds.items() if e > t + 1e-6
+            }
 
-    def _pick_foot(self, time: float) -> str:
-        held_feet = self._held_feet(time)
-        # Prefer a free foot. If both held (jumphold + tap case), fall back
-        # to alternation; the tap is non-claiming so this is harmless.
-        if 'left' in held_feet and 'right' not in held_feet:
-            return 'right'
-        if 'right' in held_feet and 'left' not in held_feet:
-            return 'left'
-        return 'right' if self.last_foot == 'left' else 'left'
+    def _pinned_feet(self, t: float) -> set:
+        self._purge_holds(t)
+        return {f for (_, f) in self.active_holds.values()}
 
-    def _panels_for_foot(self, foot: str) -> List[Direction]:
-        return self.LEFT_FOOT_PANELS if foot == 'left' else self.RIGHT_FOOT_PANELS
-
-    def _update_foot(self, foot: str, arrow: Direction):
-        if foot == 'left':
-            self.left_pos = arrow
+    def _place(self, foot: str, panel: Direction):
+        if foot == 'L':
+            self.left_panel = panel
         else:
-            self.right_pos = arrow
+            self.right_panel = panel
         self.last_foot = foot
-        self._last_arrow = arrow
+        self.last_arrow = panel
+        self.crossed = _PANEL_X[self.left_panel] > _PANEL_X[self.right_panel]
+        self.crossed_len = self.crossed_len + 1 if self.crossed else 0
 
-    def assign_single(self, time: float, energy: float = 0.5,
-                       brightness: float = 0.5) -> Direction:
-        # Active stream — follow the pattern. Must not emit a stream arrow
-        # onto a panel that is still held from a prior hold_start.
-        if self._stream_pattern is not None:
-            arrow_idx = self._stream_pattern[self._stream_idx]
-            self._stream_idx += 1
-            if self._stream_idx >= len(self._stream_pattern):
-                self._stream_pattern = None
-                self._stream_idx = 0
-            arrow = self.ALL_PANELS[arrow_idx]
-            if arrow in self._held_arrows(time):
-                free = [p for p in self.ALL_PANELS if p not in self.active_holds]
-                if free:
-                    arrow = free[0]
-                else:
-                    # All four held — abort the stream.
-                    self._stream_pattern = None
-                    self._stream_idx = 0
-            foot = self._pick_foot(time)
-            self._update_foot(foot, arrow)
-            self._step_count += 1
-            return arrow
+    # -- public entry point --------------------------------------------------
 
-        # Jack branch: with profile-controlled probability, repeat the last
-        # arrow rather than alternating feet. Must not jack onto an arrow
-        # that is still held from a prior hold_start.
-        held_now = self._held_arrows(time)
+    def assign(
+        self,
+        note_events: List[dict],
+        energy_curve: Optional[np.ndarray],
+        brightness_curve: Optional[np.ndarray],
+        beat_times: np.ndarray,
+        arrow_probs: Optional[np.ndarray] = None,
+    ) -> List[List[Direction]]:
+        """Return the arrow list for each event, aligned with ``note_events``.
+
+        ``arrow_probs`` ([T,4] per-frame L/D/U/R probabilities from the v8 learned
+        direction head, or None) is a *preference*: it steers panel choice within
+        the foot the flow model picked, and jump-pair choice — the playability
+        constraints still decide the foot and veto anything ungettable.
+        """
+        self._reset()
+        self.arrow_probs = arrow_probs
+        bts = np.asarray(beat_times, dtype=np.float64) if beat_times is not None else np.array([])
+        sections = self._detect_sections(note_events, energy_curve)
+        bars, textures, strongs = self._rhythm_features(note_events, bts)
+
+        out: List[List[Direction]] = []
+        cur_section = -1
+        for i, ev in enumerate(note_events):
+            t = float(ev['time'])
+            if self.section_aware and sections[i] != cur_section:
+                cur_section = sections[i]  # section contrast: flip base texture
+            energy = self._sample(energy_curve, t)
+            num = int(ev.get('num_arrows', 1))
+            texture = textures[i] ^ (cur_section & 1)
+            strong = strongs[i]
+            self._cur_pref = self._pref_at(t)
+
+            if ev['type'] == 'hold':
+                arrows = self._assign_hold(ev, t, num, energy, strong, texture)
+            elif num >= 2 and self._jumps_ok:
+                arrows = self._assign_jump(t, energy, strong)
+            else:
+                a = self._assign_single(t, energy, strong, texture)
+                arrows = [a] if a is not None else []
+            out.append(arrows)
+        return out
+
+    # -- single-note assignment ---------------------------------------------
+
+    def _free_foot(self, t: float) -> Optional[str]:
+        pinned = self._pinned_feet(t)
+        if 'L' in pinned and 'R' in pinned:
+            return None  # both feet committed to holds
+        if 'L' in pinned:
+            return 'R'
+        if 'R' in pinned:
+            return 'L'
+        return 'L' if self.last_foot == 'R' else 'R'  # both free -> alternate
+
+    def _assign_single(self, t, energy, strong, texture) -> Optional[Direction]:
+        dt = (t - self.prev_single_time) if self.prev_single_time is not None else 1e9
+        foot = self._free_foot(t)
+        if foot is None:
+            return None  # both feet holding; concurrency cap should prevent this
+        held = set(self.active_holds)
+
+        # 1) Deliberate jack: same foot repeats the same panel. Only when spacing is
+        #    physically repeatable and nothing is being held.
         if (
-            self._last_arrow is not None
-            and self.jack_rate > 0.0
+            self._jacks_ok
+            and self.last_arrow is not None
+            and self.last_foot is not None
+            and dt >= self.spec.jack_min_dt
+            and not self.active_holds
+            and self.last_arrow not in held
             and self.rng.random() < self.jack_rate
-            and not self._held_feet(time)
-            and self._last_arrow not in held_now
         ):
-            self._step_count += 1
-            arrow = self._last_arrow
-            # Don't flip feet for a jack — same foot taps again.
-            self._update_foot(self.last_foot, arrow)
-            return arrow
+            self._place(self.last_foot, self.last_arrow)
+            self.prev_single_time = t
+            return self.last_arrow
 
-        foot = self._pick_foot(time)
-        panels = self._panels_for_foot(foot)
-        current_pos = self.left_pos if foot == 'left' else self.right_pos
-        self._step_count += 1
-
-        # Crossover branch: pick from the OTHER foot's panels.
+        # 2) Bounded crossover: step the free foot onto the opposite side. The next
+        #    alternation naturally returns, so the crossed run stays short. Guarded
+        #    against colliding with the other foot's current panel or a hold.
         if (
-            'crossover' in self.allowed_patterns
-            and self.crossover_rate > 0.0
+            self._crossovers_ok
+            and not self.crossed
+            and dt >= self.spec.jack_min_dt
             and self.rng.random() < self.crossover_rate
         ):
-            cross_panels = self._panels_for_foot(
-                'right' if foot == 'left' else 'left'
-            )
-            arrow = self.rng.choice(cross_panels)
+            other_panel = self.right_panel if foot == 'L' else self.left_panel
+            cross_panel = self.OUTER['R' if foot == 'L' else 'L']
+            if cross_panel not in held and cross_panel != other_panel:
+                self._place(foot, cross_panel)
+                self.prev_single_time = t
+                return cross_panel
+
+        # Panels to steer away from: the other foot's current panel (collision) and,
+        # when notes are too close to jack, the panel we just hit (accidental jack).
+        other_panel = self.right_panel if foot == 'L' else self.left_panel
+        avoid = {other_panel}
+        if self.last_arrow is not None and dt < self.spec.jack_min_dt:
+            avoid.add(self.last_arrow)
+
+        # 3) If the crossed run has reached the difficulty's budget, force the
+        #    crossed foot home so the run ends within uncross_within. The crossed
+        #    foot is also the one alternation wants next, so this isn't a double-step.
+        if self.crossed and self.crossed_len >= self.spec.uncross_within:
+            uf, upanel = self._forced_uncross(held)
+            self._place(uf, upanel)
+            self.prev_single_time = t
+            return upanel
+
+        # 4) Normal musical placement on the foot's own panels (also un-crosses
+        #    gradually while a crossover is in flight).
+        panel = self._pick_own_panel(foot, strong, held, texture, avoid)
+        self._place(foot, panel)
+        self.prev_single_time = t
+        return panel
+
+    def _forced_uncross(self, held) -> Tuple[str, Direction]:
+        """Return (foot, panel) that is guaranteed to leave an un-crossed stance:
+        pull the left foot to LEFT (min x) or the right foot to RIGHT (max x)."""
+        if (Direction.LEFT not in held and self.right_panel != Direction.LEFT):
+            return 'L', Direction.LEFT
+        if (Direction.RIGHT not in held and self.left_panel != Direction.RIGHT):
+            return 'R', Direction.RIGHT
+        # Degenerate fallback: any free own-side panel.
+        if Direction.DOWN not in held:
+            return 'L', Direction.DOWN
+        return 'R', Direction.UP
+
+    def _pick_own_panel(self, foot, strong, held, texture, avoid=frozenset()) -> Direction:
+        outer, inner = self.OUTER[foot], self.INNER[foot]
+        if self._cur_pref is not None:
+            # Learned direction proposes: pick the foot's panel the model prefers.
+            want_outer = float(self._cur_pref[self.COL[outer]]) >= float(self._cur_pref[self.COL[inner]])
         else:
-            if brightness > 0.6:
-                weights = [0.7, 0.3]
-            elif brightness < 0.4:
-                weights = [0.3, 0.7]
-            else:
-                weights = [0.5, 0.5]
+            # Strong beats emphasize the outer (side) arrow; otherwise the
+            # deterministic per-rhythm texture bit chooses, so identical figures
+            # step identically.
+            want_outer = strong or bool(texture)
+        first = outer if want_outer else inner
+        second = inner if want_outer else outer
+        for cand in (first, second):        # prefer own panels, honoring avoid
+            if cand not in held and cand not in avoid:
+                return cand
+        for cand in (first, second):        # relax avoid before leaving own panels
+            if cand not in held:
+                return cand
+        for cand in self.ALL_PANELS:         # both own panels held (rare)
+            if cand not in held and cand not in avoid:
+                return cand
+        for cand in self.ALL_PANELS:
+            if cand not in held:
+                return cand
+        return first
 
-            if current_pos == panels[0]:
-                weights[1] += 0.2
-            else:
-                weights[0] += 0.2
+    # -- hold assignment -----------------------------------------------------
 
-            total = weights[0] + weights[1]
-            arrow = panels[0] if self.rng.random() < weights[0] / total else panels[1]
+    def _assign_hold(self, ev, t, num, energy, strong, texture):
+        if num >= 2 and self._jumps_ok:
+            arrows = self._assign_jump(t, energy, strong)
+            end = t + float(ev['hold_duration'])
+            for a in arrows:
+                foot = 'L' if a in self.OWN_PANELS['L'] else 'R'
+                self.active_holds[a] = (end, foot)
+            return arrows
+        foot = self._free_foot(t)
+        if foot is None:
+            return []
+        held = set(self.active_holds)
+        # Same jack/collision avoidance as singles: don't start a hold on the panel
+        # we just tapped (quick re-press) or on the other foot's current panel.
+        dt = (t - self.prev_single_time) if self.prev_single_time is not None else 1e9
+        other_panel = self.right_panel if foot == 'L' else self.left_panel
+        avoid = {other_panel}
+        if self.last_arrow is not None and dt < self.spec.jack_min_dt:
+            avoid.add(self.last_arrow)
+        panel = self._pick_own_panel(foot, strong, held, texture, avoid)
+        self._place(foot, panel)
+        self.active_holds[panel] = (t + float(ev['hold_duration']), foot)
+        self.prev_single_time = t
+        return [panel]
 
-        # Guard: if the chosen arrow is still held from a prior hold_start,
-        # swap to any free panel (same foot first, then the other foot).
-        if arrow in self._held_arrows(time):
-            same_foot = [p for p in panels if p not in self.active_holds]
-            if same_foot:
-                arrow = same_foot[0]
-            else:
-                free = [p for p in self.ALL_PANELS if p not in self.active_holds]
-                if free:
-                    arrow = free[0]
-                    foot = 'left' if arrow in self.LEFT_FOOT_PANELS else 'right'
+    # -- jump assignment -----------------------------------------------------
 
-        self._update_foot(foot, arrow)
-        return arrow
-
-    def assign_jump(self, time: float, energy: float = 0.5,
-                     brightness: float = 0.5) -> List[Direction]:
-        if self._held_feet(time):
-            return [self.assign_single(time, energy, brightness)]
-
+    def _assign_jump(self, t, energy, strong) -> List[Direction]:
+        if self._pinned_feet(t):
+            a = self._assign_single(t, energy, strong, 0)  # a foot is holding -> tap
+            return [a] if a is not None else []
+        held = set(self.active_holds)
         if energy > 0.7:
-            candidates = [self.JUMP_PATTERNS[0], self.JUMP_PATTERNS[2],
-                          self.JUMP_PATTERNS[3]]
+            candidates = [self.JUMP_PATTERNS[0], self.JUMP_PATTERNS[2], self.JUMP_PATTERNS[3]]
         elif energy < 0.3:
             candidates = [self.JUMP_PATTERNS[1]]
         else:
             candidates = list(self.JUMP_PATTERNS)
+        if strong:
+            candidates = [self.JUMP_PATTERNS[0]] + candidates  # emphasize L/R on strong beats
+        if self._cur_pref is not None:
+            # Learned direction proposes the pair: rank by summed column preference.
+            candidates = sorted(
+                candidates,
+                key=lambda p: -(float(self._cur_pref[self.COL[p[0]]])
+                                + float(self._cur_pref[self.COL[p[1]]])),
+            )
+        else:
+            self.rng.shuffle(candidates)
+        for a, b in candidates:
+            if a not in held and b not in held:
+                self.left_panel, self.right_panel = a, b
+                self.last_foot = None  # either foot may lead the next note
+                self.last_arrow = b
+                self.crossed = False
+                return [a, b]
+        a = self._assign_single(t, energy, strong, 0)  # all collide -> tap fallback
+        return [a] if a is not None else []
 
-        held_now = self._held_arrows(time)
-        # Shuffle so repeated collisions don't always fall back the same way.
-        self.rng.shuffle(candidates)
-        pattern = None
-        for c in candidates:
-            if c[0] not in held_now and c[1] not in held_now:
-                pattern = c
-                break
-        # If every jump pattern collides with active holds, emit a tap.
-        if pattern is None:
-            return [self.assign_single(time, energy, brightness)]
+    # -- rhythm / musical helpers -------------------------------------------
 
-        self._step_count += 1
-        self.left_pos = pattern[0]
-        self.right_pos = pattern[1]
-        self.last_foot = 'right'
-        self._last_arrow = pattern[1]
-        return [pattern[0], pattern[1]]
+    def _sample(self, curve: Optional[np.ndarray], t: float) -> float:
+        if curve is None or len(curve) == 0:
+            return 0.5
+        idx = int(round(t * FRAMES_PER_SECOND))
+        idx = max(0, min(idx, len(curve) - 1))
+        return float(curve[idx])
 
-    def start_hold(self, time: float, duration: float,
-                    energy: float = 0.5, brightness: float = 0.5) -> Direction:
-        self._purge_holds(time)
-        arrow = self.assign_single(time, energy, brightness)
-        # Same-arrow collision guard: if assign_single landed on an already-
-        # held arrow (e.g. via crossover or jack with stale state), swap to
-        # any free panel. With the concurrency cap upstream, a free panel is
-        # guaranteed to exist.
-        if arrow in self.active_holds:
-            free = [p for p in self.ALL_PANELS if p not in self.active_holds]
-            if free:
-                arrow = free[0]
-                foot = 'left' if arrow in self.LEFT_FOOT_PANELS else 'right'
-                self._update_foot(foot, arrow)
-        self.active_holds[arrow] = time + duration
-        return arrow
+    def _pref_at(self, t: float) -> Optional[np.ndarray]:
+        """The learned [L,D,U,R] preference vector at time ``t``, or None."""
+        if self.arrow_probs is None or len(self.arrow_probs) == 0:
+            return None
+        idx = int(round(t * FRAMES_PER_SECOND))
+        idx = max(0, min(idx, len(self.arrow_probs) - 1))
+        return self.arrow_probs[idx]
 
-    def maybe_start_stream(self, energy: float, remaining_events: int,
-                            max_stream_length: int, time: float = 0.0) -> bool:
-        if 'stream' not in self.allowed_patterns or max_stream_length == 0:
-            return False
-        if self._stream_pattern is not None:
-            return False
-        if self._held_feet(time):
-            return False
+    def _rhythm_features(self, note_events, bts):
+        """Per-event (bar index, texture bit, strong-beat flag).
 
-        # stream_preference is the per-profile bias; energy modulates it so
-        # high-energy sections still dominate the streamed parts.
-        stream_chance = max(
-            0.0, 0.5 * self.stream_preference + 0.5 * (energy - 0.5),
-        )
-        stream_chance = min(stream_chance, 0.95)
-        if self.rng.random() >= stream_chance:
-            return False
+        The texture bit is a stable function of the bar's rhythmic fingerprint and
+        the note's position in the bar, so two bars with the same rhythm produce the
+        same outer/inner footing texture -- motif repetition without storing state.
+        """
+        n = len(note_events)
+        bars = [0] * n
+        strongs = [False] * n
+        interval = float(np.median(np.diff(bts))) if bts.size > 1 else 0.5
+        for i, ev in enumerate(note_events):
+            t = float(ev['time'])
+            if bts.size >= 2:
+                bi = int(np.searchsorted(bts, t))
+                bars[i] = max(0, (bi - 1) // 4)
+                nearest = min((abs(t - bts[j]) for j in (bi - 1, bi) if 0 <= j < bts.size),
+                              default=1e9)
+                strongs[i] = nearest < 0.15 * interval
+            sub = ev.get('subdivision')
+            if sub is not None and not strongs[i]:
+                strongs[i] = (sub == BeatSubdivision.QUARTER)
 
-        pattern = list(self.rng.choice(self.STREAM_PATTERNS))
-        max_len = min(max_stream_length, remaining_events, len(pattern) * 3)
-        stream_len = self.rng.randint(len(pattern), max(len(pattern), max_len))
+        # Fingerprint each bar from its notes' subdivisions, then derive a texture
+        # bit per note position via a stable integer mix (NOT Python's hash()).
+        from itertools import groupby
+        textures = [0] * n
+        idx = 0
+        for _, grp in groupby(range(n), key=lambda k: bars[k]):
+            members = list(grp)
+            fp = 1469598103  # FNV-ish seed
+            for k in members:
+                code = self._SUB_CODE.get(note_events[k].get('subdivision'), 0)
+                fp = (fp * 16777619 + code + 1) & 0xFFFFFFFF
+            for pos, k in enumerate(members):
+                mix = (fp * 2654435761 + pos * 40503) & 0xFFFFFFFF
+                textures[k] = (mix >> 16) & 1
+        return bars, textures, strongs
 
-        full_pattern = []
-        while len(full_pattern) < stream_len:
-            full_pattern.extend(pattern)
-        self._stream_pattern = full_pattern[:stream_len]
-        self._stream_idx = 0
-        return True
+    def _detect_sections(self, note_events, energy_curve) -> List[int]:
+        """Coarse section id per event from energy-curve novelty. Cheap and bounded;
+        only used to contrast footing texture between sections."""
+        n = len(note_events)
+        if (not self.section_aware or energy_curve is None
+                or len(energy_curve) == 0 or n == 0):
+            return [0] * n
+        e = np.asarray(energy_curve, dtype=np.float64)
+        win = max(1, int(2.0 * FRAMES_PER_SECOND))  # ~2s smoothing
+        sm = np.convolve(e, np.ones(win) / win, mode='same')
+        step = max(1, int(4.0 * FRAMES_PER_SECOND))
+        boundaries = []
+        last_val = sm[0] if len(sm) else 0.0
+        for f in range(0, len(sm), step):
+            if abs(sm[f] - last_val) > 0.25:
+                boundaries.append(f / FRAMES_PER_SECOND)
+                last_val = sm[f]
+        if not boundaries:
+            return [0] * n
+        return [int(np.searchsorted(boundaries, float(ev['time']))) for ev in note_events]
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +560,7 @@ class MLChartGenerator:
         self.style = str(style)
 
         self.model: Optional[StepChartModel] = None
+        self.use_learned_arrows: bool = False
         self.default_density_by_id = DEFAULT_DENSITY_BY_ID.clone()
         self.feat_mean: Optional[np.ndarray] = None
         self.feat_std: Optional[np.ndarray] = None
@@ -440,11 +579,15 @@ class MLChartGenerator:
     def load_model(self, model_path: str):
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         arch_version = int(checkpoint.get('arch_version', 1))
-        if arch_version != ARCH_VERSION:
+        # v7 (onset/sustain/intensity) and v8 (+ learned direction head) are both
+        # supported. The learned direction is only consumed when a v8 checkpoint
+        # actually carries a trained arrow head.
+        if arch_version not in (7, 8):
             raise ValueError(
                 f"Checkpoint at {model_path} is arch_version={arch_version}; "
-                f"expected {ARCH_VERSION}. Retrain with current model.py."
+                f"expected 7 or 8. Retrain with current model.py."
             )
+        self.use_learned_arrows = arch_version >= 8
 
         n_in_channels = int(checkpoint.get('n_in_channels', N_FEAT_CHANNELS))
         args = checkpoint.get('args', {})
@@ -454,6 +597,7 @@ class MLChartGenerator:
             n_heads=args.get('n_heads', 4),
             n_transformer_layers=args.get('n_layers', 3),
             n_difficulties=5,
+            with_arrow_head=self.use_learned_arrows,
         ).to(self.device)
         self.n_in_channels = n_in_channels
 
@@ -792,11 +936,13 @@ class MLChartGenerator:
         sustain_p: np.ndarray,
         intensity: np.ndarray,
         style: Optional[str] = None,
+        arrow_probs: Optional[np.ndarray] = None,
     ) -> Chart:
         """Build a Chart from already-computed per-difficulty signals.
 
         Shared by the single-difficulty and batched-multi paths so
-        post-processing only lives in one place.
+        post-processing only lives in one place. ``arrow_probs`` ([T,4], v8 only)
+        is the learned per-column direction preference, or None for v7.
         """
         diff_config = get_difficulty_config(difficulty)
 
@@ -823,6 +969,7 @@ class MLChartGenerator:
             audio_seed=analysis.audio_seed,
             style_knobs=knobs,
             timing_offset=timing_offset,
+            arrow_probs=arrow_probs,
         )
 
         chart = Chart(
@@ -856,11 +1003,12 @@ class MLChartGenerator:
             f"density={target_density:.2f} steps/sec)..."
         )
 
-        onset_p, sustain_p, intensity = self._predict_chunked(
+        onset_p, sustain_p, intensity, arrow_probs = self._predict_chunked(
             analysis.feats_whitened, difficulty_id, target_density,
         )
         return self._chart_from_signals(
             analysis, difficulty, onset_p, sustain_p, intensity, style=style,
+            arrow_probs=arrow_probs,
         )
 
     def generate_from_audio(
@@ -903,7 +1051,7 @@ class MLChartGenerator:
             f"Running batched inference over {len(names)} difficulties: "
             f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
         )
-        onset_batch, sustain_batch, intensity_batch = self._predict_chunked_multi(
+        onset_batch, sustain_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
             analysis.feats_whitened, difficulty_ids, target_densities,
         )
 
@@ -913,6 +1061,7 @@ class MLChartGenerator:
                 analysis, name,
                 onset_batch[i], sustain_batch[i], intensity_batch[i],
                 style=style,
+                arrow_probs=(arrow_batch[i] if arrow_batch is not None else None),
             )
         return charts
 
@@ -932,6 +1081,7 @@ class MLChartGenerator:
         onset_sum = np.zeros(T, dtype=np.float32)
         sustain_sum = np.zeros(T, dtype=np.float32)
         intensity_sum = np.zeros(T, dtype=np.float32)
+        arrow_sum = np.zeros((T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -964,7 +1114,7 @@ class MLChartGenerator:
                 [remaining_seconds], dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred = self.model(
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
@@ -976,13 +1126,17 @@ class MLChartGenerator:
             onset_sum[start:start + valid_len] += onset_p[:valid_len]
             sustain_sum[start:start + valid_len] += sustain_p[:valid_len]
             intensity_sum[start:start + valid_len] += intensity_v[:valid_len]
+            if arrow_sum is not None and arrow_logits is not None:
+                arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0]  # [T,4]
+                arrow_sum[start:start + valid_len, :] += arrow_p[:valid_len, :]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        return onset_avg, sustain_avg, intensity_avg
+        arrow_avg = (arrow_sum / counts[:, None]) if arrow_sum is not None else None
+        return onset_avg, sustain_avg, intensity_avg, arrow_avg
 
     @torch.no_grad()
     def _predict_chunked_multi(
@@ -1011,6 +1165,7 @@ class MLChartGenerator:
         onset_sum = np.zeros((B, T), dtype=np.float32)
         sustain_sum = np.zeros((B, T), dtype=np.float32)
         intensity_sum = np.zeros((B, T), dtype=np.float32)
+        arrow_sum = np.zeros((B, T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -1057,7 +1212,7 @@ class MLChartGenerator:
                 (B,), remaining_seconds, dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred = self.model(
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
@@ -1069,13 +1224,17 @@ class MLChartGenerator:
             onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
             sustain_sum[:, start:start + valid_len] += sustain_p[:, :valid_len]
             intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
+            if arrow_sum is not None and arrow_logits is not None:
+                arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()  # [B,T,4]
+                arrow_sum[:, start:start + valid_len, :] += arrow_p[:, :valid_len, :]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
         sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        return onset_avg, sustain_avg, intensity_avg
+        arrow_avg = (arrow_sum / counts[None, :, None]) if arrow_sum is not None else None
+        return onset_avg, sustain_avg, intensity_avg, arrow_avg
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1122,10 +1281,11 @@ class MLChartGenerator:
         audio_seed: int,
         style_knobs: Dict[str, float],
         timing_offset: float = 0.0,
+        arrow_probs: Optional[np.ndarray] = None,
     ) -> List[Step]:
         """
         Detect WHEN (NMS on onset_p) → classify type (jump/hold/tap) →
-        assign arrows via FootStateArrowAssigner driven by style knobs.
+        assign arrows via FootFlowAssigner (whole-timeline foot-flow pass).
 
         ``timing_offset`` (seconds) is the per-song calibration baked into every
         emitted step time; negative pulls notes earlier.
@@ -1375,62 +1535,32 @@ class MLChartGenerator:
             kept.append(event)
         note_events = kept
 
-        # Arrow assignment.
-        assigner = FootStateArrowAssigner(
+        # Arrow assignment — one whole-timeline foot-flow pass. The assigner sees
+        # the finalized timeline (times, type, arity, subdivision already decided
+        # above) so every panel choice has full lookahead to each note's real
+        # inter-onset interval, and every step is a natural next step from the
+        # current stance (playable by construction; verified by ml.playability).
+        assigner = FootFlowAssigner(
+            difficulty=diff_config.name,
             seed=audio_seed,
             allowed_patterns=diff_config.allowed_patterns,
             jack_rate=style_knobs.get('jack_rate', DEFAULT_STYLE_KNOBS['jack_rate']),
             crossover_rate=style_knobs.get('crossover_rate', DEFAULT_STYLE_KNOBS['crossover_rate']),
-            stream_preference=style_knobs.get('stream_preference', DEFAULT_STYLE_KNOBS['stream_preference']),
         )
-        steps: List[Step] = []
-        max_stream_length = max(1, getattr(diff_config, 'max_stream_length', 0))
+        arrows_per_event = assigner.assign(
+            note_events, energy_curve, brightness_curve, beat_times,
+            arrow_probs=arrow_probs,
+        )
 
-        for i, event in enumerate(note_events):
-            t = round(event['time'], 3)
-            # Emitted (player-facing) time carries the global timing
-            # calibration; `t` stays on the analyzed grid so energy lookups and
-            # subdivision derivation reference the true musical position.
+        steps: List[Step] = []
+        for event, arrows in zip(note_events, arrows_per_event):
+            if not arrows:
+                continue
             emit_t = round(max(0.0, event['time'] + timing_offset), 3)
             subdivision = event.get('subdivision') or self._subdivision_from_grid(
-                t, tempo, beat_times,
+                round(event['time'], 3), tempo, beat_times,
             )
-            frame_idx = int(round(t * FRAMES_PER_SECOND))
-            frame_idx = max(0, min(frame_idx, T - 1))
-
-            if energy_curve is not None and len(energy_curve) > 0:
-                energy = float(energy_curve[min(frame_idx, len(energy_curve) - 1)])
-            else:
-                energy = 0.5
-            if brightness_curve is not None and len(brightness_curve) > 0:
-                brightness = float(brightness_curve[
-                    min(frame_idx, len(brightness_curve) - 1)
-                ])
-            else:
-                brightness = 0.5
-
-            if max_stream_length > 0:
-                assigner.maybe_start_stream(
-                    energy=energy,
-                    remaining_events=len(note_events) - i,
-                    max_stream_length=max_stream_length,
-                    time=t,
-                )
-
-            target_arity = 2 if event.get('num_arrows', 1) >= 2 else 1
-
             if event['type'] == 'hold':
-                if target_arity >= 2:
-                    # Jumphold: assign two arrows, register both as active holds.
-                    arrows = assigner.assign_jump(t, energy, brightness)
-                    if arrows:
-                        end_time = t + event['hold_duration']
-                        for a in arrows:
-                            assigner.active_holds[a] = end_time
-                else:
-                    arrows = [assigner.start_hold(
-                        t, event['hold_duration'], energy, brightness,
-                    )]
                 steps.append(Step(
                     time=emit_t,
                     arrows=arrows,
@@ -1439,15 +1569,6 @@ class MLChartGenerator:
                     beat_subdivision=subdivision,
                 ))
             else:
-                if target_arity >= 2:
-                    arrows = assigner.assign_jump(t, energy, brightness)
-                else:
-                    arrows = [assigner.assign_single(t, energy, brightness)]
-                # Safety net: drop the step if any assigned arrow is still
-                # held (e.g. all four panels occupied by jumpholds).
-                held_now = assigner._held_arrows(t)
-                if any(a in held_now for a in arrows):
-                    continue
                 steps.append(Step(
                     time=emit_t,
                     arrows=arrows,

@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ML Model Settings
-    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/best_model.pt")
+    ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "./ml/checkpoints/model_v8.pt")
 
     # Manual timing trim for ML-generated charts, in milliseconds. Added on top
     # of the per-song offset that inference now measures automatically from

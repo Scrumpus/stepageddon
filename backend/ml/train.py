@@ -49,6 +49,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+def _amp_ctx(device: torch.device):
+    """Mixed precision only on CUDA; a no-op on CPU/MPS so smoke runs work anywhere."""
+    from contextlib import nullcontext
+    return autocast('cuda') if device.type == 'cuda' else nullcontext()
+
+
+def _select_device(name: str = 'auto') -> torch.device:
+    if name and name != 'auto':
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -104,6 +120,13 @@ def build_dataloaders(args) -> BuildOutputs:
     train_idx, val_idx = split_entries_by_song(
         full_dataset.entries, val_fraction=args.val_split, seed=args.seed,
     )
+
+    max_songs = getattr(args, 'max_songs', None)
+    if max_songs is not None:
+        # Smoke-test cap: keep only the first N entries per split (deterministic).
+        train_idx = train_idx[:max_songs]
+        val_idx = val_idx[:max(1, max_songs // 5)]
+        logger.info(f"--max-songs={max_songs}: train={len(train_idx)} val={len(val_idx)}")
 
     if getattr(args, 'difficulty', None) is not None:
         target = int(args.difficulty)
@@ -251,6 +274,7 @@ def build_loss(
         focal_gamma=float(args.focal_gamma),
         sustain_weight=float(args.sustain_weight),
         intensity_weight=float(args.intensity_weight),
+        arrow_weight=float(getattr(args, 'arrow_weight', 1.0)),
     )
 
 
@@ -264,17 +288,18 @@ def train_one_epoch(
     total_onset = 0.0
     total_sustain = 0.0
     total_intensity = 0.0
+    total_arrow = 0.0
     total_samples = 0
     n_batches = len(loader)
 
-    interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'n': 0}
+    interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
     t_start = time.time()
 
     for step, batch in enumerate(loader):
         (
             feats, difficulty, density,
             onset_soft, sustain_target, intensity_target,
-            start_seconds, remaining_seconds,
+            start_seconds, remaining_seconds, arrow_target,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -284,15 +309,17 @@ def train_one_epoch(
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+        arrow_target = arrow_target.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast('cuda'):
-            onset_logits, sustain_logits, intensity_pred = model(
+        with _amp_ctx(device):
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, sustain_l, intensity_l = criterion(
+            loss, onset_l, sustain_l, intensity_l, arrow_l = criterion(
                 onset_logits, sustain_logits, intensity_pred,
                 onset_soft, sustain_target, intensity_target,
+                arrow_logits, arrow_target,
             )
 
         scaler.scale(loss).backward()
@@ -311,12 +338,14 @@ def train_one_epoch(
         total_onset += onset_l.item() * bs
         total_sustain += sustain_l.item() * bs
         total_intensity += intensity_l.item() * bs
+        total_arrow += arrow_l.item() * bs
         total_samples += bs
 
         interval['loss'] += loss.item() * bs
         interval['onset'] += onset_l.item() * bs
         interval['sustain'] += sustain_l.item() * bs
         interval['intensity'] += intensity_l.item() * bs
+        interval['arrow'] += arrow_l.item() * bs
         interval['n'] += bs
 
         if (step + 1) % log_interval == 0 or (step + 1) == n_batches:
@@ -328,11 +357,12 @@ def train_one_epoch(
                 f"loss={interval['loss']/n:.4f} "
                 f"(onset={interval['onset']/n:.4f} "
                 f"sustain={interval['sustain']/n:.4f} "
-                f"intensity={interval['intensity']/n:.4f}) "
+                f"intensity={interval['intensity']/n:.4f} "
+                f"arrow={interval['arrow']/n:.4f}) "
                 f"| lr={lr:.2e} | {elapsed:.1f}s",
                 flush=True,
             )
-            interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'n': 0}
+            interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
             t_start = time.time()
 
     return {
@@ -340,6 +370,7 @@ def train_one_epoch(
         'onset_loss': total_onset / max(total_samples, 1),
         'sustain_loss': total_sustain / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
+        'arrow_loss': total_arrow / max(total_samples, 1),
     }
 
 
@@ -464,12 +495,14 @@ def validate(
     sustain_true_chunks: List[np.ndarray] = []
     all_intensity_pred: List[np.ndarray] = []
     all_intensity_true: List[np.ndarray] = []
+    total_arrow = 0.0
+    arrow_tp = arrow_fp = arrow_fn = 0  # per-column onset agreement @0.5, onset frames only
 
     for batch in loader:
         (
             feats, difficulty, density,
             onset_soft, sustain_target, intensity_target,
-            start_seconds, remaining_seconds,
+            start_seconds, remaining_seconds, arrow_target,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -479,14 +512,16 @@ def validate(
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
+        arrow_target = arrow_target.to(device, non_blocking=True)
 
-        with autocast('cuda'):
-            onset_logits, sustain_logits, intensity_pred = model(
+        with _amp_ctx(device):
+            onset_logits, sustain_logits, intensity_pred, arrow_logits = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, sustain_l, intensity_l = criterion(
+            loss, onset_l, sustain_l, intensity_l, arrow_l = criterion(
                 onset_logits, sustain_logits, intensity_pred,
                 onset_soft, sustain_target, intensity_target,
+                arrow_logits, arrow_target,
             )
 
         bs = feats.size(0)
@@ -494,7 +529,17 @@ def validate(
         total_onset += onset_l.item() * bs
         total_sustain += sustain_l.item() * bs
         total_intensity += intensity_l.item() * bs
+        total_arrow += arrow_l.item() * bs
         total_samples += bs
+
+        if arrow_logits is not None:
+            ap = (torch.sigmoid(arrow_logits.float()) >= 0.5)
+            at = (arrow_target >= 0.5)
+            onset_frames = at.any(dim=-1, keepdim=True)          # [B,T,1]
+            ap = ap & onset_frames                                # only judge onset frames
+            arrow_tp += int((ap & at).sum().item())
+            arrow_fp += int((ap & ~at).sum().item())
+            arrow_fn += int((~ap & at).sum().item())
 
         all_onset_pred.append(
             torch.sigmoid(onset_logits.float()).cpu().numpy().reshape(-1)
@@ -563,11 +608,18 @@ def validate(
     intensity_auc = _binary_auc(intensity_pred_all, jump_label)
     intensity_mse = float(np.mean((intensity_pred_all - intensity_true_all) ** 2))
 
+    # Per-column direction F1 at 0.5, over onset frames only.
+    a_prec = arrow_tp / max(arrow_tp + arrow_fp, 1)
+    a_rec = arrow_tp / max(arrow_tp + arrow_fn, 1)
+    arrow_col_f1 = 2 * a_prec * a_rec / max(a_prec + a_rec, 1e-8)
+
     return {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
         'sustain_loss': total_sustain / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
+        'arrow_loss': total_arrow / max(total_samples, 1),
+        'arrow_col_f1': float(arrow_col_f1),
         'onset_tol_f1': float(onset_f1),
         'onset_tol_p': float(onset_p),
         'onset_tol_r': float(onset_r),
@@ -582,13 +634,15 @@ def validate(
 
 
 def composite_score(metrics: Dict[str, float]) -> float:
-    """Headline checkpoint score per the v7 plan:
-        0.7 * onset_tol_f1 + 0.15 * sustain_f1 + 0.15 * intensity_jump_auc
+    """Headline checkpoint score. v8 folds in the direction head at a small weight
+    (the arrow head does not gate onset/sustain/intensity quality):
+        0.65*onset_tol_f1 + 0.15*sustain_f1 + 0.10*intensity_jump_auc + 0.10*arrow_col_f1
     """
     onset = float(metrics.get('onset_tol_f1', 0.0))
     sustain = float(metrics.get('sustain_f1', 0.0))
     auc = float(metrics.get('intensity_jump_auc', 0.5))
-    return 0.7 * onset + 0.15 * sustain + 0.15 * auc
+    arrow = float(metrics.get('arrow_col_f1', 0.0))
+    return 0.65 * onset + 0.15 * sustain + 0.10 * auc + 0.10 * arrow
 
 
 def save_checkpoint(
@@ -659,6 +713,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--focal-gamma', type=float, default=2.0)
     parser.add_argument('--sustain-weight', type=float, default=2.0)
     parser.add_argument('--intensity-weight', type=float, default=0.5)
+    parser.add_argument('--arrow-weight', type=float, default=1.0,
+                        help='Weight of the v8 learned direction (per-column) BCE term')
+    parser.add_argument('--device', type=str, default='auto',
+                        help="auto | cuda | mps | cpu (auto prefers cuda, then mps, then cpu)")
+    parser.add_argument('--max-songs', type=int, default=None,
+                        help='Cap number of songs (for smoke tests)')
     parser.add_argument('--onset-pos-weight', type=float, default=None,
                         help='Override onset BCE pos_weight; default sqrt((1-p)/p) capped at 50')
     parser.add_argument('--sustain-pos-weight', type=float, default=None,
@@ -677,7 +737,7 @@ def main():
     args = build_argparser().parse_args()
     seed_everything(args.seed)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = _select_device(getattr(args, 'device', 'auto'))
     logger.info(f"Using device: {device} | git_sha={_git_sha()} | seed={args.seed}")
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -717,7 +777,7 @@ def main():
         patience=args.plateau_patience,
         min_lr=1e-6,
     )
-    scaler = GradScaler('cuda')
+    scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
     ema_model = AveragedModel(
         model, multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay)
     )
