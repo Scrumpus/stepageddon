@@ -1,7 +1,7 @@
 """
 Inference module: generate step charts from audio using the v7 hybrid model.
 
-The model emits three dense per-frame channels (onset / sustain / intensity).
+The model emits three dense per-frame channels (onset / intensity / direction).
 Algorithmic post-processing — driven by selectable, auto-clustered style
 profiles — decides arrows, jump vs. tap, hold start/end, and jumpholds.
 """
@@ -73,6 +73,8 @@ DEFAULT_STYLE_KNOBS: Dict[str, float] = {
     'target_jump_rate': 0.05,     # fraction of peaks to mark as jumps (top-K)
     'jumphold_rate': 0.0,         # 0 disables jumpholds
     'jumphold_rms_thr': 0.7,
+    'hold_rate': 0.04,            # fraction of notes promoted to holds (top-K)
+    'avg_hold_beats': 2.0,        # corpus-typical hold length, in beats
     'jack_rate': 0.05,
     'crossover_rate': 0.10,
     'stream_preference': 0.5,
@@ -344,8 +346,21 @@ class FootFlowAssigner:
     # -- hold assignment -----------------------------------------------------
 
     def _assign_hold(self, ev, t, num, energy, strong, texture):
+        """Place a derived hold, demoting it to a tap rather than dropping it if
+        the stance can't accommodate one.
+
+        ``ev`` is mutated on demotion so ``_postprocess`` emits the right
+        ``StepType`` — a hold whose arrows were reassigned as a tap must not
+        keep its ``hold_duration``.
+        """
         if num >= 2 and self._jumps_ok:
+            # _assign_jump has already committed the stance, so whatever it
+            # returns is the answer — it may have degraded to a single arrow if
+            # a foot was pinned. Register a hold on each arrow it did place.
             arrows = self._assign_jump(t, energy, strong)
+            if not arrows:
+                self._demote_to_tap(ev)
+                return []
             end = t + float(ev['hold_duration'])
             for a in arrows:
                 foot = 'L' if a in self.OWN_PANELS['L'] else 'R'
@@ -353,6 +368,9 @@ class FootFlowAssigner:
             return arrows
         foot = self._free_foot(t)
         if foot is None:
+            # Both feet are committed to holds; the concurrency cap should have
+            # prevented this event from surviving at all.
+            self._demote_to_tap(ev)
             return []
         held = set(self.active_holds)
         # Same jack/collision avoidance as singles: don't start a hold on the panel
@@ -364,9 +382,21 @@ class FootFlowAssigner:
             avoid.add(self.last_arrow)
         panel = self._pick_own_panel(foot, strong, held, texture, avoid)
         self._place(foot, panel)
-        self.active_holds[panel] = (t + float(ev['hold_duration']), foot)
         self.prev_single_time = t
+        if panel in held:
+            # _pick_own_panel exhausted its options and fell back to an occupied
+            # panel. Starting a second hold there would clobber the active one's
+            # end time, so emit a plain tap instead.
+            self._demote_to_tap(ev)
+            return [panel]
+        self.active_holds[panel] = (t + float(ev['hold_duration']), foot)
         return [panel]
+
+    @staticmethod
+    def _demote_to_tap(ev: dict) -> None:
+        """Turn a hold event back into a tap, in place."""
+        ev['type'] = 'tap'
+        ev.pop('hold_duration', None)
 
     # -- jump assignment -----------------------------------------------------
 
@@ -506,6 +536,12 @@ def _profile_knobs(profile: Dict) -> Dict[str, float]:
     hold_rate = float(rm.get('hold_rate', 0.04))
     knobs['jumphold_rate'] = float(np.clip(min(hold_rate, jump_rate) * 1.5, 0.0, 0.4))
 
+    # Hold derivation (see _derive_holds): the corpus hold_rate sets how many
+    # notes get promoted, and avg_hold_beats biases the quantized length toward
+    # what this style actually writes.
+    knobs['hold_rate'] = float(np.clip(hold_rate, 0.0, 0.5))
+    knobs['avg_hold_beats'] = float(np.clip(rm.get('avg_hold_beats', 2.0), 0.5, 8.0))
+
     knobs['jack_rate'] = float(np.clip(rm.get('jack_rate', 0.05), 0.0, 0.5))
     knobs['crossover_rate'] = float(np.clip(rm.get('crossover_rate', 0.10), 0.0, 0.5))
     # stream_preference rolls stream_density into the assigner's branch
@@ -528,8 +564,6 @@ class MLChartGenerator:
         confidence_threshold: Optional[float] = None,
         min_note_gap: float = 0.05,
         snap_to_beats: bool = True,
-        sustain_threshold_up: float = 0.5,
-        sustain_threshold_down: float = 0.4,
         intensity_threshold_base: float = 0.5,
         style: str = 'auto',
         style_profiles_path: Optional[str] = None,
@@ -548,8 +582,6 @@ class MLChartGenerator:
         )
         self.min_note_gap = min_note_gap
         self.snap_to_beats = snap_to_beats
-        self.sustain_threshold_up = float(sustain_threshold_up)
-        self.sustain_threshold_down = float(sustain_threshold_down)
         self.intensity_threshold_base = float(intensity_threshold_base)
         self.min_first_step_time = float(min_first_step_time)
         self.min_last_step_buffer = float(min_last_step_buffer)
@@ -579,13 +611,17 @@ class MLChartGenerator:
     def load_model(self, model_path: str):
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         arch_version = int(checkpoint.get('arch_version', 1))
-        # v7 (onset/sustain/intensity) and v8 (+ learned direction head) are both
-        # supported. The learned direction is only consumed when a v8 checkpoint
-        # actually carries a trained arrow head.
-        if arch_version not in (7, 8):
+        # v7 (onset/sustain/intensity), v8 (+ learned direction head) and v9
+        # (sustain head removed) are all loadable. v7/v8 checkpoints carry
+        # sustain_head weights that this architecture no longer has; they land
+        # in `unexpected` below and are ignored, which is exactly right — holds
+        # are derived algorithmically now, so the head's output is unused. The
+        # learned direction is only consumed when the checkpoint actually
+        # carries a trained arrow head.
+        if arch_version not in (7, 8, 9):
             raise ValueError(
                 f"Checkpoint at {model_path} is arch_version={arch_version}; "
-                f"expected 7 or 8. Retrain with current model.py."
+                f"expected 7, 8 or 9. Retrain with current model.py."
             )
         self.use_learned_arrows = arch_version >= 8
 
@@ -608,7 +644,16 @@ class MLChartGenerator:
         if missing:
             logger.warning(f"Checkpoint missing keys (zero-initialized): {missing}")
         if unexpected:
-            logger.warning(f"Checkpoint had unexpected keys (ignored): {unexpected}")
+            sustain_keys = [k for k in unexpected if k.startswith('sustain_head.')]
+            other = [k for k in unexpected if k not in sustain_keys]
+            if sustain_keys:
+                logger.info(
+                    f"Ignoring {len(sustain_keys)} sustain_head weights from this "
+                    f"arch_version={arch_version} checkpoint (holds are derived "
+                    f"algorithmically since v9)."
+                )
+            if other:
+                logger.warning(f"Checkpoint had unexpected keys (ignored): {other}")
         self.model.eval()
 
         ckpt_default = checkpoint.get('default_density_by_id')
@@ -633,16 +678,6 @@ class MLChartGenerator:
                 f"(from checkpoint best_onset_threshold)"
             )
 
-        ckpt_sustain_up = checkpoint.get('best_sustain_threshold')
-        if ckpt_sustain_up is not None:
-            self.sustain_threshold_up = float(ckpt_sustain_up)
-            self.sustain_threshold_down = max(
-                0.0, float(ckpt_sustain_up) - 0.1,
-            )
-            logger.info(
-                f"Sustain thresholds: up={self.sustain_threshold_up:.3f} "
-                f"down={self.sustain_threshold_down:.3f}"
-            )
 
         if 'feat_mean' in checkpoint and 'feat_std' in checkpoint:
             fm = np.asarray(checkpoint['feat_mean'], dtype=np.float32)
@@ -933,7 +968,6 @@ class MLChartGenerator:
         analysis: "_AudioAnalysis",
         difficulty: str,
         onset_p: np.ndarray,
-        sustain_p: np.ndarray,
         intensity: np.ndarray,
         style: Optional[str] = None,
         arrow_probs: Optional[np.ndarray] = None,
@@ -961,7 +995,7 @@ class MLChartGenerator:
         timing_offset = analysis.timing_offset + self.timing_trim
 
         steps = self._postprocess(
-            onset_p, sustain_p, intensity,
+            onset_p, intensity,
             analysis.tempo, analysis.beat_times, analysis.duration, diff_config,
             energy_curve=analysis.rms_norm,
             brightness_curve=analysis.centroid_norm,
@@ -1003,11 +1037,11 @@ class MLChartGenerator:
             f"density={target_density:.2f} steps/sec)..."
         )
 
-        onset_p, sustain_p, intensity, arrow_probs = self._predict_chunked(
+        onset_p, intensity, arrow_probs = self._predict_chunked(
             analysis.feats_whitened, difficulty_id, target_density,
         )
         return self._chart_from_signals(
-            analysis, difficulty, onset_p, sustain_p, intensity, style=style,
+            analysis, difficulty, onset_p, intensity, style=style,
             arrow_probs=arrow_probs,
         )
 
@@ -1051,7 +1085,7 @@ class MLChartGenerator:
             f"Running batched inference over {len(names)} difficulties: "
             f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
         )
-        onset_batch, sustain_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
+        onset_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
             analysis.feats_whitened, difficulty_ids, target_densities,
         )
 
@@ -1059,7 +1093,7 @@ class MLChartGenerator:
         for i, name in enumerate(names):
             charts[name] = self._chart_from_signals(
                 analysis, name,
-                onset_batch[i], sustain_batch[i], intensity_batch[i],
+                onset_batch[i], intensity_batch[i],
                 style=style,
                 arrow_probs=(arrow_batch[i] if arrow_batch is not None else None),
             )
@@ -1072,14 +1106,13 @@ class MLChartGenerator:
         difficulty_id: int,
         target_density: float,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run model on overlapping chunks; return (onset_p, sustain_p, intensity).
+        """Run model on overlapping chunks; return (onset_p, intensity).
 
-        Each output is shape [T] float32. onset_p and sustain_p are sigmoids;
+        Each output is shape [T] float32. onset_p is a sigmoid;
         intensity is the raw regression output (clipped to [0, 1]).
         """
         T = feats.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
-        sustain_sum = np.zeros(T, dtype=np.float32)
         intensity_sum = np.zeros(T, dtype=np.float32)
         arrow_sum = np.zeros((T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
@@ -1114,17 +1147,15 @@ class MLChartGenerator:
                 [remaining_seconds], dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]
-            sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[0, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[0, :, 0]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[start:start + valid_len] += onset_p[:valid_len]
-            sustain_sum[start:start + valid_len] += sustain_p[:valid_len]
             intensity_sum[start:start + valid_len] += intensity_v[:valid_len]
             if arrow_sum is not None and arrow_logits is not None:
                 arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0]  # [T,4]
@@ -1133,10 +1164,9 @@ class MLChartGenerator:
 
         counts = np.maximum(counts, 1.0)
         onset_avg = onset_sum / counts
-        sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
         arrow_avg = (arrow_sum / counts[:, None]) if arrow_sum is not None else None
-        return onset_avg, sustain_avg, intensity_avg, arrow_avg
+        return onset_avg, intensity_avg, arrow_avg
 
     @torch.no_grad()
     def _predict_chunked_multi(
@@ -1163,7 +1193,6 @@ class MLChartGenerator:
 
         T = feats.shape[0]
         onset_sum = np.zeros((B, T), dtype=np.float32)
-        sustain_sum = np.zeros((B, T), dtype=np.float32)
         intensity_sum = np.zeros((B, T), dtype=np.float32)
         arrow_sum = np.zeros((B, T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
@@ -1212,17 +1241,15 @@ class MLChartGenerator:
                 (B,), remaining_seconds, dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[:, :, 0]
-            sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[:, :, 0]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
-            sustain_sum[:, start:start + valid_len] += sustain_p[:, :valid_len]
             intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
             if arrow_sum is not None and arrow_logits is not None:
                 arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()  # [B,T,4]
@@ -1231,45 +1258,366 @@ class MLChartGenerator:
 
         counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
-        sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
         arrow_avg = (arrow_sum / counts[None, :, None]) if arrow_sum is not None else None
-        return onset_avg, sustain_avg, intensity_avg, arrow_avg
+        return onset_avg, intensity_avg, arrow_avg
 
     # ------------------------------------------------------------------
     # Post-processing
     # ------------------------------------------------------------------
 
-    def _find_hold_end(
+    # Hold lengths are quantized to these beat counts so tails land on the same
+    # grid the heads were snapped to.
+    HOLD_BEAT_CELLS = (4.0, 3.0, 2.0, 1.5, 1.0, 0.5)
+    # Cumulative distribution of hold lengths measured over the training corpus
+    # (n=3242): one beat is far and away the mode, with a long right tail.
+    # Sampling a cell from this by sustain rank reproduces that shape; mapping a
+    # continuous target length onto the nearest cell does not, because the cells
+    # are unevenly spaced and the 2-beat cell would swallow half the range.
+    HOLD_LENGTH_CDF = (
+        (0.5, 0.07), (1.0, 0.54), (1.5, 0.61),
+        (2.0, 0.81), (3.0, 0.96), (4.0, 1.00),
+    )
+    # Median corpus hold length in beats. Dividing a style's typical length by
+    # this gives 1.0 for a corpus-average profile, so the bias below is neutral
+    # unless the style really does write longer or shorter holds.
+    HOLD_CORPUS_TYPICAL_BEATS = 1.24
+    # Harmonic energy below this fraction of its value at the onset counts as
+    # the note having decayed away.
+    HOLD_DECAY_FLOOR = 0.10
+    # A hold tail stops this many beats short of the next note, so the foot has
+    # time to release and move.
+    HOLD_TAIL_LEAD_BEATS = 0.5
+    # Style profiles report avg_hold_beats as a MEAN over a strongly
+    # right-skewed distribution (corpus: mode 1.0, median 1.24, mean 1.94
+    # beats). Preferring the mean would systematically overshoot by ~1 beat, so
+    # convert to a typical length with the corpus median/mean ratio.
+    HOLD_TYPICAL_OVER_MEAN = 0.65
+    # Lookahead for scoring how well a note sustains, in beats.
+    HOLD_RETENTION_BEATS = 1.0
+
+    def _audio_hold_end(
         self,
-        sustain_p: np.ndarray,
-        harmonic_curve: np.ndarray,
+        harmonic_curve: Optional[np.ndarray],
         start_frame: int,
         max_frames: int,
+        n_frames: int,
     ) -> int:
-        """Walk forward from start_frame until sustain falls below the down
-        threshold (with hysteresis) OR the harmonic energy decays to 10% of
-        the value at start_frame. Returns the final in-hold frame index.
+        """Walk forward from ``start_frame`` until the harmonic energy decays to
+        :attr:`HOLD_DECAY_FLOOR` of its value there. Returns the last frame the
+        note is still ringing.
+
+        This is the audio half of the old ``_find_hold_end``; the model-sustain
+        half is gone (holds are no longer predicted). Where the note stops
+        ringing is what *proposes* a hold — foot feasibility then trims it.
         """
-        T = sustain_p.shape[0]
-        end_cap = min(T, start_frame + max_frames)
-        if start_frame >= T - 1:
+        end_cap = min(n_frames, start_frame + max_frames)
+        if start_frame >= n_frames - 1 or harmonic_curve is None:
             return start_frame
-        start_harm = float(harmonic_curve[start_frame]) if harmonic_curve is not None else 1.0
-        decay_floor = max(start_harm * 0.10, 1e-3)
+        start_harm = float(harmonic_curve[start_frame])
+        decay_floor = max(start_harm * self.HOLD_DECAY_FLOOR, 1e-3)
         f = start_frame + 1
         while f < end_cap:
-            if sustain_p[f] < self.sustain_threshold_down:
-                return f - 1
-            if harmonic_curve is not None and harmonic_curve[f] < decay_floor:
+            if harmonic_curve[f] < decay_floor:
                 return f - 1
             f += 1
         return end_cap - 1
 
+    @staticmethod
+    def _percentile_ranks(values: List[float]) -> List[float]:
+        """Map each value to its percentile rank in [0, 1], ties sharing a rank."""
+        n = len(values)
+        if n == 0:
+            return []
+        if n == 1:
+            return [0.5]
+        order = sorted(range(n), key=lambda i: values[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+                j += 1
+            shared = (i + j) / 2.0 / (n - 1)
+            for k in range(i, j + 1):
+                ranks[order[k]] = shared
+            i = j + 1
+        return ranks
+
+    def _sustain_retention(
+        self,
+        harmonic_curve: Optional[np.ndarray],
+        start_frame: int,
+        beat_interval: float,
+        n_frames: int,
+    ) -> float:
+        """Ratio of harmonic energy a beat after the onset to energy at it.
+
+        High for a sustained pad or held vocal, near zero for a staccato stab.
+        Used only to rank hold candidates against each other, so it has to
+        *vary* — unlike the walk-until-decay length, which pins to its cap on
+        most material. Deliberately not clipped to 1.0: harmonic energy often
+        holds steady or rises after an onset, and clipping there collapses
+        almost every note onto the same value, leaving the ranking with no
+        information to order by.
+        """
+        if harmonic_curve is None or start_frame >= n_frames - 1:
+            return 0.0
+        start = float(harmonic_curve[start_frame])
+        if start <= 1e-6:
+            return 0.0
+        look = min(n_frames - 1, start_frame + max(1, int(round(
+            self.HOLD_RETENTION_BEATS * beat_interval * FRAMES_PER_SECOND
+        ))))
+        window = harmonic_curve[start_frame + 1:look + 1]
+        if window.size == 0:
+            return 0.0
+        return float(np.mean(window)) / start
+
+    def _derive_holds(
+        self,
+        note_events: List[dict],
+        harmonic_curve: Optional[np.ndarray],
+        tempo: float,
+        beat_times: np.ndarray,
+        n_frames: int,
+        diff_config,
+        style_knobs: Dict[str, float],
+    ) -> int:
+        """Promote single taps to holds in place. Returns the number promoted.
+
+        Audio proposes, feet veto. A note whose harmonic energy keeps ringing is
+        a hold *candidate*; how long it may actually last is bounded by what the
+        free foot can still cover, because a hold pins one foot and every note
+        underneath it is played by the other one.
+
+        Runs after beat-snapping so tail times land on the grid, and before the
+        concurrency cap so derived holds are subject to it like any other event.
+        """
+        if not note_events or diff_config.hold_percentage <= 0:
+            return 0
+
+        target_rate = min(
+            float(style_knobs.get('hold_rate', 0.04)),
+            float(diff_config.hold_percentage),
+        )
+        target_k = int(round(target_rate * len(note_events)))
+        if target_k <= 0:
+            return 0
+
+        bts = np.asarray(beat_times, dtype=np.float64)
+        # Quantize against the musical beat, NOT the spacing between entries in
+        # ``beat_times``. Those are PLP pulse maxima — irregular, and often a
+        # different count than the song has beats — so using them would give
+        # holds a jittery, non-musical length.
+        if tempo and tempo > 0:
+            beat_interval = 60.0 / float(tempo)
+        elif bts.size > 1:
+            beat_interval = float(np.median(np.diff(bts)))
+        else:
+            beat_interval = 0.5
+        max_notes_under = int(getattr(diff_config, 'max_notes_under_hold', 0))
+        spec = playability_spec(diff_config.name)
+        jack_min_dt = float(spec.jack_min_dt)
+        # A hold pins its foot for the whole span, so that foot has to *arrive*
+        # cleanly. Spacing that is fine for a tap can be a forced double-step
+        # once the note becomes a hold, hence a lead-in gap covering both the
+        # same-panel (jack) and cross-panel (double-step) floors.
+        min_lead_in = max(jack_min_dt, float(spec.double_step_min_dt))
+        pref_beats = (
+            float(style_knobs.get('avg_hold_beats', 2.0)) * self.HOLD_TYPICAL_OVER_MEAN
+        )
+
+        candidates: List[Tuple[float, int, float]] = []  # (score, index, budget)
+        for i, ev in enumerate(note_events):
+            if ev.get('type') != 'tap' or int(ev.get('num_arrows', 1)) != 1:
+                continue  # jumps need both feet; only singles become holds
+
+            t = float(ev['time'])
+
+            # 0. The foot taking the hold must be able to get there in time.
+            if i > 0 and t - float(note_events[i - 1]['time']) < min_lead_in:
+                continue
+
+            # 1. Propose: how long does the audio keep ringing here?
+            start_frame = int(round(t * FRAMES_PER_SECOND))
+            max_frames = max(1, int(round(diff_config.max_hold_duration * FRAMES_PER_SECOND)))
+            end_frame = self._audio_hold_end(
+                harmonic_curve, start_frame, max_frames, n_frames,
+            )
+            audio_dur = (end_frame - start_frame) / FRAMES_PER_SECOND
+            if audio_dur <= 0.0:
+                continue
+
+            # How much of the onset's harmonic energy is still there a beat
+            # later. audio_dur alone saturates at the cap on most material, and
+            # tied scores collapse the ranking into "whatever comes first in the
+            # song" — this actually separates ringing notes from staccato ones.
+            score = self._sustain_retention(
+                harmonic_curve, start_frame, beat_interval, n_frames,
+            )
+
+            # 2. Trim: how far can the hold run before the free foot can't cope?
+            feasible_dur, blocked_by_jump = self._free_foot_window(
+                note_events, i, max_notes_under, jack_min_dt,
+            )
+            if blocked_by_jump:
+                # A jump needs the pinned foot back, so leave it room to release
+                # and travel. Notes taken by the free foot need no such lead —
+                # a tap coinciding with a tail is played by the other foot.
+                feasible_dur -= self.HOLD_TAIL_LEAD_BEATS * beat_interval
+            if feasible_dur <= 0.0:
+                continue
+
+            # 3. Quantize to a beat cell so the tail lands on the grid. A
+            #    candidate whose budget can't fit a cell of at least
+            #    min_hold_duration is rejected, never floored — the old path
+            #    applied max(min_hold_duration, ...), inflating a single-frame
+            #    flicker into a 0.3-0.8s hold.
+            #    The exact length is settled after ranking (below), since it
+            #    depends on this note's sustain *relative to the song*.
+            budget = min(audio_dur, feasible_dur, diff_config.max_hold_duration)
+            if self._quantize_hold(
+                budget, beat_interval, pref_beats, diff_config.min_hold_duration,
+            ) is None:
+                continue  # window admits no cell at all
+
+            candidates.append((score, i, budget))
+
+        if not candidates:
+            logger.info("[hold debug] no viable hold candidates")
+            return 0
+
+        # 5. Budget: split the song into as many spans as we want holds and take
+        #    the best-ringing candidate in each. Picking the global top-K
+        #    instead would bunch every hold into the intro — sparse, sustained
+        #    openings beat the rest of the song on both sustain and foot room,
+        #    so they win every slot.
+        t_first = float(note_events[0]['time'])
+        t_last = float(note_events[-1]['time'])
+        span = max(t_last - t_first, 1e-6) / target_k
+        best_per_bucket: Dict[int, Tuple[float, int, float]] = {}
+        for cand in candidates:
+            t = float(note_events[cand[1]]['time'])
+            bucket = min(target_k - 1, int((t - t_first) / span))
+            if bucket not in best_per_bucket or cand[0] > best_per_bucket[bucket][0]:
+                best_per_bucket[bucket] = cand
+
+        min_spacing = 4.0 * beat_interval  # roughly one bar apart
+        selected: List[Tuple[float, int, float]] = []
+        promoted_times: List[float] = []
+        for _bucket, cand in sorted(best_per_bucket.items()):
+            t = float(note_events[cand[1]]['time'])
+            if any(abs(t - p) < min_spacing for p in promoted_times):
+                continue
+            selected.append(cand)
+            promoted_times.append(t)
+
+        # Length is set from each hold's sustain ranked against the *other holds
+        # in this chart*. The raw retention ratio sits near 1.0 on most material,
+        # and bucket selection already skims the top scorer from every span, so
+        # both the absolute value and a corpus-wide rank would bunch at the top
+        # and give every hold the same length. Ranking within the selected set
+        # spreads them around the style's typical hold instead.
+        ranks = self._percentile_ranks([c[0] for c in selected])
+        n_promoted = 0
+        for (_score, idx, budget), rank in zip(selected, ranks):
+            dur = self._quantize_hold(
+                budget, beat_interval, pref_beats,
+                diff_config.min_hold_duration, rank,
+            )
+            if dur is None:
+                continue  # unreachable: candidacy already proved a cell fits
+            note_events[idx]['type'] = 'hold'
+            note_events[idx]['hold_duration'] = dur
+            n_promoted += 1
+
+        logger.info(
+            f"[hold debug] candidates={len(candidates)} target_k={target_k} "
+            f"promoted={n_promoted} (rate={target_rate:.3f}, "
+            f"max_under={max_notes_under}, jack_min_dt={jack_min_dt:.3f})"
+        )
+        return n_promoted
+
+    @staticmethod
+    def _free_foot_window(
+        note_events: List[dict],
+        start_idx: int,
+        max_notes_under: int,
+        jack_min_dt: float,
+    ) -> Tuple[float, bool]:
+        """Seconds a hold starting at ``start_idx`` may run before the free foot
+        runs out of road, and whether a jump is what stopped it.
+
+        While one foot is pinned by the hold, *every* note in its span is hit by
+        the other foot, so this needs no knowledge of the eventual footing —
+        which is what lets hold derivation run before arrow assignment. The span
+        ends at the first note that:
+
+        * is a jump (needs both feet), or
+        * follows the previous in-span note by less than ``jack_min_dt`` (one
+          foot cannot repeat that fast), or
+        * exceeds the difficulty's ``max_notes_under_hold`` budget.
+        """
+        t0 = float(note_events[start_idx]['time'])
+        prev_t = t0
+        n_under = 0
+        for j in range(start_idx + 1, len(note_events)):
+            nxt = note_events[j]
+            t = float(nxt['time'])
+            if int(nxt.get('num_arrows', 1)) >= 2:
+                return t - t0, True
+            if n_under >= max_notes_under or t - prev_t < jack_min_dt:
+                return t - t0, False
+            n_under += 1
+            prev_t = t
+        return float('inf'), False
+
+    def _quantize_hold(
+        self,
+        budget_seconds: float,
+        beat_interval: float,
+        pref_beats: float,
+        min_seconds: float,
+        rank: float = 0.5,
+    ) -> Optional[float]:
+        """Choose a hold length in whole beats, or None if the window admits none.
+
+        Quantizing to whole beats is what puts tails on the grid — the old path
+        left ``hold_duration`` in raw frames while the head was beat-snapped, so
+        every tail landed off-grid and ``sm_export`` had to re-snap it.
+
+        ``rank`` is the note's sustain percentile among the chart's holds; it
+        indexes :attr:`HOLD_LENGTH_CDF`, so the more a note rings the longer its
+        hold, and the lengths across a chart reproduce the corpus distribution.
+        ``pref_beats`` biases that draw for styles that write unusually long or
+        short holds. The result is then clamped into
+        ``[min_seconds, budget_seconds]``; if no cell survives, the caller drops
+        the candidate rather than flooring it to the minimum.
+        """
+        if beat_interval <= 0:
+            return None
+        fitting = [
+            c for c in self.HOLD_BEAT_CELLS
+            if min_seconds <= c * beat_interval <= budget_seconds
+        ]
+        if not fitting:
+            return None
+
+        bias = pref_beats / self.HOLD_CORPUS_TYPICAL_BEATS if pref_beats > 0 else 1.0
+        draw = float(np.clip(rank * bias, 0.0, 1.0))
+        target = self.HOLD_LENGTH_CDF[-1][0]
+        for cell, cumulative in self.HOLD_LENGTH_CDF:
+            if draw <= cumulative:
+                target = cell
+                break
+        # Clamp into the playable window, preferring the shorter side on a tie —
+        # overshooting pins a foot for longer and suppresses other notes.
+        return min(fitting, key=lambda c: (abs(c - target), c)) * beat_interval
+
     def _postprocess(
         self,
         onset_p: np.ndarray,
-        sustain_p: np.ndarray,
         intensity: np.ndarray,
         tempo: float,
         beat_times: np.ndarray,
@@ -1284,7 +1632,8 @@ class MLChartGenerator:
         arrow_probs: Optional[np.ndarray] = None,
     ) -> List[Step]:
         """
-        Detect WHEN (NMS on onset_p) → classify type (jump/hold/tap) →
+        Detect WHEN (NMS on onset_p) → mark jumps (top-K on intensity) → snap to
+        the beat grid → derive holds (audio sustain, foot-feasibility bounded) →
         assign arrows via FootFlowAssigner (whole-timeline foot-flow pass).
 
         ``timing_offset`` (seconds) is the per-song calibration baked into every
@@ -1299,7 +1648,6 @@ class MLChartGenerator:
         min_gap = max(diff_config.min_gap, self.min_note_gap)
         nms_window_frames = max(1, int(round(min_gap * FRAMES_PER_SECOND)))
         jumps_allowed = 'jump' in diff_config.allowed_patterns
-        holds_allowed = diff_config.hold_percentage > 0
 
         first_allowed = max(0.0, self.min_first_step_time)
         last_allowed = duration - max(0.0, self.min_last_step_buffer)
@@ -1322,11 +1670,6 @@ class MLChartGenerator:
         # Classify each peak.
         jump_threshold = float(style_knobs.get('jump_threshold', self.intensity_threshold_base))
         target_jump_rate = float(style_knobs.get('target_jump_rate', 0.0))
-        jumphold_rate = float(style_knobs.get('jumphold_rate', 0.0))
-        jumphold_rms_thr = float(style_knobs.get('jumphold_rms_thr', 0.7))
-
-        max_hold_frames = max(1, int(round(diff_config.max_hold_duration * FRAMES_PER_SECOND)))
-        rng = random.Random(audio_seed ^ 0xA5A5A5A5)
 
         # Top-K jump selection: rank peaks by predicted intensity, mark the top
         # `target_jump_rate * N` (above the absolute floor) as jumps. Robust
@@ -1357,52 +1700,17 @@ class MLChartGenerator:
                 f"target_rate={target_jump_rate:.3f} → selected=0"
             )
 
+        # Every peak starts as a tap. Holds are derived further down, after beat
+        # snapping, so their tails land on the grid (see _derive_holds).
         note_events = []
         for peak_idx, (frame, t, confidence) in enumerate(peaks):
-            is_hold_start = (
-                holds_allowed
-                and sustain_p[frame] >= self.sustain_threshold_up
-            )
-            is_jump = peak_idx in jump_peak_indices
+            note_events.append({
+                'frame': frame, 'time': t, 'type': 'tap',
+                'confidence': confidence,
+                'num_arrows': 2 if peak_idx in jump_peak_indices else 1,
+            })
 
-            if is_hold_start:
-                end_frame = self._find_hold_end(
-                    sustain_p, harmonic_curve, frame, max_hold_frames,
-                )
-                hold_seconds = max(
-                    diff_config.min_hold_duration,
-                    min(
-                        diff_config.max_hold_duration,
-                        (end_frame - frame) / FRAMES_PER_SECOND,
-                    ),
-                )
-                # Jumphold heuristic: rare; only when both intensity is high
-                # and the audio energy spikes hard at hold onset.
-                rms_at_frame = float(energy_curve[frame]) if energy_curve is not None else 0.0
-                wants_jumphold = (
-                    is_jump
-                    and rms_at_frame > jumphold_rms_thr
-                    and jumphold_rate > 0.0
-                    and rng.random() < jumphold_rate
-                )
-                note_events.append({
-                    'frame': frame, 'time': t, 'type': 'hold',
-                    'confidence': confidence,
-                    'hold_duration': hold_seconds,
-                    'num_arrows': 2 if wants_jumphold else 1,
-                })
-            elif is_jump:
-                note_events.append({
-                    'frame': frame, 'time': t, 'type': 'tap',
-                    'confidence': confidence, 'num_arrows': 2,
-                })
-            else:
-                note_events.append({
-                    'frame': frame, 'time': t, 'type': 'tap',
-                    'confidence': confidence, 'num_arrows': 1,
-                })
-
-        # Density cap — keep top-N by confidence (holds are protected).
+        # Density cap — keep top-N by confidence.
         avg_density = (diff_config.min_density + diff_config.max_density) / 2.0
         target_notes = max(1, int(round(avg_density * duration)))
         logger.info(
@@ -1410,11 +1718,8 @@ class MLChartGenerator:
             f"target_notes={target_notes} (density={avg_density:.2f}/s, dur={duration:.1f}s)"
         )
         if len(note_events) > target_notes:
-            holds = [e for e in note_events if e['type'] == 'hold']
-            taps = [e for e in note_events if e['type'] == 'tap']
-            taps.sort(key=lambda e: e['confidence'], reverse=True)
-            remaining = max(0, target_notes - len(holds))
-            note_events = holds + taps[:remaining]
+            note_events.sort(key=lambda e: e['confidence'], reverse=True)
+            note_events = note_events[:target_notes]
 
         # Beat-snap: anchor each event to the nearest librosa beat, enumerate
         # candidate cells {4th, 8th, 16th, 12th} within that beat, and pick
@@ -1511,6 +1816,14 @@ class MLChartGenerator:
                 last_time = event['time']
         note_events = filtered
 
+        # Hold derivation. Runs on the finalized, beat-snapped timeline so a
+        # hold's length can be measured in whole beats (grid-aligned tails) and
+        # its foot-feasibility judged against the notes that actually survived.
+        self._derive_holds(
+            note_events, harmonic_curve, tempo, beat_times, T,
+            diff_config, style_knobs,
+        )
+
         # Concurrency cap: at any instant the chart shows at most
         # MAX_CONCURRENT_ARROWS arrows (active hold bodies + new taps/jumps).
         # A jump/jumphold counts as 2. If a new event would exceed the cap,
@@ -1553,13 +1866,17 @@ class MLChartGenerator:
         )
 
         steps: List[Step] = []
+        n_unassignable = 0
         for event, arrows in zip(note_events, arrows_per_event):
             if not arrows:
+                n_unassignable += 1
                 continue
             emit_t = round(max(0.0, event['time'] + timing_offset), 3)
             subdivision = event.get('subdivision') or self._subdivision_from_grid(
                 round(event['time'], 3), tempo, beat_times,
             )
+            # `type` may have been demoted hold→tap during assignment, so it is
+            # read after assign(), not before.
             if event['type'] == 'hold':
                 steps.append(Step(
                     time=emit_t,
@@ -1576,6 +1893,11 @@ class MLChartGenerator:
                     beat_subdivision=subdivision,
                 ))
 
+        n_holds = sum(1 for s in steps if s.step_type == StepType.HOLD)
+        logger.info(
+            f"[postprocess debug] emitted {len(steps)} steps "
+            f"({n_holds} holds, {n_unassignable} unassignable)"
+        )
         return steps
 
     def _subdivision_from_grid(

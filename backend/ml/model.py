@@ -1,17 +1,17 @@
 """
-Step Chart Neural Network Model (v7 hybrid).
+Step Chart Neural Network Model (v9 hybrid).
 
 Three-head architecture:
     feats[T,88] -> AudioEncoder (CNN) -> Dilated TCN -> early FiLM
         (difficulty + density + start_seconds + remaining_seconds)
         -> RoPE Transformer -> LayerNorm
         -> onset head      [T, 1] sigmoid: any-onset prob (Gaussian-smoothed BCE)
-        -> sustain head    [T, 1] sigmoid: in-any-hold prob (dense BCE)
         -> intensity head  [T, 1] linear:  jump-vs-tap intensity (MSE regression)
+        -> arrow head      [T, 4] sigmoid: per-column direction, onset frames only
 
 The model predicts dense, style-agnostic signals only. Algorithmic
-post-processing (see `inference.py`) decides arrows, jump vs. tap, hold
-start/end, and jumpholds, parameterized by selectable style profiles.
+post-processing (see `inference.py`) decides arrows, jump vs. tap, and holds,
+parameterized by selectable style profiles.
 """
 
 import math
@@ -22,9 +22,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Bumped to v7: full hybrid rewrite. The arrow/type/duration/beat/hold heads
-# of v6 are gone; the model now emits only onset/sustain/intensity.
-ARCH_VERSION = 8
+# v7: full hybrid rewrite (the arrow/type/duration/beat/hold heads of v6 are
+# gone). v8: added the learned direction head.
+# v9: dropped the sustain head. It could only express "some arrow is held"
+# — a union mask over all four columns — and its supervision was further
+# undermined by jumpholds being relabelled as jumps upstream, so it never
+# learned holds well. Holds are now derived in post-processing from the
+# harmonic-sustain envelope, bounded by foot feasibility, which frees the
+# capacity this head was spending (loss weight 2.0, the second-largest term).
+ARCH_VERSION = 9
 
 
 class AudioEncoder(nn.Module):
@@ -243,10 +249,9 @@ class TransformerBlock(nn.Module):
 
 class StepChartModel(nn.Module):
     """
-    feats -> (onset_logits, sustain_logits, intensity_pred, arrow_logits).
+    feats -> (onset_logits, intensity_pred, arrow_logits).
 
     onset_logits:    [B, T, 1]  any-onset pre-sigmoid
-    sustain_logits:  [B, T, 1]  "any arrow currently held" pre-sigmoid
     intensity_pred:  [B, T, 1]  continuous jump-vs-tap intensity (linear out)
     arrow_logits:    [B, T, 4]  per-column (L/D/U/R) onset pre-sigmoid, or ``None``
                                  when built without the arrow head (v7 back-compat)
@@ -296,7 +301,6 @@ class StepChartModel(nn.Module):
             return nn.Sequential(*layers)
 
         self.onset_head = _mlp_head(1)
-        self.sustain_head = _mlp_head(1)
         self.intensity_head = _mlp_head(1)
         self.arrow_head = _mlp_head(4) if self.with_arrow_head else None
 
@@ -309,14 +313,6 @@ class StepChartModel(nn.Module):
         p = float(max(min(p, 0.999), 1e-4))
         bias = math.log(p / (1.0 - p))
         final = self.onset_head[-1]
-        assert isinstance(final, nn.Linear)
-        nn.init.constant_(final.bias, bias)
-
-    def set_sustain_prior(self, p: float) -> None:
-        """Bias-init the sustain head to logit(p) (any-arrow in-hold rate)."""
-        p = float(max(min(p, 0.999), 1e-4))
-        bias = math.log(p / (1.0 - p))
-        final = self.sustain_head[-1]
         assert isinstance(final, nn.Linear)
         nn.init.constant_(final.bias, bias)
 
@@ -343,7 +339,7 @@ class StepChartModel(nn.Module):
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             feats: [B, T, n_in_channels]
@@ -354,7 +350,6 @@ class StepChartModel(nn.Module):
 
         Returns:
             onset_logits:    [B, T, 1] pre-sigmoid
-            sustain_logits:  [B, T, 1] pre-sigmoid
             intensity_pred:  [B, T, 1] linear regression output
             arrow_logits:    [B, T, 4] pre-sigmoid per column, or None (no arrow head)
         """
@@ -362,10 +357,9 @@ class StepChartModel(nn.Module):
             feats, difficulty, density, start_seconds, remaining_seconds,
         )
         onset_logits = self.onset_head(features)
-        sustain_logits = self.sustain_head(features)
         intensity_pred = self.intensity_head(features)
         arrow_logits = self.arrow_head(features) if self.arrow_head is not None else None
-        return onset_logits, sustain_logits, intensity_pred, arrow_logits
+        return onset_logits, intensity_pred, arrow_logits
 
 
 # ---------------------------------------------------------------------------
@@ -374,18 +368,18 @@ class StepChartModel(nn.Module):
 
 class StepChartLoss(nn.Module):
     """
-    Combined v7 loss:
+    Combined v9 loss:
         - focal BCE on onset_logits against Gaussian-smoothed any-onset target
-        - focal BCE on sustain_logits against dense in-any-hold target
         - MSE on intensity_pred against jump-intensity target (smeared)
+        - per-column BCE on arrow_logits, masked to onset frames
+
+    The sustain term is gone in v9 — see :data:`ARCH_VERSION`.
     """
 
     def __init__(
         self,
         onset_pos_weight: float = 10.0,
-        sustain_pos_weight: float = 5.0,
         focal_gamma: float = 2.0,
-        sustain_weight: float = 1.0,
         intensity_weight: float = 0.5,
         arrow_weight: float = 1.0,
     ):
@@ -394,26 +388,19 @@ class StepChartLoss(nn.Module):
             'onset_pos_weight',
             torch.tensor(float(onset_pos_weight), dtype=torch.float32),
         )
-        self.register_buffer(
-            'sustain_pos_weight',
-            torch.tensor(float(sustain_pos_weight), dtype=torch.float32),
-        )
         self.focal_gamma = float(focal_gamma)
-        self.sustain_weight = float(sustain_weight)
         self.intensity_weight = float(intensity_weight)
         self.arrow_weight = float(arrow_weight)
 
     def forward(
         self,
         onset_logits: torch.Tensor,    # [B, T, 1]
-        sustain_logits: torch.Tensor,  # [B, T, 1]
         intensity_pred: torch.Tensor,  # [B, T, 1]
         onset_soft: torch.Tensor,      # [B, T, 1]
-        sustain_target: torch.Tensor,  # [B, T, 1]
         intensity_target: torch.Tensor,  # [B, T, 1]
         arrow_logits: Optional[torch.Tensor] = None,  # [B, T, 4]
         arrow_target: Optional[torch.Tensor] = None,  # [B, T, 4] per-column onset
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Focal BCE on onset.
         if self.focal_gamma > 0.0:
             bce = F.binary_cross_entropy_with_logits(
@@ -430,23 +417,6 @@ class StepChartLoss(nn.Module):
             onset_loss = F.binary_cross_entropy_with_logits(
                 onset_logits, onset_soft,
                 pos_weight=self.onset_pos_weight,
-            )
-
-        if self.focal_gamma > 0.0:
-            bce_s = F.binary_cross_entropy_with_logits(
-                sustain_logits, sustain_target,
-                pos_weight=self.sustain_pos_weight,
-                reduction='none',
-            )
-            with torch.no_grad():
-                p_s = torch.sigmoid(sustain_logits)
-                p_t_s = sustain_target * p_s + (1.0 - sustain_target) * (1.0 - p_s)
-                focal_w_s = (1.0 - p_t_s).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
-            sustain_loss = (focal_w_s * bce_s).mean()
-        else:
-            sustain_loss = F.binary_cross_entropy_with_logits(
-                sustain_logits, sustain_target,
-                pos_weight=self.sustain_pos_weight,
             )
 
         intensity_loss = F.mse_loss(intensity_pred, intensity_target)
@@ -466,11 +436,10 @@ class StepChartLoss(nn.Module):
 
         total = (
             onset_loss
-            + self.sustain_weight * sustain_loss
             + self.intensity_weight * intensity_loss
             + self.arrow_weight * arrow_loss
         )
         return (
-            total, onset_loss.detach(), sustain_loss.detach(),
+            total, onset_loss.detach(),
             intensity_loss.detach(), arrow_loss.detach(),
         )

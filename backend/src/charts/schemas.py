@@ -149,6 +149,10 @@ class DifficultyConfig(BaseModel):
     hold_percentage: float = Field(default=0.15, ge=0.0, le=1.0)
     min_hold_duration: float = 0.5
     max_hold_duration: float = 3.0
+    # How many notes the free foot may play underneath a hold. A hold pins one
+    # foot, so everything in its span is hit by the other one; 0 keeps holds in
+    # rests (readable for new players), higher values allow hold-under-stream.
+    max_notes_under_hold: int = Field(default=0, ge=0)
     energy_scale_factor: float = 0.5  # how much energy affects density
     min_gap: float = 0.15      # minimum seconds between any two steps
 

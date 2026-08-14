@@ -1,9 +1,11 @@
 """
-Training script for the v7 hybrid step chart model.
+Training script for the v9 hybrid step chart model.
 
-Three dense heads (onset / sustain / intensity), no per-arrow / type /
-duration / beat heads. Composite val metric:
-    0.7 * onset_tol_f1 + 0.15 * sustain_f1 + 0.15 * intensity_jump_auc
+Three dense heads (onset / intensity / direction), no per-arrow / type /
+duration / beat heads. The sustain head was dropped in v9 — holds are derived
+algorithmically at inference (see `inference._derive_holds`). Composite val
+metric:
+    0.75 * onset_tol_f1 + 0.10 * intensity_jump_auc + 0.15 * arrow_col_f1
 
 Usage:
     python -m ml.train \
@@ -40,7 +42,6 @@ from ml.dataset import (
     StepChartDataset,
     compute_default_density_per_difficulty,
     compute_onset_prior,
-    compute_sustain_prior,
     split_entries_by_song,
 )
 
@@ -91,7 +92,6 @@ class BuildOutputs:
     train_idx: List[int]
     val_idx: List[int]
     onset_prior: float
-    sustain_prior: float
     default_density_by_id: torch.Tensor
 
 
@@ -147,7 +147,6 @@ def build_dataloaders(args) -> BuildOutputs:
         )
 
     onset_prior = compute_onset_prior(full_dataset.entries, str(data_dir), train_idx)
-    sustain_prior = compute_sustain_prior(full_dataset.entries, str(data_dir), train_idx)
 
     # Plain RandomSampler over train indices (no rare-class boosts).
     # Train DataLoader iterates over the *subset* via Subset for cleanliness.
@@ -196,7 +195,6 @@ def build_dataloaders(args) -> BuildOutputs:
         train_idx=train_idx,
         val_idx=val_idx,
         onset_prior=onset_prior,
-        sustain_prior=sustain_prior,
         default_density_by_id=default_density_by_id,
     )
 
@@ -204,7 +202,6 @@ def build_dataloaders(args) -> BuildOutputs:
 def build_model(
     args,
     onset_prior: float,
-    sustain_prior: float,
     n_in_channels: int,
     device: torch.device,
 ) -> StepChartModel:
@@ -219,7 +216,6 @@ def build_model(
         tcn_dilations=tcn_dilations,
     ).to(device)
     model.set_onset_prior(onset_prior)
-    model.set_sustain_prior(sustain_prior)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
     return model
@@ -246,33 +242,20 @@ def build_optimizer_and_scheduler(model: nn.Module, args, steps_per_epoch: int):
 
 def build_loss(
     onset_prior: float,
-    sustain_prior: float,
     args,
 ) -> StepChartLoss:
-    """Per-head pos_weights derived from the empirical positive rates.
-
-    Onset:  sqrt((1-p)/p) capped at 50.
-    Sustain: sqrt((1-p)/p) capped at 20 (positives are ~3%, so the raw weight
-        is already smaller than the onset rate's).
+    """Onset pos_weight derived from the empirical positive rate:
+    sqrt((1-p)/p) capped at 50.
     """
     if args.onset_pos_weight is not None:
         opw = float(args.onset_pos_weight)
     else:
         p = max(min(onset_prior, 0.5), 1e-5)
         opw = float(np.clip(np.sqrt((1.0 - p) / p), 1.0, 50.0))
-    if args.sustain_pos_weight is not None:
-        spw = float(args.sustain_pos_weight)
-    else:
-        p = max(min(sustain_prior, 0.5), 1e-4)
-        spw = float(np.clip(np.sqrt((1.0 - p) / p), 1.0, 20.0))
-    logger.info(
-        f"Onset pos_weight={opw:.2f}, sustain pos_weight={spw:.2f}"
-    )
+    logger.info(f"Onset pos_weight={opw:.2f}")
     return StepChartLoss(
         onset_pos_weight=opw,
-        sustain_pos_weight=spw,
         focal_gamma=float(args.focal_gamma),
-        sustain_weight=float(args.sustain_weight),
         intensity_weight=float(args.intensity_weight),
         arrow_weight=float(getattr(args, 'arrow_weight', 1.0)),
     )
@@ -286,26 +269,24 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     total_onset = 0.0
-    total_sustain = 0.0
     total_intensity = 0.0
     total_arrow = 0.0
     total_samples = 0
     n_batches = len(loader)
 
-    interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
+    interval = {'loss': 0.0, 'onset': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
     t_start = time.time()
 
     for step, batch in enumerate(loader):
         (
             feats, difficulty, density,
-            onset_soft, sustain_target, intensity_target,
+            onset_soft, intensity_target,
             start_seconds, remaining_seconds, arrow_target,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
         density = density.to(device, non_blocking=True)
         onset_soft = onset_soft.to(device, non_blocking=True)
-        sustain_target = sustain_target.to(device, non_blocking=True)
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
@@ -313,12 +294,12 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         with _amp_ctx(device):
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = model(
+            onset_logits, intensity_pred, arrow_logits = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, sustain_l, intensity_l, arrow_l = criterion(
-                onset_logits, sustain_logits, intensity_pred,
-                onset_soft, sustain_target, intensity_target,
+            loss, onset_l, intensity_l, arrow_l = criterion(
+                onset_logits, intensity_pred,
+                onset_soft, intensity_target,
                 arrow_logits, arrow_target,
             )
 
@@ -336,14 +317,12 @@ def train_one_epoch(
         bs = feats.size(0)
         total_loss += loss.item() * bs
         total_onset += onset_l.item() * bs
-        total_sustain += sustain_l.item() * bs
         total_intensity += intensity_l.item() * bs
         total_arrow += arrow_l.item() * bs
         total_samples += bs
 
         interval['loss'] += loss.item() * bs
         interval['onset'] += onset_l.item() * bs
-        interval['sustain'] += sustain_l.item() * bs
         interval['intensity'] += intensity_l.item() * bs
         interval['arrow'] += arrow_l.item() * bs
         interval['n'] += bs
@@ -356,19 +335,17 @@ def train_one_epoch(
                 f"  step {step+1:4d}/{n_batches} | "
                 f"loss={interval['loss']/n:.4f} "
                 f"(onset={interval['onset']/n:.4f} "
-                f"sustain={interval['sustain']/n:.4f} "
                 f"intensity={interval['intensity']/n:.4f} "
                 f"arrow={interval['arrow']/n:.4f}) "
                 f"| lr={lr:.2e} | {elapsed:.1f}s",
                 flush=True,
             )
-            interval = {'loss': 0.0, 'onset': 0.0, 'sustain': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
+            interval = {'loss': 0.0, 'onset': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
             t_start = time.time()
 
     return {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
-        'sustain_loss': total_sustain / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
         'arrow_loss': total_arrow / max(total_samples, 1),
     }
@@ -443,26 +420,6 @@ def _f1_at_threshold(
     return prec, rec, f1
 
 
-def _hysteresis_segments(p: np.ndarray, up: float, down: float) -> np.ndarray:
-    """Forward-pass hysteresis. Latches True when p>=up, releases when p<down.
-
-    Frames with down <= p < up carry the prior state (False at start of array).
-    Mirrors the inference-time sustain decoder so val F1 reflects deployed behavior.
-    """
-    if p.size == 0:
-        return np.zeros(0, dtype=bool)
-    entry = p >= up
-    exit_ = p < down
-    events = np.where(entry, 1, np.where(exit_, 0, -1))
-    known = events != -1
-    last_known_idx = np.where(known, np.arange(events.size), -1)
-    np.maximum.accumulate(last_known_idx, out=last_known_idx)
-    out = np.zeros(events.size, dtype=bool)
-    has_prior = last_known_idx >= 0
-    out[has_prior] = events[last_known_idx[has_prior]] == 1
-    return out
-
-
 def _binary_auc(scores: np.ndarray, labels: np.ndarray) -> float:
     """ROC AUC via the rank-sum identity. Returns 0.5 if class is degenerate."""
     pos = labels > 0.5
@@ -485,14 +442,11 @@ def validate(
     model.eval()
     total_loss = 0.0
     total_onset = 0.0
-    total_sustain = 0.0
     total_intensity = 0.0
     total_samples = 0
 
     all_onset_pred: List[np.ndarray] = []
     all_onset_true: List[np.ndarray] = []
-    sustain_pred_chunks: List[np.ndarray] = []
-    sustain_true_chunks: List[np.ndarray] = []
     all_intensity_pred: List[np.ndarray] = []
     all_intensity_true: List[np.ndarray] = []
     total_arrow = 0.0
@@ -501,33 +455,31 @@ def validate(
     for batch in loader:
         (
             feats, difficulty, density,
-            onset_soft, sustain_target, intensity_target,
+            onset_soft, intensity_target,
             start_seconds, remaining_seconds, arrow_target,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
         density = density.to(device, non_blocking=True)
         onset_soft = onset_soft.to(device, non_blocking=True)
-        sustain_target = sustain_target.to(device, non_blocking=True)
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
         arrow_target = arrow_target.to(device, non_blocking=True)
 
         with _amp_ctx(device):
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = model(
+            onset_logits, intensity_pred, arrow_logits = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, sustain_l, intensity_l, arrow_l = criterion(
-                onset_logits, sustain_logits, intensity_pred,
-                onset_soft, sustain_target, intensity_target,
+            loss, onset_l, intensity_l, arrow_l = criterion(
+                onset_logits, intensity_pred,
+                onset_soft, intensity_target,
                 arrow_logits, arrow_target,
             )
 
         bs = feats.size(0)
         total_loss += loss.item() * bs
         total_onset += onset_l.item() * bs
-        total_sustain += sustain_l.item() * bs
         total_intensity += intensity_l.item() * bs
         total_arrow += arrow_l.item() * bs
         total_samples += bs
@@ -545,11 +497,6 @@ def validate(
             torch.sigmoid(onset_logits.float()).cpu().numpy().reshape(-1)
         )
         all_onset_true.append(onset_soft.cpu().numpy().reshape(-1))
-        sp_bt = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]  # [B, T]
-        st_bt = sustain_target.cpu().numpy()[:, :, 0] >= 0.5                  # [B, T]
-        for b in range(sp_bt.shape[0]):
-            sustain_pred_chunks.append(sp_bt[b])
-            sustain_true_chunks.append(st_bt[b])
         all_intensity_pred.append(intensity_pred.float().cpu().numpy().reshape(-1))
         all_intensity_true.append(intensity_target.cpu().numpy().reshape(-1))
 
@@ -579,29 +526,6 @@ def validate(
     onset_f1, onset_thr, onset_p, onset_r = _sweep(tol_frames)
     onset_f1_50ms, _, _, _ = _sweep(5)
 
-    # Sustain F1 / IoU under the inference-time hysteresis decoder:
-    #   up = thr, down = max(0, thr - 0.1). Sweep `up` to pick the threshold
-    #   the inference loader will read back from `best_sustain_threshold`.
-    sustain_best = (0.0, 0.5, 0.0)  # f1, thr, iou
-    for thr in thresholds:
-        up = float(thr)
-        down = max(0.0, up - 0.1)
-        tp = fp = fn = 0
-        for sp_chunk, st_chunk in zip(sustain_pred_chunks, sustain_true_chunks):
-            pred = _hysteresis_segments(sp_chunk, up, down)
-            tp += int(np.logical_and(pred, st_chunk).sum())
-            fp += int(np.logical_and(pred, np.logical_not(st_chunk)).sum())
-            fn += int(np.logical_and(np.logical_not(pred), st_chunk).sum())
-        if tp + fp + fn == 0:
-            continue
-        prec = tp / max(tp + fp, 1)
-        rec = tp / max(tp + fn, 1)
-        f1 = 2 * prec * rec / max(prec + rec, 1e-8)
-        iou = tp / max(tp + fp + fn, 1)
-        if f1 > sustain_best[0]:
-            sustain_best = (float(f1), float(up), float(iou))
-    sustain_f1, sustain_thr, sustain_iou = sustain_best
-
     # Intensity AUC: discriminate "jump-ish frame" (target > 0.5) vs.
     # everything else, using the regression head's raw output as score.
     jump_label = (intensity_true_all > 0.5).astype(np.float32)
@@ -616,7 +540,6 @@ def validate(
     return {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
-        'sustain_loss': total_sustain / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
         'arrow_loss': total_arrow / max(total_samples, 1),
         'arrow_col_f1': float(arrow_col_f1),
@@ -625,9 +548,6 @@ def validate(
         'onset_tol_r': float(onset_r),
         'onset_tol_f1_50ms': float(onset_f1_50ms),
         'best_onset_threshold': float(onset_thr),
-        'sustain_f1': float(sustain_f1),
-        'sustain_iou': float(sustain_iou),
-        'best_sustain_threshold': float(sustain_thr),
         'intensity_jump_auc': float(intensity_auc),
         'intensity_mse': intensity_mse,
     }
@@ -635,14 +555,15 @@ def validate(
 
 def composite_score(metrics: Dict[str, float]) -> float:
     """Headline checkpoint score. v8 folds in the direction head at a small weight
-    (the arrow head does not gate onset/sustain/intensity quality):
-        0.65*onset_tol_f1 + 0.15*sustain_f1 + 0.10*intensity_jump_auc + 0.10*arrow_col_f1
+    (the arrow head does not gate onset/intensity quality). The 0.15 the
+    sustain head used to carry is redistributed to onset and direction, the two
+    signals the algorithmic hold pass now depends on:
+        0.75*onset_tol_f1 + 0.10*intensity_jump_auc + 0.15*arrow_col_f1
     """
     onset = float(metrics.get('onset_tol_f1', 0.0))
-    sustain = float(metrics.get('sustain_f1', 0.0))
     auc = float(metrics.get('intensity_jump_auc', 0.5))
     arrow = float(metrics.get('arrow_col_f1', 0.0))
-    return 0.65 * onset + 0.15 * sustain + 0.10 * auc + 0.10 * arrow
+    return 0.75 * onset + 0.10 * auc + 0.15 * arrow
 
 
 def save_checkpoint(
@@ -659,7 +580,6 @@ def save_checkpoint(
     feat_std: np.ndarray,
     n_in_channels: int,
     onset_prior: float,
-    sustain_prior: float,
     args,
 ) -> None:
     ckpt = {
@@ -675,9 +595,7 @@ def save_checkpoint(
         'scaler_state_dict': scaler.state_dict(),
         'metrics': metrics,
         'best_onset_threshold': float(metrics.get('best_onset_threshold', 0.5)),
-        'best_sustain_threshold': float(metrics.get('best_sustain_threshold', 0.5)),
         'onset_prior': float(onset_prior),
-        'sustain_prior': float(sustain_prior),
         'default_density_by_id': default_density_by_id.tolist(),
         'feat_mean': [float(x) for x in feat_mean],
         'feat_std': [float(x) for x in feat_std],
@@ -711,7 +629,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--tol-frames', type=int, default=3)
     parser.add_argument('--log-interval', type=int, default=50)
     parser.add_argument('--focal-gamma', type=float, default=2.0)
-    parser.add_argument('--sustain-weight', type=float, default=2.0)
     parser.add_argument('--intensity-weight', type=float, default=0.5)
     parser.add_argument('--arrow-weight', type=float, default=1.0,
                         help='Weight of the v8 learned direction (per-column) BCE term')
@@ -721,8 +638,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         help='Cap number of songs (for smoke tests)')
     parser.add_argument('--onset-pos-weight', type=float, default=None,
                         help='Override onset BCE pos_weight; default sqrt((1-p)/p) capped at 50')
-    parser.add_argument('--sustain-pos-weight', type=float, default=None,
-                        help='Override sustain BCE pos_weight; default sqrt((1-p)/p) capped at 20')
     parser.add_argument('--p-density-swap', type=float, default=0.5)
     parser.add_argument('--intro-outro-oversample-prob', type=float, default=0.15)
     parser.add_argument('--plateau-patience', type=int, default=4)
@@ -765,10 +680,10 @@ def main():
     n_in_channels = built.full_dataset.n_in_channels
     print(f"Dataloaders built. Building model (n_in_channels={n_in_channels})...", flush=True)
     model = build_model(
-        args, built.onset_prior, built.sustain_prior,
+        args, built.onset_prior,
         n_in_channels=n_in_channels, device=device,
     )
-    criterion = build_loss(built.onset_prior, built.sustain_prior, args).to(device)
+    criterion = build_loss(built.onset_prior, args).to(device)
     steps_per_epoch = max(1, len(built.train_loader))
     optimizer, scheduler = build_optimizer_and_scheduler(model, args, steps_per_epoch)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -832,7 +747,6 @@ def main():
             f"Epoch {epoch+1:3d}/{args.epochs} "
             f"| train_loss={train_metrics['loss']:.4f} "
             f"(onset={train_metrics['onset_loss']:.4f} "
-            f"sustain={train_metrics['sustain_loss']:.4f} "
             f"intensity={train_metrics['intensity_loss']:.4f}) "
             f"| val_loss={val_metrics['loss']:.4f} "
             f"onset_tol_f1={val_metrics['onset_tol_f1']:.3f} "
@@ -840,8 +754,6 @@ def main():
             f"R={val_metrics['onset_tol_r']:.3f} "
             f"thr={val_metrics['best_onset_threshold']:.2f}) "
             f"f1_50ms={val_metrics['onset_tol_f1_50ms']:.3f} "
-            f"sustain_f1={val_metrics['sustain_f1']:.3f} "
-            f"sustain_iou={val_metrics['sustain_iou']:.3f} "
             f"intensity_auc={val_metrics['intensity_jump_auc']:.3f} "
             f"intensity_mse={val_metrics['intensity_mse']:.4f} "
             f"| composite={composite:.3f} "
@@ -855,7 +767,7 @@ def main():
             built.default_density_by_id,
             built.full_dataset.feat_mean, built.full_dataset.feat_std,
             n_in_channels,
-            built.onset_prior, built.sustain_prior,
+            built.onset_prior,
             args,
         )
 
@@ -867,7 +779,7 @@ def main():
                 built.default_density_by_id,
                 built.full_dataset.feat_mean, built.full_dataset.feat_std,
                 n_in_channels,
-                built.onset_prior, built.sustain_prior,
+                built.onset_prior,
                 args,
             )
             print(f"  -> New best composite={best_composite:.3f}", flush=True)
