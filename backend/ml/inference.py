@@ -1,9 +1,10 @@
 """
-Inference module: generate step charts from audio using the v7 hybrid model.
+Inference module: generate step charts from audio using the v9 model.
 
-The model emits three dense per-frame channels (onset / sustain / intensity).
-Algorithmic post-processing — driven by selectable, auto-clustered style
-profiles — decides arrows, jump vs. tap, hold start/end, and jumpholds.
+The model emits dense per-frame onset / intensity / arrow-direction signals
+(no hold prediction). Algorithmic post-processing — driven by selectable,
+auto-clustered style profiles — decides arrows, jump vs. tap, and derives
+hold notes from the harmonic-sustain envelope.
 """
 
 import hashlib
@@ -71,8 +72,7 @@ class _AudioAnalysis:
 DEFAULT_STYLE_KNOBS: Dict[str, float] = {
     'jump_threshold': 0.05,       # min intensity for a peak to be jump-eligible
     'target_jump_rate': 0.05,     # fraction of peaks to mark as jumps (top-K)
-    'jumphold_rate': 0.0,         # 0 disables jumpholds
-    'jumphold_rms_thr': 0.7,
+    'hold_rate': 0.10,            # fraction of notes to promote to holds (algorithmic)
     'jack_rate': 0.05,
     'crossover_rate': 0.10,
     'stream_preference': 0.5,
@@ -501,10 +501,8 @@ def _profile_knobs(profile: Dict) -> Dict[str, float]:
     knobs['target_jump_rate'] = float(np.clip(jump_rate, 0.0, 0.40))
     knobs['jump_threshold'] = 0.05
 
-    # Jumphold: enable when both holds and jumps are common; rate scales with
-    # min(hold_rate, jump_rate).
-    hold_rate = float(rm.get('hold_rate', 0.04))
-    knobs['jumphold_rate'] = float(np.clip(min(hold_rate, jump_rate) * 1.5, 0.0, 0.4))
+    # Hold density comes straight from the profile's observed hold_rate.
+    knobs['hold_rate'] = float(np.clip(rm.get('hold_rate', 0.10), 0.0, 0.5))
 
     knobs['jack_rate'] = float(np.clip(rm.get('jack_rate', 0.05), 0.0, 0.5))
     knobs['crossover_rate'] = float(np.clip(rm.get('crossover_rate', 0.10), 0.0, 0.5))
@@ -517,7 +515,7 @@ def _profile_knobs(profile: Dict) -> Dict[str, float]:
 
 
 class MLChartGenerator:
-    """Generate step charts using the v7 hybrid model + style profiles."""
+    """Generate step charts using the v9 model + style profiles."""
 
     def __init__(
         self,
@@ -528,8 +526,6 @@ class MLChartGenerator:
         confidence_threshold: Optional[float] = None,
         min_note_gap: float = 0.05,
         snap_to_beats: bool = True,
-        sustain_threshold_up: float = 0.5,
-        sustain_threshold_down: float = 0.4,
         intensity_threshold_base: float = 0.5,
         style: str = 'auto',
         style_profiles_path: Optional[str] = None,
@@ -548,8 +544,6 @@ class MLChartGenerator:
         )
         self.min_note_gap = min_note_gap
         self.snap_to_beats = snap_to_beats
-        self.sustain_threshold_up = float(sustain_threshold_up)
-        self.sustain_threshold_down = float(sustain_threshold_down)
         self.intensity_threshold_base = float(intensity_threshold_base)
         self.min_first_step_time = float(min_first_step_time)
         self.min_last_step_buffer = float(min_last_step_buffer)
@@ -579,13 +573,14 @@ class MLChartGenerator:
     def load_model(self, model_path: str):
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         arch_version = int(checkpoint.get('arch_version', 1))
-        # v7 (onset/sustain/intensity) and v8 (+ learned direction head) are both
-        # supported. The learned direction is only consumed when a v8 checkpoint
-        # actually carries a trained arrow head.
-        if arch_version not in (7, 8):
+        # v7 (onset/sustain/intensity), v8 (+ learned direction head), and v9
+        # (no sustain head) are all supported. The learned direction is consumed
+        # when the checkpoint carries a trained arrow head (v8+). sustain_head
+        # weights from v7/v8 checkpoints are ignored.
+        if arch_version not in (7, 8, 9):
             raise ValueError(
                 f"Checkpoint at {model_path} is arch_version={arch_version}; "
-                f"expected 7 or 8. Retrain with current model.py."
+                f"expected 7, 8, or 9. Retrain with current model.py."
             )
         self.use_learned_arrows = arch_version >= 8
 
@@ -631,17 +626,6 @@ class MLChartGenerator:
             logger.info(
                 f"Onset threshold = {self.confidence_threshold:.3f} "
                 f"(from checkpoint best_onset_threshold)"
-            )
-
-        ckpt_sustain_up = checkpoint.get('best_sustain_threshold')
-        if ckpt_sustain_up is not None:
-            self.sustain_threshold_up = float(ckpt_sustain_up)
-            self.sustain_threshold_down = max(
-                0.0, float(ckpt_sustain_up) - 0.1,
-            )
-            logger.info(
-                f"Sustain thresholds: up={self.sustain_threshold_up:.3f} "
-                f"down={self.sustain_threshold_down:.3f}"
             )
 
         if 'feat_mean' in checkpoint and 'feat_std' in checkpoint:
@@ -933,7 +917,6 @@ class MLChartGenerator:
         analysis: "_AudioAnalysis",
         difficulty: str,
         onset_p: np.ndarray,
-        sustain_p: np.ndarray,
         intensity: np.ndarray,
         style: Optional[str] = None,
         arrow_probs: Optional[np.ndarray] = None,
@@ -941,7 +924,7 @@ class MLChartGenerator:
         """Build a Chart from already-computed per-difficulty signals.
 
         Shared by the single-difficulty and batched-multi paths so
-        post-processing only lives in one place. ``arrow_probs`` ([T,4], v8 only)
+        post-processing only lives in one place. ``arrow_probs`` ([T,4], v8+)
         is the learned per-column direction preference, or None for v7.
         """
         diff_config = get_difficulty_config(difficulty)
@@ -961,7 +944,7 @@ class MLChartGenerator:
         timing_offset = analysis.timing_offset + self.timing_trim
 
         steps = self._postprocess(
-            onset_p, sustain_p, intensity,
+            onset_p, intensity,
             analysis.tempo, analysis.beat_times, analysis.duration, diff_config,
             energy_curve=analysis.rms_norm,
             brightness_curve=analysis.centroid_norm,
@@ -1003,11 +986,11 @@ class MLChartGenerator:
             f"density={target_density:.2f} steps/sec)..."
         )
 
-        onset_p, sustain_p, intensity, arrow_probs = self._predict_chunked(
+        onset_p, intensity, arrow_probs = self._predict_chunked(
             analysis.feats_whitened, difficulty_id, target_density,
         )
         return self._chart_from_signals(
-            analysis, difficulty, onset_p, sustain_p, intensity, style=style,
+            analysis, difficulty, onset_p, intensity, style=style,
             arrow_probs=arrow_probs,
         )
 
@@ -1051,7 +1034,7 @@ class MLChartGenerator:
             f"Running batched inference over {len(names)} difficulties: "
             f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
         )
-        onset_batch, sustain_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
+        onset_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
             analysis.feats_whitened, difficulty_ids, target_densities,
         )
 
@@ -1059,7 +1042,7 @@ class MLChartGenerator:
         for i, name in enumerate(names):
             charts[name] = self._chart_from_signals(
                 analysis, name,
-                onset_batch[i], sustain_batch[i], intensity_batch[i],
+                onset_batch[i], intensity_batch[i],
                 style=style,
                 arrow_probs=(arrow_batch[i] if arrow_batch is not None else None),
             )
@@ -1071,15 +1054,14 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_id: int,
         target_density: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run model on overlapping chunks; return (onset_p, sustain_p, intensity).
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Run model on overlapping chunks; return (onset_p, intensity, arrow_p).
 
-        Each output is shape [T] float32. onset_p and sustain_p are sigmoids;
-        intensity is the raw regression output (clipped to [0, 1]).
+        onset_p is [T] float32 sigmoid; intensity is the raw regression output
+        clipped to [0, 1]; arrow_p is [T,4] float32 sigmoid (or None for v7).
         """
         T = feats.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
-        sustain_sum = np.zeros(T, dtype=np.float32)
         intensity_sum = np.zeros(T, dtype=np.float32)
         arrow_sum = np.zeros((T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
@@ -1114,17 +1096,15 @@ class MLChartGenerator:
                 [remaining_seconds], dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[0, :, 0]
-            sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[0, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[0, :, 0]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[start:start + valid_len] += onset_p[:valid_len]
-            sustain_sum[start:start + valid_len] += sustain_p[:valid_len]
             intensity_sum[start:start + valid_len] += intensity_v[:valid_len]
             if arrow_sum is not None and arrow_logits is not None:
                 arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0]  # [T,4]
@@ -1133,10 +1113,9 @@ class MLChartGenerator:
 
         counts = np.maximum(counts, 1.0)
         onset_avg = onset_sum / counts
-        sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
         arrow_avg = (arrow_sum / counts[:, None]) if arrow_sum is not None else None
-        return onset_avg, sustain_avg, intensity_avg, arrow_avg
+        return onset_avg, intensity_avg, arrow_avg
 
     @torch.no_grad()
     def _predict_chunked_multi(
@@ -1144,13 +1123,13 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_ids: List[int],
         target_densities: List[float],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """Batched-multi version of :meth:`_predict_chunked`.
 
         Runs all difficulties as one forward pass per chunk: the shared audio
         features are broadcast across the batch dimension, while difficulty
-        and density vary per row. Returns three arrays of shape ``[B, T]``,
-        one row per requested difficulty.
+        and density vary per row. Returns onset/intensity arrays of shape
+        ``[B, T]`` (one row per difficulty) plus arrow ``[B, T, 4]`` or None.
         """
         B = len(difficulty_ids)
         if B == 0:
@@ -1163,7 +1142,6 @@ class MLChartGenerator:
 
         T = feats.shape[0]
         onset_sum = np.zeros((B, T), dtype=np.float32)
-        sustain_sum = np.zeros((B, T), dtype=np.float32)
         intensity_sum = np.zeros((B, T), dtype=np.float32)
         arrow_sum = np.zeros((B, T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
@@ -1212,17 +1190,15 @@ class MLChartGenerator:
                 (B,), remaining_seconds, dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, sustain_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, intensity_pred, arrow_logits = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
             onset_p = torch.sigmoid(onset_logits.float()).cpu().numpy()[:, :, 0]
-            sustain_p = torch.sigmoid(sustain_logits.float()).cpu().numpy()[:, :, 0]
             intensity_v = intensity_pred.float().cpu().numpy()[:, :, 0]
 
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
-            sustain_sum[:, start:start + valid_len] += sustain_p[:, :valid_len]
             intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
             if arrow_sum is not None and arrow_logits is not None:
                 arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()  # [B,T,4]
@@ -1231,10 +1207,9 @@ class MLChartGenerator:
 
         counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
-        sustain_avg = sustain_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
         arrow_avg = (arrow_sum / counts[None, :, None]) if arrow_sum is not None else None
-        return onset_avg, sustain_avg, intensity_avg, arrow_avg
+        return onset_avg, intensity_avg, arrow_avg
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1242,34 +1217,188 @@ class MLChartGenerator:
 
     def _find_hold_end(
         self,
-        sustain_p: np.ndarray,
         harmonic_curve: np.ndarray,
         start_frame: int,
         max_frames: int,
     ) -> int:
-        """Walk forward from start_frame until sustain falls below the down
-        threshold (with hysteresis) OR the harmonic energy decays to 10% of
-        the value at start_frame. Returns the final in-hold frame index.
+        """Walk forward from start_frame until the harmonic energy decays below
+        10% of its onset value. Returns the final in-hold frame index.
         """
-        T = sustain_p.shape[0]
+        T = harmonic_curve.shape[0]
         end_cap = min(T, start_frame + max_frames)
         if start_frame >= T - 1:
             return start_frame
-        start_harm = float(harmonic_curve[start_frame]) if harmonic_curve is not None else 1.0
+        start_harm = float(harmonic_curve[start_frame])
         decay_floor = max(start_harm * 0.10, 1e-3)
         f = start_frame + 1
         while f < end_cap:
-            if sustain_p[f] < self.sustain_threshold_down:
-                return f - 1
-            if harmonic_curve is not None and harmonic_curve[f] < decay_floor:
+            if harmonic_curve[f] < decay_floor:
                 return f - 1
             f += 1
         return end_cap - 1
 
+    def _harmonic_sustain_score(
+        self,
+        harmonic_curve: np.ndarray,
+        frame: int,
+        lookahead_frames: int,
+    ) -> float:
+        """How "sustained" the harmonic envelope is just after ``frame``.
+
+        Combines two cues:
+          * persistence — fraction of the lookahead where harmonic energy stays
+            above half its onset value (sustained instruments hold up;
+            percussive hits decay almost immediately);
+          * flatness — 1 minus the normalized std, rewarding held pads/notes
+            over wobbling textures.
+        Returns a score in [0, 1]; higher ⇒ better hold candidate.
+        """
+        if harmonic_curve is None or frame >= harmonic_curve.shape[0]:
+            return 0.0
+        start = float(harmonic_curve[frame])
+        if start < 1e-3:
+            return 0.0
+        seg = harmonic_curve[frame:frame + lookahead_frames]
+        if seg.size < 2:
+            return 0.0
+        persistence = float(np.mean(seg >= 0.5 * start))
+        flatness = 1.0 - float(np.std(seg) / (start + 1e-6))
+        return float(np.clip(0.7 * persistence + 0.3 * flatness, 0.0, 1.0))
+
+    @staticmethod
+    def _beat_interval_at(t: float, beat_times: np.ndarray) -> float:
+        """Local beat spacing (seconds) at time ``t``; 0.5s fallback."""
+        if beat_times is None or len(beat_times) < 2:
+            return 0.5
+        bts = np.asarray(beat_times, dtype=np.float64)
+        idx = int(np.searchsorted(bts, t))
+        idx = max(1, min(idx, bts.size - 1))
+        return float(bts[idx] - bts[idx - 1])
+
+    @staticmethod
+    def _quantize_hold_length(
+        raw_seconds: float,
+        beat_interval: float,
+        min_hold_duration: float,
+        max_hold_duration: float,
+    ) -> float:
+        """Snap a raw hold length to a whole number of beats, then clamp to the
+        difficulty's [min, max] hold-duration bounds."""
+        if beat_interval <= 0:
+            beat_interval = 0.5
+        n_beats = max(1, int(round(raw_seconds / beat_interval)))
+        seconds = n_beats * beat_interval
+        return float(np.clip(seconds, min_hold_duration, max_hold_duration))
+
+    def _derive_holds(
+        self,
+        note_events: List[dict],
+        harmonic_curve: np.ndarray,
+        beat_times: np.ndarray,
+        diff_config,
+        style_knobs: Dict[str, float],
+        rng: random.Random,
+    ) -> List[dict]:
+        """Promote selected taps to holds, purely algorithmically.
+
+        Candidates are single-arrow taps whose harmonic-sustain envelope stays
+        elevated (sustained instrument / vocal / pad). Hold lengths are found by
+        walking the harmonic decay, then quantized to whole beats and clamped to
+        the difficulty's [min, max] hold duration. The count is capped by the
+        style profile's hold_rate (fraction of notes). Each hold pins a foot, so
+        at most ``max_notes_under_hold`` notes may fall beneath it and every one
+        of them must be a single (a jump under a hold is unplayable by the free
+        foot); violating that truncates or skips the hold.
+        """
+        n = len(note_events)
+        if n == 0 or harmonic_curve is None or harmonic_curve.size == 0:
+            return note_events
+
+        hold_rate = float(style_knobs.get('hold_rate', diff_config.hold_percentage))
+        target_holds = max(0, int(round(hold_rate * n)))
+        if target_holds <= 0:
+            return note_events
+
+        max_hold_frames = max(1, int(round(diff_config.max_hold_duration * FRAMES_PER_SECOND)))
+        min_hold_duration = float(diff_config.min_hold_duration)
+        max_hold_duration = float(diff_config.max_hold_duration)
+        max_notes_under = int(getattr(diff_config, 'max_notes_under_hold', 2))
+        lookahead = int(round(0.4 * FRAMES_PER_SECOND))
+
+        # Score every single-arrow tap by how sustained its harmonic envelope is.
+        candidates: List[Tuple[float, int]] = []
+        for i, ev in enumerate(note_events):
+            if ev['type'] != 'tap' or ev.get('num_arrows', 1) != 1:
+                continue
+            score = self._harmonic_sustain_score(harmonic_curve, ev['frame'], lookahead)
+            if score > 0.0:
+                candidates.append((score, i))
+        if not candidates:
+            return note_events
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        min_score = 0.35  # below this the envelope isn't convincingly sustained
+        accepted = 0
+        hold_intervals: List[Tuple[float, float]] = []
+
+        for score, i in candidates:
+            if accepted >= target_holds or score < min_score:
+                break
+            ev = note_events[i]
+            t = float(ev['time'])
+            frame = int(ev['frame'])
+            beat_interval = self._beat_interval_at(t, beat_times)
+
+            # Natural end from harmonic decay, quantized to whole beats.
+            end_frame = self._find_hold_end(harmonic_curve, frame, max_hold_frames)
+            raw_seconds = (end_frame - frame) / FRAMES_PER_SECOND
+            hold_seconds = self._quantize_hold_length(
+                raw_seconds, beat_interval, min_hold_duration, max_hold_duration,
+            )
+            if hold_seconds < min_hold_duration:
+                continue
+            hold_end = t + hold_seconds
+
+            # Foot feasibility: a hold pins one foot, so nothing underneath may be
+            # a jump and at most max_notes_under singles may play underneath.
+            def _under(ht: float, hend: float):
+                return [
+                    o for o in note_events
+                    if o is not ev and ht < o['time'] < hend
+                ]
+
+            under = _under(t, hold_end)
+            if any(o.get('num_arrows', 1) > 1 for o in under) or len(under) > max_notes_under:
+                # Truncate to before the first offending note, then re-check.
+                first_under_t = min(o['time'] for o in under) if under else hold_end
+                hold_seconds = self._quantize_hold_length(
+                    max(0.0, first_under_t - t), beat_interval,
+                    min_hold_duration, max_hold_duration,
+                )
+                hold_end = t + hold_seconds
+                under = _under(t, hold_end)
+                if (
+                    hold_seconds < min_hold_duration
+                    or any(o.get('num_arrows', 1) > 1 for o in under)
+                    or len(under) > max_notes_under
+                ):
+                    continue
+
+            # No two holds may overlap (both feet pinned would block everything).
+            if any(t < hs_end and hs_start < hold_end for hs_start, hs_end in hold_intervals):
+                continue
+
+            ev['type'] = 'hold'
+            ev['hold_duration'] = round(hold_seconds, 3)
+            ev['num_arrows'] = 1
+            hold_intervals.append((t, hold_end))
+            accepted += 1
+
+        return note_events
+
     def _postprocess(
         self,
         onset_p: np.ndarray,
-        sustain_p: np.ndarray,
         intensity: np.ndarray,
         tempo: float,
         beat_times: np.ndarray,
@@ -1284,8 +1413,9 @@ class MLChartGenerator:
         arrow_probs: Optional[np.ndarray] = None,
     ) -> List[Step]:
         """
-        Detect WHEN (NMS on onset_p) → classify type (jump/hold/tap) →
-        assign arrows via FootFlowAssigner (whole-timeline foot-flow pass).
+        Detect WHEN (NMS on onset_p) → classify jump vs. tap → beat-snap →
+        derive holds algorithmically → assign arrows via FootFlowAssigner
+        (whole-timeline foot-flow pass).
 
         ``timing_offset`` (seconds) is the per-song calibration baked into every
         emitted step time; negative pulls notes earlier.
@@ -1322,10 +1452,7 @@ class MLChartGenerator:
         # Classify each peak.
         jump_threshold = float(style_knobs.get('jump_threshold', self.intensity_threshold_base))
         target_jump_rate = float(style_knobs.get('target_jump_rate', 0.0))
-        jumphold_rate = float(style_knobs.get('jumphold_rate', 0.0))
-        jumphold_rms_thr = float(style_knobs.get('jumphold_rms_thr', 0.7))
 
-        max_hold_frames = max(1, int(round(diff_config.max_hold_duration * FRAMES_PER_SECOND)))
         rng = random.Random(audio_seed ^ 0xA5A5A5A5)
 
         # Top-K jump selection: rank peaks by predicted intensity, mark the top
@@ -1357,52 +1484,18 @@ class MLChartGenerator:
                 f"target_rate={target_jump_rate:.3f} → selected=0"
             )
 
+        # The model only decides WHEN notes happen and WHICH are jumps. Holds
+        # are derived later, after beat snapping, from the harmonic envelope.
         note_events = []
         for peak_idx, (frame, t, confidence) in enumerate(peaks):
-            is_hold_start = (
-                holds_allowed
-                and sustain_p[frame] >= self.sustain_threshold_up
-            )
             is_jump = peak_idx in jump_peak_indices
+            note_events.append({
+                'frame': frame, 'time': t, 'type': 'tap',
+                'confidence': confidence,
+                'num_arrows': 2 if is_jump else 1,
+            })
 
-            if is_hold_start:
-                end_frame = self._find_hold_end(
-                    sustain_p, harmonic_curve, frame, max_hold_frames,
-                )
-                hold_seconds = max(
-                    diff_config.min_hold_duration,
-                    min(
-                        diff_config.max_hold_duration,
-                        (end_frame - frame) / FRAMES_PER_SECOND,
-                    ),
-                )
-                # Jumphold heuristic: rare; only when both intensity is high
-                # and the audio energy spikes hard at hold onset.
-                rms_at_frame = float(energy_curve[frame]) if energy_curve is not None else 0.0
-                wants_jumphold = (
-                    is_jump
-                    and rms_at_frame > jumphold_rms_thr
-                    and jumphold_rate > 0.0
-                    and rng.random() < jumphold_rate
-                )
-                note_events.append({
-                    'frame': frame, 'time': t, 'type': 'hold',
-                    'confidence': confidence,
-                    'hold_duration': hold_seconds,
-                    'num_arrows': 2 if wants_jumphold else 1,
-                })
-            elif is_jump:
-                note_events.append({
-                    'frame': frame, 'time': t, 'type': 'tap',
-                    'confidence': confidence, 'num_arrows': 2,
-                })
-            else:
-                note_events.append({
-                    'frame': frame, 'time': t, 'type': 'tap',
-                    'confidence': confidence, 'num_arrows': 1,
-                })
-
-        # Density cap — keep top-N by confidence (holds are protected).
+        # Density cap — keep top-N by confidence.
         avg_density = (diff_config.min_density + diff_config.max_density) / 2.0
         target_notes = max(1, int(round(avg_density * duration)))
         logger.info(
@@ -1410,11 +1503,8 @@ class MLChartGenerator:
             f"target_notes={target_notes} (density={avg_density:.2f}/s, dur={duration:.1f}s)"
         )
         if len(note_events) > target_notes:
-            holds = [e for e in note_events if e['type'] == 'hold']
-            taps = [e for e in note_events if e['type'] == 'tap']
-            taps.sort(key=lambda e: e['confidence'], reverse=True)
-            remaining = max(0, target_notes - len(holds))
-            note_events = holds + taps[:remaining]
+            note_events.sort(key=lambda e: e['confidence'], reverse=True)
+            note_events = note_events[:target_notes]
 
         # Beat-snap: anchor each event to the nearest librosa beat, enumerate
         # candidate cells {4th, 8th, 16th, 12th} within that beat, and pick
@@ -1510,6 +1600,16 @@ class MLChartGenerator:
                 filtered.append(event)
                 last_time = event['time']
         note_events = filtered
+
+        # Derive holds algorithmically from the harmonic-sustain envelope. This
+        # promotes selected taps to holds AFTER beat snapping, so hold lengths
+        # quantize cleanly to whole beats and foot-feasibility checks see the
+        # finalized note timeline.
+        if holds_allowed:
+            note_events = self._derive_holds(
+                note_events, harmonic_curve, beat_times, diff_config,
+                style_knobs, rng,
+            )
 
         # Concurrency cap: at any instant the chart shows at most
         # MAX_CONCURRENT_ARROWS arrows (active hold bodies + new taps/jumps).

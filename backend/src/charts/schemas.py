@@ -149,6 +149,7 @@ class DifficultyConfig(BaseModel):
     hold_percentage: float = Field(default=0.15, ge=0.0, le=1.0)
     min_hold_duration: float = 0.5
     max_hold_duration: float = 3.0
+    max_notes_under_hold: int = 2  # max singles playable under a hold (one foot pins)
     energy_scale_factor: float = 0.5  # how much energy affects density
     min_gap: float = 0.15      # minimum seconds between any two steps
 

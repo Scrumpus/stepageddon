@@ -1,9 +1,10 @@
 """
-PyTorch Dataset for step chart training data (v7 hybrid).
+PyTorch Dataset for step chart training data (v9).
 
 Loads preprocessed feats[T,88] tensors plus per-chart label arrays, returns
-random chunks for training. The model only consumes onset / sustain /
-intensity targets — derived per-chunk from the saved label arrays.
+random chunks for training. The model consumes onset / intensity / arrow
+targets — derived per-chunk from the saved label arrays. Holds are not
+supervised; they are derived algorithmically at inference time.
 """
 
 import json
@@ -35,58 +36,6 @@ FRAMES_PER_SECOND = 22050 / 220  # ~100.23
 DIFFICULTY_ID_TO_NAME = {
     0: 'beginner', 1: 'easy', 2: 'medium', 3: 'hard', 4: 'challenge',
 }
-
-
-def _build_sustain_target(
-    arrow_labels: np.ndarray,
-    labels: np.ndarray,
-    durations_seconds: np.ndarray,
-    fps: float,
-    boundary_ramp: int = 2,
-) -> np.ndarray:
-    """Per-frame "any arrow currently held" indicator over the full song.
-
-    Hold boundaries are inherently ambiguous to within a frame or two, so the
-    target ramps linearly to/from 1.0 just outside each segment instead of
-    flipping hard. The hysteresis-based eval decoder expects exactly this
-    kind of soft boundary; hard 0/1 labels punished the model for 1-frame
-    boundary jitter and depressed val IoU/F1.
-
-    Args:
-        arrow_labels: [T, 4] uint8 — per-arrow onset indicator.
-        labels: [T] uint8 — frame-level note class. Hold starts have value 3.
-        durations_seconds: [T] float32 — total hold duration in seconds at
-            hold_start frames, 0 elsewhere.
-        boundary_ramp: number of frames on each side of a hold span to soften.
-
-    Returns:
-        sustain: [T] float32 in [0, 1]. 1.0 inside any hold span on any arrow,
-            ramping down outside the span across `boundary_ramp` frames.
-    """
-    T = arrow_labels.shape[0]
-    out = np.zeros(T, dtype=np.float32)
-    if T == 0:
-        return out
-    hs_indices = np.flatnonzero(labels == 3)
-    if hs_indices.size == 0:
-        return out
-    for hs in hs_indices:
-        dur_seconds = float(durations_seconds[hs])
-        if dur_seconds <= 0.0:
-            continue
-        dur_frames = max(1, int(round(dur_seconds * fps)))
-        start = int(hs)
-        end = min(T, start + dur_frames)
-        out[start:end] = 1.0
-        for k in range(1, boundary_ramp + 1):
-            w = 1.0 - k / (boundary_ramp + 1)
-            left = start - k
-            if left >= 0:
-                out[left] = max(out[left], w)
-            right = end + k - 1
-            if right < T:
-                out[right] = max(out[right], w)
-    return out
 
 
 def _build_intensity_target(
@@ -140,8 +89,8 @@ def load_manifest(manifest_path: str) -> dict:
 
 class StepChartDataset(Dataset):
     """
-    Dataset of (feats_chunk, difficulty, density, onset_soft, sustain,
-    intensity, start_seconds, remaining_seconds) tuples.
+    Dataset of (feats_chunk, difficulty, density, onset_soft, intensity,
+    start_seconds, remaining_seconds, arrow_target) tuples.
 
     Each item is a fixed-length chunk from a song/chart pair. During training,
     chunks are randomly offset (with intro/outro oversampling). During val,
@@ -265,14 +214,10 @@ class StepChartDataset(Dataset):
         data = np.load(self.data_dir / entry['filename'])
         feats_full = data['feats']                    # [T, 88] float16
         labels = data[entry['labels_key']]            # [T] uint8
-        durations = data[entry['durations_key']]      # [T] float32 seconds at hold_start
         arrow_labels = data[entry['arrow_labels_key']]  # [T, 4] uint8
 
-        # Build per-song streams before slicing so chunks starting mid-hold
-        # still get correct supervision.
-        sustain_full = _build_sustain_target(
-            arrow_labels, labels, durations, FRAMES_PER_SECOND,
-        )
+        # Build the per-song intensity stream before slicing so chunks starting
+        # near a jump still get correct supervision.
         intensity_full = _build_intensity_target(
             labels, smear_radius=self.intensity_smear_radius,
         )
@@ -280,7 +225,6 @@ class StepChartDataset(Dataset):
         end = start + self.chunk_frames
         feats_chunk = feats_full[start:end].astype(np.float32)  # [T, 88] in [0,1] for mel sub-block
         labels_chunk = labels[start:end].astype(np.int64)
-        sustain_chunk = sustain_full[start:end].astype(np.float32)
         intensity_chunk = intensity_full[start:end].astype(np.float32)
         arrow_labels_chunk = arrow_labels[start:end].astype(np.float32)  # [T, 4]
         difficulty = entry['difficulty_id']
@@ -330,7 +274,6 @@ class StepChartDataset(Dataset):
             torch.tensor(difficulty, dtype=torch.long),
             torch.tensor(density_norm, dtype=torch.float32),
             torch.from_numpy(onset_soft).unsqueeze(-1),       # [T, 1]
-            torch.from_numpy(sustain_chunk).unsqueeze(-1),    # [T, 1]
             torch.from_numpy(intensity_chunk).unsqueeze(-1),  # [T, 1]
             torch.tensor(start_seconds, dtype=torch.float32),
             torch.tensor(remaining_seconds, dtype=torch.float32),
@@ -434,56 +377,6 @@ def compute_onset_prior(
         total += int(labels.shape[0])
     p = pos / max(total, 1)
     logger.info(f"Empirical per-frame onset rate: {p:.6f}")
-    return float(p)
-
-
-def compute_sustain_prior(
-    manifest: List[dict],
-    data_dir: str,
-    indices: Optional[List[int]] = None,
-    sample_limit: int = 200,
-) -> float:
-    """Empirical per-frame "any arrow held" rate.
-
-    Used to bias-init the sustain head. Returns 0.03 (≈3%) as fallback if
-    no holds are found in the sampled archives.
-    """
-    data_dir = Path(data_dir)
-    idxs = indices if indices is not None else list(range(len(manifest)))
-    if len(idxs) > sample_limit:
-        step = max(1, len(idxs) // sample_limit)
-        idxs = idxs[::step][:sample_limit]
-    pos = 0
-    total = 0
-    seen_any = False
-    for i in idxs:
-        entry = manifest[i]
-        archive = np.load(data_dir / entry['filename'])
-        labels_key = entry.get('labels_key')
-        durations_key = entry.get('durations_key')
-        arrow_key = entry.get('arrow_labels_key')
-        if not (
-            labels_key in archive.files
-            and durations_key in archive.files
-            and arrow_key in archive.files
-        ):
-            continue
-        labels = archive[labels_key]
-        durations = archive[durations_key]
-        arrow_labels = archive[arrow_key]
-        sustain = _build_sustain_target(
-            arrow_labels, labels, durations, FRAMES_PER_SECOND,
-        )
-        seen_any = True
-        pos += int((sustain > 0.5).sum())
-        total += int(sustain.shape[0])
-    if not seen_any or total == 0:
-        logger.warning(
-            "No sustain data found while computing sustain prior; using 0.03 fallback."
-        )
-        return 0.03
-    p = pos / max(total, 1)
-    logger.info(f"Empirical per-frame sustain rate: {p:.6f}")
     return float(p)
 
 

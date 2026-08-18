@@ -95,7 +95,20 @@ docker compose logs -f   # follow logs
 docker compose down      # stop
 ```
 
-There are **no test files or test commands** configured.
+### Tests
+
+No pytest is installed; each test file runs standalone from `backend/`:
+
+```bash
+PYTHONPATH=. python tests/test_sm_export.py      # .sm export round-trip
+PYTHONPATH=. python tests/test_derive_holds.py   # algorithmic hold derivation
+```
+
+Offline hold-quality evaluation against the training corpus:
+
+```bash
+PYTHONPATH=. python -m ml.eval_holds --limit 150
+```
 
 ## Architecture
 
@@ -118,10 +131,31 @@ Each domain is a self-contained subpackage under `src/` with its own **router** 
 
 ### ML Module (`ml/`)
 
-- **`MLChartGenerator`** (`ml/inference.py:360`) — the sole inference entry point. Loads checkpoint at startup via `ML_MODEL_PATH` env var.
+- **`MLChartGenerator`** (`ml/inference.py`) — the sole inference entry point. Loads checkpoint at startup via `ML_MODEL_PATH` env var.
 - **`prepare_data.py`** — converts `.sm` charts + audio into npz training data (mel spectrogram + onset strength + spectral contrast features).
 - **Training pipeline**: `prepare_data.py` → `dataset.py` → `train.py` → checkpoint saved to `ml/checkpoints/best_model.pt`.
 - No algorithmic fallback if checkpoint can't be loaded — app fails fast.
+
+**Model heads (v9, `ARCH_VERSION = 9`)** — the model emits dense per-frame signals only:
+
+| Head | Shape | Predicts |
+|---|---|---|
+| onset | `[T,1]` | any-onset probability |
+| intensity | `[T,1]` | jump-vs-tap intensity (regression) |
+| arrow | `[T,4]` | per-column L/D/U/R direction, supervised on onset frames only |
+
+Everything else is algorithmic post-processing in `inference.py`: jump selection
+(top-K on intensity), beat snapping, **hold derivation**, and foot-flow arrow
+assignment. v7/v8 checkpoints still load — their `sustain_head` weights are
+ignored.
+
+**Holds are not predicted.** `_derive_holds` promotes taps to holds after beat
+snapping: the harmonic-sustain envelope proposes candidates, foot feasibility
+bounds how long each may run (a hold pins one foot; everything under it is
+played by the other), lengths quantize to whole beats drawn from the corpus
+length distribution, and the count is capped by the style profile's `hold_rate`.
+Per-difficulty `max_notes_under_hold` (`src/generation/constants.py`) controls
+how much may play underneath — 0 for beginner/easy keeps holds in rests.
 
 ### Frontend — State via zustand
 
@@ -209,6 +243,6 @@ Response: `{ song_id, charts: { beginner: { steps: [...] }, ... }, song_info, au
 - **ML**: Model trained offline; API runs inference only. Checkpoint loaded at startup.
 - **Imports**: `from src.xxx import ...` (absolute within backend package). Must run from `backend/` dir or set `PYTHONPATH=.`.
 - **Audio**: All loaded at 22050 Hz via librosa. Files saved to `AUDIO_STORAGE_PATH` (never auto-deleted).
-- **No test suite exists** — no pytest configuration, no test files.
+- **Tests** are standalone scripts under `backend/tests/` (no pytest installed); run them with `PYTHONPATH=. python tests/<file>.py`.
 
 ## Notes
