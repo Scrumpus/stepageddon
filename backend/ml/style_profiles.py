@@ -42,7 +42,6 @@ import numpy as np
 
 from ml.dataset import (
     FRAMES_PER_SECOND,
-    _build_sustain_target,
     load_manifest,
 )
 
