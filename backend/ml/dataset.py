@@ -1,10 +1,10 @@
 """
-PyTorch Dataset for step chart training data (v9).
+PyTorch Dataset for step chart training data (v10).
 
 Loads preprocessed feats[T,88] tensors plus per-chart label arrays, returns
-random chunks for training. The model consumes onset / intensity / direction
-targets — derived per-chunk from the saved label arrays. Hold notes are no
-longer a model target: they are assigned algorithmically at inference time.
+random chunks for training. The model consumes onset / intensity targets —
+derived per-chunk from the saved label arrays. Hold notes and arrow direction
+are assigned algorithmically at inference time, not predicted by the model.
 """
 
 import json
@@ -214,7 +214,6 @@ class StepChartDataset(Dataset):
         data = np.load(self.data_dir / entry['filename'])
         feats_full = data['feats']                    # [T, 88] float16
         labels = data[entry['labels_key']]            # [T] uint8
-        arrow_labels = data[entry['arrow_labels_key']]  # [T, 4] uint8
 
         intensity_full = _build_intensity_target(
             labels, smear_radius=self.intensity_smear_radius,
@@ -224,7 +223,6 @@ class StepChartDataset(Dataset):
         feats_chunk = feats_full[start:end].astype(np.float32)  # [T, 88] in [0,1] for mel sub-block
         labels_chunk = labels[start:end].astype(np.int64)
         intensity_chunk = intensity_full[start:end].astype(np.float32)
-        arrow_labels_chunk = arrow_labels[start:end].astype(np.float32)  # [T, 4]
         difficulty = entry['difficulty_id']
 
         # Per-chunk step density (steps/sec): any frame with a note event.
@@ -246,7 +244,7 @@ class StepChartDataset(Dataset):
             density = float(self._default_density_by_id[difficulty].item())
         density_norm = (density - DENSITY_MEAN) / DENSITY_STD
 
-        # Onset target: row-max over arrow_labels at each frame, then smoothed.
+        # Onset target: any frame with a note event (tap/jump/hold head), smoothed.
         onset_hard = (labels_chunk >= 1).astype(np.float32)
         if self.is_train and self._onset_kernel is not None:
             onset_soft = self._smooth_1d(onset_hard)
@@ -275,7 +273,6 @@ class StepChartDataset(Dataset):
             torch.from_numpy(intensity_chunk).unsqueeze(-1),  # [T, 1]
             torch.tensor(start_seconds, dtype=torch.float32),
             torch.tensor(remaining_seconds, dtype=torch.float32),
-            torch.from_numpy(arrow_labels_chunk),             # [T, 4]
         )
 
     # ------------------------------------------------------------------

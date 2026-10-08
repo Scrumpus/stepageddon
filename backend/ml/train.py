@@ -1,10 +1,10 @@
 """
-Training script for the v9 step chart model.
+Training script for the v10 step chart model.
 
-Two dense heads plus a learned direction head (onset / intensity / arrow), no
-sustain head — hold notes are assigned algorithmically at inference time.
+Two dense heads (onset / intensity). Hold notes AND arrow direction are
+assigned algorithmically at inference time.
 Composite val metric:
-    0.70 * onset_tol_f1 + 0.15 * intensity_jump_auc + 0.15 * arrow_col_f1
+    0.80 * onset_tol_f1 + 0.20 * intensity_jump_auc
 
 Usage:
     python -m ml.train \
@@ -252,16 +252,11 @@ def build_loss(
     else:
         p = max(min(onset_prior, 0.5), 1e-5)
         opw = float(np.clip(np.sqrt((1.0 - p) / p), 1.0, 50.0))
-    logger.info(
-        f"Onset pos_weight={opw:.2f}, arrow_pos_weight="
-        f"{float(getattr(args, 'arrow_pos_weight', 2.0)):.2f}"
-    )
+    logger.info(f"Onset pos_weight={opw:.2f}")
     return StepChartLoss(
         onset_pos_weight=opw,
         focal_gamma=float(args.focal_gamma),
         intensity_weight=float(args.intensity_weight),
-        arrow_weight=float(getattr(args, 'arrow_weight', 1.0)),
-        arrow_pos_weight=float(getattr(args, 'arrow_pos_weight', 2.0)),
     )
 
 
@@ -274,18 +269,17 @@ def train_one_epoch(
     total_loss = 0.0
     total_onset = 0.0
     total_intensity = 0.0
-    total_arrow = 0.0
     total_samples = 0
     n_batches = len(loader)
 
-    interval = {'loss': 0.0, 'onset': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
+    interval = {'loss': 0.0, 'onset': 0.0, 'intensity': 0.0, 'n': 0}
     t_start = time.time()
 
     for step, batch in enumerate(loader):
         (
             feats, difficulty, density,
             onset_soft, intensity_target,
-            start_seconds, remaining_seconds, arrow_target,
+            start_seconds, remaining_seconds,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -294,17 +288,15 @@ def train_one_epoch(
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
-        arrow_target = arrow_target.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with _amp_ctx(device):
-            onset_logits, intensity_pred, arrow_logits = model(
+            onset_logits, intensity_pred = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, intensity_l, arrow_l = criterion(
+            loss, onset_l, intensity_l = criterion(
                 onset_logits, intensity_pred,
                 onset_soft, intensity_target,
-                arrow_logits, arrow_target,
             )
 
         scaler.scale(loss).backward()
@@ -322,13 +314,11 @@ def train_one_epoch(
         total_loss += loss.item() * bs
         total_onset += onset_l.item() * bs
         total_intensity += intensity_l.item() * bs
-        total_arrow += arrow_l.item() * bs
         total_samples += bs
 
         interval['loss'] += loss.item() * bs
         interval['onset'] += onset_l.item() * bs
         interval['intensity'] += intensity_l.item() * bs
-        interval['arrow'] += arrow_l.item() * bs
         interval['n'] += bs
 
         if (step + 1) % log_interval == 0 or (step + 1) == n_batches:
@@ -339,19 +329,17 @@ def train_one_epoch(
                 f"  step {step+1:4d}/{n_batches} | "
                 f"loss={interval['loss']/n:.4f} "
                 f"(onset={interval['onset']/n:.4f} "
-                f"intensity={interval['intensity']/n:.4f} "
-                f"arrow={interval['arrow']/n:.4f}) "
+                f"intensity={interval['intensity']/n:.4f}) "
                 f"| lr={lr:.2e} | {elapsed:.1f}s",
                 flush=True,
             )
-            interval = {'loss': 0.0, 'onset': 0.0, 'intensity': 0.0, 'arrow': 0.0, 'n': 0}
+            interval = {'loss': 0.0, 'onset': 0.0, 'intensity': 0.0, 'n': 0}
             t_start = time.time()
 
     return {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
-        'arrow_loss': total_arrow / max(total_samples, 1),
     }
 
 
@@ -453,15 +441,12 @@ def validate(
     all_onset_true: List[np.ndarray] = []
     all_intensity_pred: List[np.ndarray] = []
     all_intensity_true: List[np.ndarray] = []
-    total_arrow = 0.0
-    all_arrow_pred: List[np.ndarray] = []
-    all_arrow_true: List[np.ndarray] = []
 
     for batch in loader:
         (
             feats, difficulty, density,
             onset_soft, intensity_target,
-            start_seconds, remaining_seconds, arrow_target,
+            start_seconds, remaining_seconds,
         ) = batch
         feats = feats.to(device, non_blocking=True)
         difficulty = difficulty.to(device, non_blocking=True)
@@ -470,30 +455,21 @@ def validate(
         intensity_target = intensity_target.to(device, non_blocking=True)
         start_seconds = start_seconds.to(device, non_blocking=True)
         remaining_seconds = remaining_seconds.to(device, non_blocking=True)
-        arrow_target = arrow_target.to(device, non_blocking=True)
 
         with _amp_ctx(device):
-            onset_logits, intensity_pred, arrow_logits = model(
+            onset_logits, intensity_pred = model(
                 feats, difficulty, density, start_seconds, remaining_seconds,
             )
-            loss, onset_l, intensity_l, arrow_l = criterion(
+            loss, onset_l, intensity_l = criterion(
                 onset_logits, intensity_pred,
                 onset_soft, intensity_target,
-                arrow_logits, arrow_target,
             )
 
         bs = feats.size(0)
         total_loss += loss.item() * bs
         total_onset += onset_l.item() * bs
         total_intensity += intensity_l.item() * bs
-        total_arrow += arrow_l.item() * bs
         total_samples += bs
-
-        if arrow_logits is not None:
-            all_arrow_pred.append(
-                torch.sigmoid(arrow_logits.float()).cpu().numpy().reshape(-1, 4)
-            )
-            all_arrow_true.append(arrow_target.cpu().numpy().reshape(-1, 4))
 
         all_onset_pred.append(
             torch.sigmoid(onset_logits.float()).cpu().numpy().reshape(-1)
@@ -534,37 +510,10 @@ def validate(
     intensity_auc = _binary_auc(intensity_pred_all, jump_label)
     intensity_mse = float(np.mean((intensity_pred_all - intensity_true_all) ** 2))
 
-    # Per-column direction F1, threshold-swept over onset frames only. The
-    # multi-label sigmoid head sits at a ~27% positive prior, so a fixed 0.5
-    # threshold reads a well-ranked but conservative head as all-negative.
-    # Inference only consumes the *ranking* of the 4 columns, so sweep the
-    # threshold exactly like the onset metric.
-    arrow_col_f1 = 0.0
-    if all_arrow_pred:
-        ap_all = np.concatenate(all_arrow_pred)   # [N, 4]
-        at_all = np.concatenate(all_arrow_true)   # [N, 4]
-        onset_rows = at_all.any(axis=1)
-        ap = ap_all[onset_rows]
-        at = at_all[onset_rows] >= 0.5             # bool
-        best = (0.0, 0.5)
-        for thr in thresholds:
-            pred = ap >= thr
-            tp = int((pred & at).sum())
-            fp = int((pred & ~at).sum())
-            fn = int((~pred & at).sum())
-            prec = tp / max(tp + fp, 1)
-            rec = tp / max(tp + fn, 1)
-            f1 = 2 * prec * rec / max(prec + rec, 1e-8)
-            if f1 > best[0]:
-                best = (float(f1), float(thr))
-        arrow_col_f1 = best[0]
-
     return {
         'loss': total_loss / max(total_samples, 1),
         'onset_loss': total_onset / max(total_samples, 1),
         'intensity_loss': total_intensity / max(total_samples, 1),
-        'arrow_loss': total_arrow / max(total_samples, 1),
-        'arrow_col_f1': float(arrow_col_f1),
         'onset_tol_f1': float(onset_f1),
         'onset_tol_p': float(onset_p),
         'onset_tol_r': float(onset_r),
@@ -576,13 +525,12 @@ def validate(
 
 
 def composite_score(metrics: Dict[str, float]) -> float:
-    """Headline checkpoint score (v9: no sustain head):
-        0.70*onset_tol_f1 + 0.15*intensity_jump_auc + 0.15*arrow_col_f1
+    """Headline checkpoint score (v10: onset + intensity only):
+        0.80*onset_tol_f1 + 0.20*intensity_jump_auc
     """
     onset = float(metrics.get('onset_tol_f1', 0.0))
     auc = float(metrics.get('intensity_jump_auc', 0.5))
-    arrow = float(metrics.get('arrow_col_f1', 0.0))
-    return 0.70 * onset + 0.15 * auc + 0.15 * arrow
+    return 0.80 * onset + 0.20 * auc
 
 
 def save_checkpoint(
@@ -649,10 +597,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--log-interval', type=int, default=50)
     parser.add_argument('--focal-gamma', type=float, default=2.0)
     parser.add_argument('--intensity-weight', type=float, default=0.5)
-    parser.add_argument('--arrow-weight', type=float, default=1.0,
-                        help='Weight of the learned direction (per-column) BCE term')
-    parser.add_argument('--arrow-pos-weight', type=float, default=2.0,
-                        help='Pos-weight for the per-column direction BCE (default 2.0)')
     parser.add_argument('--device', type=str, default='auto',
                         help="auto | cuda | mps | cpu (auto prefers cuda, then mps, then cpu)")
     parser.add_argument('--max-songs', type=int, default=None,
@@ -768,8 +712,7 @@ def main():
             f"Epoch {epoch+1:3d}/{args.epochs} "
             f"| train_loss={train_metrics['loss']:.4f} "
             f"(onset={train_metrics['onset_loss']:.4f} "
-            f"intensity={train_metrics['intensity_loss']:.4f} "
-            f"arrow={train_metrics['arrow_loss']:.4f}) "
+            f"intensity={train_metrics['intensity_loss']:.4f}) "
             f"| val_loss={val_metrics['loss']:.4f} "
             f"onset_tol_f1={val_metrics['onset_tol_f1']:.3f} "
             f"(P={val_metrics['onset_tol_p']:.3f} "
@@ -778,7 +721,6 @@ def main():
             f"f1_50ms={val_metrics['onset_tol_f1_50ms']:.3f} "
             f"intensity_auc={val_metrics['intensity_jump_auc']:.3f} "
             f"intensity_mse={val_metrics['intensity_mse']:.4f} "
-            f"arrow_col_f1={val_metrics['arrow_col_f1']:.3f} "
             f"| composite={composite:.3f} "
             f"| lr={lr:.2e} | {elapsed:.1f}s",
             flush=True,

@@ -1,10 +1,10 @@
 """
-Inference module: generate step charts from audio using the v9 model.
+Inference module: generate step charts from audio using the v10 model.
 
-The model emits two dense per-frame channels plus a learned direction head
-(onset / intensity / per-column direction). Algorithmic post-processing —
-driven by selectable, auto-clustered style profiles — decides arrows, jump
-vs. tap, and (entirely algorithmically) hold start/end/duration and jumpholds.
+The model emits two dense per-frame channels (onset / intensity). Algorithmic
+post-processing — driven by selectable, auto-clustered style profiles —
+decides arrows (foot-flow), jump vs. tap, and hold start/end/duration and
+jumpholds. Direction is fully algorithmic; there is no learned direction head.
 """
 
 import hashlib
@@ -117,8 +117,6 @@ class FootFlowAssigner:
         'R': (Direction.UP, Direction.RIGHT),
     }
     ALL_PANELS = (Direction.LEFT, Direction.DOWN, Direction.UP, Direction.RIGHT)
-    # Column index of each panel, matching the model's arrow head (L/D/U/R).
-    COL = {Direction.LEFT: 0, Direction.DOWN: 1, Direction.UP: 2, Direction.RIGHT: 3}
     # Physically sane two-panel jump pairs (all un-crossed).
     JUMP_PATTERNS = [
         (Direction.LEFT, Direction.RIGHT),
@@ -168,8 +166,6 @@ class FootFlowAssigner:
         self.active_holds: Dict[Direction, Tuple[float, str]] = {}
         self.crossed = False
         self.crossed_len = 0
-        self.arrow_probs: Optional[np.ndarray] = None  # [T,4] learned direction (v8)
-        self._cur_pref: Optional[np.ndarray] = None    # 4-vector for the current event
 
     def _purge_holds(self, t: float):
         if self.active_holds:
@@ -199,17 +195,9 @@ class FootFlowAssigner:
         energy_curve: Optional[np.ndarray],
         brightness_curve: Optional[np.ndarray],
         beat_times: np.ndarray,
-        arrow_probs: Optional[np.ndarray] = None,
     ) -> List[List[Direction]]:
-        """Return the arrow list for each event, aligned with ``note_events``.
-
-        ``arrow_probs`` ([T,4] per-frame L/D/U/R probabilities from the v8 learned
-        direction head, or None) is a *preference*: it steers panel choice within
-        the foot the flow model picked, and jump-pair choice — the playability
-        constraints still decide the foot and veto anything ungettable.
-        """
+        """Return the arrow list for each event, aligned with ``note_events``."""
         self._reset()
-        self.arrow_probs = arrow_probs
         bts = np.asarray(beat_times, dtype=np.float64) if beat_times is not None else np.array([])
         sections = self._detect_sections(note_events, energy_curve)
         bars, textures, strongs = self._rhythm_features(note_events, bts)
@@ -224,7 +212,6 @@ class FootFlowAssigner:
             num = int(ev.get('num_arrows', 1))
             texture = textures[i] ^ (cur_section & 1)
             strong = strongs[i]
-            self._cur_pref = self._pref_at(t)
 
             if ev['type'] == 'hold':
                 arrows = self._assign_hold(ev, t, num, energy, strong, texture)
@@ -323,14 +310,10 @@ class FootFlowAssigner:
 
     def _pick_own_panel(self, foot, strong, held, texture, avoid=frozenset()) -> Direction:
         outer, inner = self.OUTER[foot], self.INNER[foot]
-        if self._cur_pref is not None:
-            # Learned direction proposes: pick the foot's panel the model prefers.
-            want_outer = float(self._cur_pref[self.COL[outer]]) >= float(self._cur_pref[self.COL[inner]])
-        else:
-            # Strong beats emphasize the outer (side) arrow; otherwise the
-            # deterministic per-rhythm texture bit chooses, so identical figures
-            # step identically.
-            want_outer = strong or bool(texture)
+        # Strong beats emphasize the outer (side) arrow; otherwise the
+        # deterministic per-rhythm texture bit chooses, so identical figures
+        # step identically.
+        want_outer = strong or bool(texture)
         first = outer if want_outer else inner
         second = inner if want_outer else outer
         for cand in (first, second):        # prefer own panels, honoring avoid
@@ -389,15 +372,7 @@ class FootFlowAssigner:
             candidates = list(self.JUMP_PATTERNS)
         if strong:
             candidates = [self.JUMP_PATTERNS[0]] + candidates  # emphasize L/R on strong beats
-        if self._cur_pref is not None:
-            # Learned direction proposes the pair: rank by summed column preference.
-            candidates = sorted(
-                candidates,
-                key=lambda p: -(float(self._cur_pref[self.COL[p[0]]])
-                                + float(self._cur_pref[self.COL[p[1]]])),
-            )
-        else:
-            self.rng.shuffle(candidates)
+        self.rng.shuffle(candidates)
         for a, b in candidates:
             if a not in held and b not in held:
                 self.left_panel, self.right_panel = a, b
@@ -416,14 +391,6 @@ class FootFlowAssigner:
         idx = int(round(t * FRAMES_PER_SECOND))
         idx = max(0, min(idx, len(curve) - 1))
         return float(curve[idx])
-
-    def _pref_at(self, t: float) -> Optional[np.ndarray]:
-        """The learned [L,D,U,R] preference vector at time ``t``, or None."""
-        if self.arrow_probs is None or len(self.arrow_probs) == 0:
-            return None
-        idx = int(round(t * FRAMES_PER_SECOND))
-        idx = max(0, min(idx, len(self.arrow_probs) - 1))
-        return self.arrow_probs[idx]
 
     def _rhythm_features(self, note_events, bts):
         """Per-event (bar index, texture bit, strong-beat flag).
@@ -570,7 +537,6 @@ class MLChartGenerator:
         self.style = str(style)
 
         self.model: Optional[StepChartModel] = None
-        self.use_learned_arrows: bool = False
         self.default_density_by_id = DEFAULT_DENSITY_BY_ID.clone()
         self.feat_mean: Optional[np.ndarray] = None
         self.feat_std: Optional[np.ndarray] = None
@@ -589,20 +555,19 @@ class MLChartGenerator:
     def load_model(self, model_path: str):
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         arch_version = int(checkpoint.get('arch_version', 1))
-        # v9 (onset/intensity/direction) is current. v7/v8 checkpoints are still
-        # loadable for the heads they share; their sustain head is simply ignored
-        # (holds are now assigned algorithmically).
-        if arch_version not in (7, 8, 9):
+        # v10 (onset/intensity only) is current. v7-v9 checkpoints are still
+        # loadable for the heads they share; their sustain / direction heads are
+        # simply ignored (holds + direction are now algorithmic).
+        if arch_version not in (7, 8, 9, 10):
             raise ValueError(
                 f"Checkpoint at {model_path} is arch_version={arch_version}; "
-                f"expected 7, 8, or 9. Retrain with current model.py."
+                f"expected 7, 8, 9, or 10. Retrain with current model.py."
             )
-        if arch_version < 9:
+        if arch_version < 10:
             logger.warning(
-                f"Loading a v{arch_version} checkpoint; the sustain head it carries "
-                f"is ignored (holds are now algorithmic)."
+                f"Loading a v{arch_version} checkpoint; any sustain / direction "
+                f"heads it carries are ignored (holds + direction are algorithmic)."
             )
-        self.use_learned_arrows = arch_version >= 8
 
         n_in_channels = int(checkpoint.get('n_in_channels', N_FEAT_CHANNELS))
         args = checkpoint.get('args', {})
@@ -612,7 +577,6 @@ class MLChartGenerator:
             n_heads=args.get('n_heads', 4),
             n_transformer_layers=args.get('n_layers', 3),
             n_difficulties=5,
-            with_arrow_head=self.use_learned_arrows,
         ).to(self.device)
         self.n_in_channels = n_in_channels
 
@@ -939,13 +903,11 @@ class MLChartGenerator:
         onset_p: np.ndarray,
         intensity: np.ndarray,
         style: Optional[str] = None,
-        arrow_probs: Optional[np.ndarray] = None,
     ) -> Chart:
         """Build a Chart from already-computed per-difficulty signals.
 
         Shared by the single-difficulty and batched-multi paths so
-        post-processing only lives in one place. ``arrow_probs`` ([T,4]) is the
-        learned per-column direction preference, or None.
+        post-processing only lives in one place.
         """
         diff_config = get_difficulty_config(difficulty)
 
@@ -972,7 +934,6 @@ class MLChartGenerator:
             audio_seed=analysis.audio_seed,
             style_knobs=knobs,
             timing_offset=timing_offset,
-            arrow_probs=arrow_probs,
         )
 
         chart = Chart(
@@ -1006,12 +967,11 @@ class MLChartGenerator:
             f"density={target_density:.2f} steps/sec)..."
         )
 
-        onset_p, intensity, arrow_probs = self._predict_chunked(
+        onset_p, intensity = self._predict_chunked(
             analysis.feats_whitened, difficulty_id, target_density,
         )
         return self._chart_from_signals(
             analysis, difficulty, onset_p, intensity, style=style,
-            arrow_probs=arrow_probs,
         )
 
     def generate_from_audio(
@@ -1054,7 +1014,7 @@ class MLChartGenerator:
             f"Running batched inference over {len(names)} difficulties: "
             f"{list(zip(names, [round(d, 2) for d in target_densities]))}"
         )
-        onset_batch, intensity_batch, arrow_batch = self._predict_chunked_multi(
+        onset_batch, intensity_batch = self._predict_chunked_multi(
             analysis.feats_whitened, difficulty_ids, target_densities,
         )
 
@@ -1064,7 +1024,6 @@ class MLChartGenerator:
                 analysis, name,
                 onset_batch[i], intensity_batch[i],
                 style=style,
-                arrow_probs=(arrow_batch[i] if arrow_batch is not None else None),
             )
         return charts
 
@@ -1074,17 +1033,15 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_id: int,
         target_density: float,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-        """Run model on overlapping chunks; return (onset_p, intensity, arrow_probs).
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run model on overlapping chunks; return (onset_p, intensity).
 
         onset_p is a [T] sigmoid; intensity is the raw regression output clipped
-        to [0, 1]; arrow_probs is [T, 4] or None when the checkpoint has no
-        learned direction head.
+        to [0, 1].
         """
         T = feats.shape[0]
         onset_sum = np.zeros(T, dtype=np.float32)
         intensity_sum = np.zeros(T, dtype=np.float32)
-        arrow_sum = np.zeros((T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -1117,7 +1074,7 @@ class MLChartGenerator:
                 [remaining_seconds], dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, intensity_pred = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
@@ -1127,16 +1084,12 @@ class MLChartGenerator:
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[start:start + valid_len] += onset_p[:valid_len]
             intensity_sum[start:start + valid_len] += intensity_v[:valid_len]
-            if arrow_sum is not None and arrow_logits is not None:
-                arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()[0]  # [T,4]
-                arrow_sum[start:start + valid_len, :] += arrow_p[:valid_len, :]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)
         onset_avg = onset_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        arrow_avg = (arrow_sum / counts[:, None]) if arrow_sum is not None else None
-        return onset_avg, intensity_avg, arrow_avg
+        return onset_avg, intensity_avg
 
     @torch.no_grad()
     def _predict_chunked_multi(
@@ -1144,13 +1097,13 @@ class MLChartGenerator:
         feats: np.ndarray,
         difficulty_ids: List[int],
         target_densities: List[float],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Batched-multi version of :meth:`_predict_chunked`.
 
         Runs all difficulties as one forward pass per chunk: the shared audio
         features are broadcast across the batch dimension, while difficulty
         and density vary per row. Returns onset/intensity arrays of shape
-        ``[B, T]`` and an arrow array of shape ``[B, T, 4]`` (or None).
+        ``[B, T]``.
         """
         B = len(difficulty_ids)
         if B == 0:
@@ -1164,7 +1117,6 @@ class MLChartGenerator:
         T = feats.shape[0]
         onset_sum = np.zeros((B, T), dtype=np.float32)
         intensity_sum = np.zeros((B, T), dtype=np.float32)
-        arrow_sum = np.zeros((B, T, 4), dtype=np.float32) if self.use_learned_arrows else None
         counts = np.zeros(T, dtype=np.float32)
 
         stride = self.chunk_frames - self.overlap_frames
@@ -1211,7 +1163,7 @@ class MLChartGenerator:
                 (B,), remaining_seconds, dtype=torch.float32, device=self.device,
             )
 
-            onset_logits, intensity_pred, arrow_logits = self.model(
+            onset_logits, intensity_pred = self.model(
                 feats_tensor, diff_tensor, density_tensor,
                 start_seconds_tensor, remaining_seconds_tensor,
             )
@@ -1221,16 +1173,12 @@ class MLChartGenerator:
             valid_len = min(end - start, self.chunk_frames)
             onset_sum[:, start:start + valid_len] += onset_p[:, :valid_len]
             intensity_sum[:, start:start + valid_len] += intensity_v[:, :valid_len]
-            if arrow_sum is not None and arrow_logits is not None:
-                arrow_p = torch.sigmoid(arrow_logits.float()).cpu().numpy()  # [B,T,4]
-                arrow_sum[:, start:start + valid_len, :] += arrow_p[:, :valid_len, :]
             counts[start:start + valid_len] += 1.0
 
         counts = np.maximum(counts, 1.0)  # broadcast across the B axis
         onset_avg = onset_sum / counts
         intensity_avg = np.clip(intensity_sum / counts, 0.0, 1.0)
-        arrow_avg = (arrow_sum / counts[None, :, None]) if arrow_sum is not None else None
-        return onset_avg, intensity_avg, arrow_avg
+        return onset_avg, intensity_avg
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1438,7 +1386,6 @@ class MLChartGenerator:
         audio_seed: int,
         style_knobs: Dict[str, float],
         timing_offset: float = 0.0,
-        arrow_probs: Optional[np.ndarray] = None,
     ) -> List[Step]:
         """
         Detect WHEN (NMS on onset_p) → classify jump-vs-tap → assign holds
@@ -1673,7 +1620,6 @@ class MLChartGenerator:
         )
         arrows_per_event = assigner.assign(
             note_events, energy_curve, brightness_curve, beat_times,
-            arrow_probs=arrow_probs,
         )
 
         steps: List[Step] = []
