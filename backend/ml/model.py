@@ -1,34 +1,35 @@
 """
-Step Chart Neural Network Model (v7 hybrid).
+Step Chart Neural Network Model (v10).
 
-Three-head architecture:
+Two-head architecture:
     feats[T,88] -> AudioEncoder (CNN) -> Dilated TCN -> early FiLM
         (difficulty + density + start_seconds + remaining_seconds)
         -> RoPE Transformer -> LayerNorm
         -> onset head      [T, 1] sigmoid: any-onset prob (Gaussian-smoothed BCE)
-        -> sustain head    [T, 1] sigmoid: in-any-hold prob (dense BCE)
         -> intensity head  [T, 1] linear:  jump-vs-tap intensity (MSE regression)
 
-The model predicts dense, style-agnostic signals only. Algorithmic
-post-processing (see `inference.py`) decides arrows, jump vs. tap, hold
-start/end, and jumpholds, parameterized by selectable style profiles.
+v9 removed the sustain head (holds are algorithmic). v10 removes the learned
+per-column direction head too: direction is a choreographic/foot-flow choice,
+not a property of mono audio, so the head could only ever predict the prior.
+Direction is assigned algorithmically by FootFlowAssigner in `inference.py`.
+The model now predicts only WHEN a note occurs and its jump-vs-tap intensity.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Bumped to v7: full hybrid rewrite. The arrow/type/duration/beat/hold heads
-# of v6 are gone; the model now emits only onset/sustain/intensity.
-ARCH_VERSION = 8
+# v10: the learned direction head is removed — direction is choreographic and
+# assigned algorithmically. The model emits only onset / intensity.
+ARCH_VERSION = 10
 
 
 class AudioEncoder(nn.Module):
-    """CNN encoder for the v7 88-channel audio feature tensor.
+    """CNN encoder for the 88-channel audio feature tensor.
 
     Input is `feats[B, T, n_in_channels]` (mel ⊕ onset_strength ⊕ spec_contrast)
     rather than the v6 mel-only input — the conv stack widens the channel
@@ -238,23 +239,15 @@ class TransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full step chart model (v7)
+# Full step chart model (v10)
 # ---------------------------------------------------------------------------
 
 class StepChartModel(nn.Module):
     """
-    feats -> (onset_logits, sustain_logits, intensity_pred, arrow_logits).
+    feats -> (onset_logits, intensity_pred).
 
     onset_logits:    [B, T, 1]  any-onset pre-sigmoid
-    sustain_logits:  [B, T, 1]  "any arrow currently held" pre-sigmoid
     intensity_pred:  [B, T, 1]  continuous jump-vs-tap intensity (linear out)
-    arrow_logits:    [B, T, 4]  per-column (L/D/U/R) onset pre-sigmoid, or ``None``
-                                 when built without the arrow head (v7 back-compat)
-
-    v8 adds the learned per-arrow direction head. The arrow head is supervised only
-    on onset frames (direction is meaningless off-onset) and is used at inference as
-    a *preference* that the foot-flow constraints then filter — model proposes,
-    constraints dispose. Build with ``with_arrow_head=False`` to load a v7 checkpoint.
     """
 
     def __init__(
@@ -267,12 +260,10 @@ class StepChartModel(nn.Module):
         dropout: float = 0.1,
         tcn_dilations: Tuple[int, ...] = (1, 2, 4, 8, 16),
         head_layers: int = 2,
-        with_arrow_head: bool = True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_in_channels = int(n_in_channels)
-        self.with_arrow_head = bool(with_arrow_head)
 
         self.audio_encoder = AudioEncoder(n_in_channels, hidden_dim, dropout)
         self.tcn = DilatedTCN(hidden_dim, dilations=tcn_dilations, dropout=dropout)
@@ -296,9 +287,7 @@ class StepChartModel(nn.Module):
             return nn.Sequential(*layers)
 
         self.onset_head = _mlp_head(1)
-        self.sustain_head = _mlp_head(1)
         self.intensity_head = _mlp_head(1)
-        self.arrow_head = _mlp_head(4) if self.with_arrow_head else None
 
     def set_onset_prior(self, p: float) -> None:
         """Bias-init the onset head's final layer to logit(p).
@@ -309,14 +298,6 @@ class StepChartModel(nn.Module):
         p = float(max(min(p, 0.999), 1e-4))
         bias = math.log(p / (1.0 - p))
         final = self.onset_head[-1]
-        assert isinstance(final, nn.Linear)
-        nn.init.constant_(final.bias, bias)
-
-    def set_sustain_prior(self, p: float) -> None:
-        """Bias-init the sustain head to logit(p) (any-arrow in-hold rate)."""
-        p = float(max(min(p, 0.999), 1e-4))
-        bias = math.log(p / (1.0 - p))
-        final = self.sustain_head[-1]
         assert isinstance(final, nn.Linear)
         nn.init.constant_(final.bias, bias)
 
@@ -343,7 +324,7 @@ class StepChartModel(nn.Module):
         density: torch.Tensor,
         start_seconds: torch.Tensor,
         remaining_seconds: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             feats: [B, T, n_in_channels]
@@ -354,18 +335,14 @@ class StepChartModel(nn.Module):
 
         Returns:
             onset_logits:    [B, T, 1] pre-sigmoid
-            sustain_logits:  [B, T, 1] pre-sigmoid
             intensity_pred:  [B, T, 1] linear regression output
-            arrow_logits:    [B, T, 4] pre-sigmoid per column, or None (no arrow head)
         """
         features = self.encode(
             feats, difficulty, density, start_seconds, remaining_seconds,
         )
         onset_logits = self.onset_head(features)
-        sustain_logits = self.sustain_head(features)
         intensity_pred = self.intensity_head(features)
-        arrow_logits = self.arrow_head(features) if self.arrow_head is not None else None
-        return onset_logits, sustain_logits, intensity_pred, arrow_logits
+        return onset_logits, intensity_pred
 
 
 # ---------------------------------------------------------------------------
@@ -374,46 +351,32 @@ class StepChartModel(nn.Module):
 
 class StepChartLoss(nn.Module):
     """
-    Combined v7 loss:
+    Combined v10 loss:
         - focal BCE on onset_logits against Gaussian-smoothed any-onset target
-        - focal BCE on sustain_logits against dense in-any-hold target
         - MSE on intensity_pred against jump-intensity target (smeared)
     """
 
     def __init__(
         self,
         onset_pos_weight: float = 10.0,
-        sustain_pos_weight: float = 5.0,
         focal_gamma: float = 2.0,
-        sustain_weight: float = 1.0,
         intensity_weight: float = 0.5,
-        arrow_weight: float = 1.0,
     ):
         super().__init__()
         self.register_buffer(
             'onset_pos_weight',
             torch.tensor(float(onset_pos_weight), dtype=torch.float32),
         )
-        self.register_buffer(
-            'sustain_pos_weight',
-            torch.tensor(float(sustain_pos_weight), dtype=torch.float32),
-        )
         self.focal_gamma = float(focal_gamma)
-        self.sustain_weight = float(sustain_weight)
         self.intensity_weight = float(intensity_weight)
-        self.arrow_weight = float(arrow_weight)
 
     def forward(
         self,
         onset_logits: torch.Tensor,    # [B, T, 1]
-        sustain_logits: torch.Tensor,  # [B, T, 1]
         intensity_pred: torch.Tensor,  # [B, T, 1]
         onset_soft: torch.Tensor,      # [B, T, 1]
-        sustain_target: torch.Tensor,  # [B, T, 1]
         intensity_target: torch.Tensor,  # [B, T, 1]
-        arrow_logits: Optional[torch.Tensor] = None,  # [B, T, 4]
-        arrow_target: Optional[torch.Tensor] = None,  # [B, T, 4] per-column onset
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Focal BCE on onset.
         if self.focal_gamma > 0.0:
             bce = F.binary_cross_entropy_with_logits(
@@ -432,45 +395,9 @@ class StepChartLoss(nn.Module):
                 pos_weight=self.onset_pos_weight,
             )
 
-        if self.focal_gamma > 0.0:
-            bce_s = F.binary_cross_entropy_with_logits(
-                sustain_logits, sustain_target,
-                pos_weight=self.sustain_pos_weight,
-                reduction='none',
-            )
-            with torch.no_grad():
-                p_s = torch.sigmoid(sustain_logits)
-                p_t_s = sustain_target * p_s + (1.0 - sustain_target) * (1.0 - p_s)
-                focal_w_s = (1.0 - p_t_s).clamp_(min=0.0, max=1.0).pow(self.focal_gamma)
-            sustain_loss = (focal_w_s * bce_s).mean()
-        else:
-            sustain_loss = F.binary_cross_entropy_with_logits(
-                sustain_logits, sustain_target,
-                pos_weight=self.sustain_pos_weight,
-            )
-
         intensity_loss = F.mse_loss(intensity_pred, intensity_target)
 
-        # Direction: per-column BCE supervised ONLY on onset frames (a column label
-        # is meaningful only where a note exists). Multi-label sigmoids, not softmax,
-        # so a jump (>=2 active columns) is representable.
-        if arrow_logits is not None and arrow_target is not None:
-            onset_mask = (arrow_target.sum(dim=-1, keepdim=True) > 0.5).float()  # [B,T,1]
-            bce_a = F.binary_cross_entropy_with_logits(
-                arrow_logits, arrow_target, reduction='none',
-            )  # [B, T, 4]
-            denom = onset_mask.sum().clamp_(min=1.0) * arrow_target.shape[-1]
-            arrow_loss = (bce_a * onset_mask).sum() / denom
-        else:
-            arrow_loss = onset_loss.new_zeros(())
-
-        total = (
-            onset_loss
-            + self.sustain_weight * sustain_loss
-            + self.intensity_weight * intensity_loss
-            + self.arrow_weight * arrow_loss
-        )
+        total = onset_loss + self.intensity_weight * intensity_loss
         return (
-            total, onset_loss.detach(), sustain_loss.detach(),
-            intensity_loss.detach(), arrow_loss.detach(),
+            total, onset_loss.detach(), intensity_loss.detach(),
         )
